@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ib_async; import inspect; src = inspect.getsource\\(ib_async.IB.reqAccountUpdates\\); print\\(src\\)\")",
+      "Bash(dir /s /b \"C:\\\\Users\\\\kashi\\\\python\\\\ibd\\\\src\")",
+      "PowerShell(Get-ChildItem -Recurse \"C:\\\\Users\\\\kashi\\\\python\\\\ibd\\\\src\" -Force | ForEach-Object { $_.FullName })",
+      "PowerShell(Remove-Item \"C:\\\\Users\\\\kashi\\\\python\\\\ibd\\\\src\\\\dashboard\\\\risk.py.tmp.23068.1778321435802\" -Confirm:$false)",
+      "Bash(Get-Content C:\\\\Users\\\\kashi\\\\python\\\\ibd\\\\CLAUDE.md)",
+      "Bash(Measure-Object -Line)",
+      "Bash(Select-Object -ExpandProperty Lines)"
+    ]
+  }
+}
