@@ -10,13 +10,7 @@ import pandas as pd
 
 
 def _flag_by_symbol(df: pd.DataFrame, mask: pd.Series, all_syms) -> pd.Series:
-    return (
-        df[mask]
-        .groupby("symbol")["position"]
-        .size()
-        .reindex(all_syms, fill_value=0)
-        .gt(0)
-    )
+    return df[mask].groupby("symbol")["position"].size().reindex(all_syms, fill_value=0).gt(0)
 
 
 def classify_portfolio(positions: pd.DataFrame) -> pd.DataFrame:

@@ -38,13 +38,11 @@ def position_delta_dollars(df: pd.DataFrame) -> pd.Series:
     opt = df["secType"] == "OPT"
     px = df["marketPrice"]  # stock price for STK rows; option price for OPT (fallback)
     und_px = (
-        df["underlying_px"] if "underlying_px" in df.columns
+        df["underlying_px"]
+        if "underlying_px" in df.columns
         else pd.Series(float("nan"), index=df.index)
     )
-    delta = (
-        df["delta"] if "delta" in df.columns
-        else pd.Series(float("nan"), index=df.index)
-    )
+    delta = df["delta"] if "delta" in df.columns else pd.Series(float("nan"), index=df.index)
     stk_d = df["position"] * px
     opt_d = df["position"] * delta.fillna(0.0) * 100 * und_px
     return pd.Series(
@@ -75,8 +73,8 @@ def position_margin_est(df: pd.DataFrame) -> pd.Series:
     qty = df["position"].abs()
     mv = df["marketValue"].abs()
 
-    und_px: pd.Series = df["underlying_px"] if "underlying_px" in df.columns else pd.Series(
-        np.nan, index=df.index
+    und_px: pd.Series = (
+        df["underlying_px"] if "underlying_px" in df.columns else pd.Series(np.nan, index=df.index)
     )
     und_px = und_px.fillna(df.get("marketPrice", pd.Series(np.nan, index=df.index)))
 
@@ -133,15 +131,18 @@ def _join_tickers(positions: pd.DataFrame, tickers: dict[int, TickerSnap]) -> pd
     ]
     if not rows:
         return pos.assign(
-            delta=np.nan, gamma=np.nan, theta=np.nan, vega=np.nan,
-            iv=np.nan, underlying_px=np.nan, last_px=np.nan,
+            delta=np.nan,
+            gamma=np.nan,
+            theta=np.nan,
+            vega=np.nan,
+            iv=np.nan,
+            underlying_px=np.nan,
+            last_px=np.nan,
         )
     return pos.merge(pd.DataFrame(rows), on="conId", how="left")
 
 
-def _select_account_values(
-    snap: Snapshot, account: str = ""
-) -> dict[str, Decimal]:
+def _select_account_values(snap: Snapshot, account: str = "") -> dict[str, Decimal]:
     """Return a flat {tag: Decimal} dict for the requested account (or sum of all)."""
     all_av = snap.account_values  # {acct: {tag: Decimal}}
     if account and account in all_av:
@@ -312,6 +313,14 @@ def cover_protect_gaps(
         if needs_protect:
             gap_needs.append("protect")
 
+        # Existing protective long option strike(s), if any
+        protect_strike_str = ""
+        if protect_me and has_long and "strike" in sym_opt.columns:
+            long_opts = sym_opt[sym_opt["position"] > 0]
+            if not long_opts.empty:
+                strikes = sorted(long_opts["strike"].dropna().unique())
+                protect_strike_str = ", ".join(f"{s:.1f}" for s in strikes)
+
         rec: dict = {
             "symbol": sym,
             "shares": shares,
@@ -323,6 +332,7 @@ def cover_protect_gaps(
         }
         if protect_me:
             rec["max_downside"] = round(abs(avg_cost * shares), 0)
+            rec["protect_strike"] = protect_strike_str
         rows.append(rec)
 
     return pd.DataFrame(rows)

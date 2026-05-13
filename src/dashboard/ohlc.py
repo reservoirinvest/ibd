@@ -29,6 +29,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import TextIO
 
+from ib_async import IB, Stock
+
 import pandas as pd
 from loguru import logger
 from pyprojroot import here
@@ -38,13 +40,13 @@ from pyprojroot import here
 # ---------------------------------------------------------------------------
 
 MASTER_DIR = here() / "data" / "master"
-OHLC_PATH  = MASTER_DIR / "ohlc.pkl"
-SYMS_PATH  = here() / "data" / "ohlc_symbols.json"   # written by button, read by subprocess
-LOG_PATH   = here() / "log" / "ohlc_progress.log"
+OHLC_PATH = MASTER_DIR / "ohlc.pkl"
+SYMS_PATH = here() / "data" / "ohlc_symbols.json"  # written by button, read by subprocess
+LOG_PATH = here() / "log" / "ohlc_progress.log"
 
-MIN_DAYS = 548           # 1.5 years ≈ 548 calendar days
+MIN_DAYS = 548  # 1.5 years ≈ 548 calendar days
 _OHLC_COLS = ["Open", "High", "Low", "Close", "Volume"]
-_CONCURRENCY = 20        # parallel yfinance coroutines
+_CONCURRENCY = 20  # parallel yfinance coroutines
 
 # ---------------------------------------------------------------------------
 # Symbol / ticker utilities
@@ -53,36 +55,36 @@ _CONCURRENCY = 20        # parallel yfinance coroutines
 # Hard overrides: IBKR symbol → yfinance ticker
 _IB_TO_YF: dict[str, str] = {
     "BRK B": "BRK-B",
-    "BF B":  "BF-B",
+    "BF B": "BF-B",
 }
 
 # Primary-exchange → yfinance suffix
 _EXCH_SUFFIX: dict[str, str] = {
-    "LSE":   ".L",
-    "TSX":   ".TO",
-    "TSXV":  ".V",
-    "ASX":   ".AX",
-    "HKEX":  ".HK",
-    "FWB":   ".DE",
-    "IBIS":  ".DE",
-    "SBF":   ".PA",
-    "AEB":   ".AS",
+    "LSE": ".L",
+    "TSX": ".TO",
+    "TSXV": ".V",
+    "ASX": ".AX",
+    "HKEX": ".HK",
+    "FWB": ".DE",
+    "IBIS": ".DE",
+    "SBF": ".PA",
+    "AEB": ".AS",
     "VIRTX": ".SW",
-    "SWX":   ".SW",
+    "SWX": ".SW",
 }
 
 # Currency fallback when exchange is SMART / unknown
 _CCY_SUFFIX: dict[str, str] = {
-    "GBP":  ".L",
-    "CAD":  ".TO",
-    "AUD":  ".AX",
-    "HKD":  ".HK",
-    "CHF":  ".SW",
-    "EUR":  ".DE",   # best-effort: most EUR instruments are Xetra
+    "GBP": ".L",
+    "CAD": ".TO",
+    "AUD": ".AX",
+    "HKD": ".HK",
+    "CHF": ".SW",
+    "EUR": ".DE",  # best-effort: most EUR instruments are Xetra
 }
 
 
-SymbolSpec = dict[str, str]   # {"symbol": ..., "exchange": ..., "currency": ...}
+SymbolSpec = dict[str, str]  # {"symbol": ..., "exchange": ..., "currency": ...}
 
 
 def ib_to_yf(symbol: str, exchange: str = "SMART", currency: str = "USD") -> str:
@@ -97,6 +99,7 @@ def ib_to_yf(symbol: str, exchange: str = "SMART", currency: str = "USD") -> str
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
+
 
 def load_ohlc() -> dict[str, pd.DataFrame]:
     """Load OHLC store; return {} if not yet created or unreadable."""
@@ -120,16 +123,17 @@ def save_ohlc(data: dict[str, pd.DataFrame]) -> None:
 # Symbol discovery
 # ---------------------------------------------------------------------------
 
+
 def get_sp500_symbols() -> list[SymbolSpec]:
     """Load S&P500 symbol specs from data/symbols.pkl (list of ib_async Stock objects)."""
     path = here() / "data" / "symbols.pkl"
     if not path.exists():
         return []
     try:
-        stocks = pd.read_pickle(path)   # list[ib_async.Stock]
+        stocks = pd.read_pickle(path)  # list[ib_async.Stock]
         return [
             {
-                "symbol":   s.symbol,
+                "symbol": s.symbol,
                 "exchange": getattr(s, "primaryExchange", "SMART"),
                 "currency": getattr(s, "currency", "USD"),
             }
@@ -161,6 +165,7 @@ def load_symbol_list() -> list[SymbolSpec]:
 # yfinance fetch  (async, bounded concurrency)
 # ---------------------------------------------------------------------------
 
+
 def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
     """Normalise a yfinance DataFrame to our canonical OHLCV shape.
 
@@ -175,7 +180,7 @@ def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df[cols].copy()
     idx = pd.to_datetime(df.index)
     if idx.tz is not None:
-        idx = idx.tz_convert(None)   # tz-aware → naive UTC equivalent
+        idx = idx.tz_convert(None)  # tz-aware → naive UTC equivalent
     df.index = idx.normalize()
     return df.sort_index().dropna(subset=["Close"])
 
@@ -186,11 +191,13 @@ async def _fetch_one_yf(
     end: date,
 ) -> tuple[str, pd.DataFrame | None]:
     """Fetch one symbol from yfinance in a thread pool worker."""
-    import yfinance as yf   # deferred — not always installed
+    import yfinance as yf  # deferred — not always installed
 
-    ib_sym   = spec["symbol"]
+    ib_sym = spec["symbol"]
     # "yf_ticker" key allows callers to override the computed ticker (e.g. for .L retry)
-    yf_tick  = spec.get("yf_ticker") or ib_to_yf(ib_sym, spec.get("exchange", "SMART"), spec.get("currency", "USD"))
+    yf_tick = spec.get("yf_ticker") or ib_to_yf(
+        ib_sym, spec.get("exchange", "SMART"), spec.get("currency", "USD")
+    )
 
     def _dl() -> pd.DataFrame:
         return yf.Ticker(yf_tick).history(
@@ -218,27 +225,29 @@ async def _fetch_yf_all(
     log_fh: TextIO,
 ) -> dict[str, pd.DataFrame]:
     """Bounded-concurrency yfinance fetch with inline tqdm progress."""
-    from tqdm import tqdm
+    from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn
+    from rich.console import Console
 
     sem = asyncio.Semaphore(_CONCURRENCY)
     results: dict[str, pd.DataFrame] = {}
-    bar_fmt = "{l_bar}{bar:10}{r_bar}"
 
-    with tqdm(
-        total=len(specs),
-        desc="Fetching OHLC (yfinance)",
-        bar_format=bar_fmt,
-        file=log_fh,
-        dynamic_ncols=False,
-        ncols=80,
+    console = Console(file=log_fh, force_terminal=False)
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("{task.fields[status]}"),
+        console=console,
     ) as pbar:
+        task_id = pbar.add_task("Fetching OHLC (yfinance)", total=len(specs), status="")
+
         async def _bounded(spec: SymbolSpec) -> None:
             async with sem:
                 ib_sym, df = await _fetch_one_yf(spec, start, end)
             if df is not None:
                 results[ib_sym] = df
-            pbar.update(1)
-            pbar.set_postfix_str(spec["symbol"], refresh=True)
+            pbar.advance(task_id, 1)
+            pbar.update(task_id, status=spec["symbol"])
 
         await asyncio.gather(*[_bounded(s) for s in specs])
 
@@ -248,6 +257,7 @@ async def _fetch_yf_all(
 # ---------------------------------------------------------------------------
 # IBKR fallback  (separate CID — never conflicts with dashboard CID=10)
 # ---------------------------------------------------------------------------
+
 
 async def _fetch_ib_all(
     specs: list[SymbolSpec],
@@ -262,11 +272,10 @@ async def _fetch_ib_all(
     if not specs:
         return {}
 
-    from ib_async import IB, Stock   # type: ignore[import]
-    from tqdm import tqdm
+    from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn
+    from rich.console import Console
 
     results: dict[str, pd.DataFrame] = {}
-    bar_fmt = "{l_bar}{bar:10}{r_bar}"
     duration_days = (end - start).days + 5
     duration_str = f"{max(duration_days, 30)} D"
 
@@ -279,19 +288,22 @@ async def _fetch_ib_all(
         return {}
 
     try:
-        with tqdm(
-            total=len(specs),
-            desc="Fetching OHLC (IBKR fallback)",
-            bar_format=bar_fmt,
-            file=log_fh,
-            dynamic_ncols=False,
-            ncols=80,
+        console = Console(file=log_fh, force_terminal=False)
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("{task.fields[status]}"),
+            console=console,
         ) as pbar:
+            task_id = pbar.add_task("Fetching OHLC (IBKR fallback)", total=len(specs), status="")
             for spec in specs:
-                sym      = spec["symbol"]
+                sym = spec["symbol"]
                 exchange = spec.get("exchange", "SMART")
                 currency = spec.get("currency", "USD")
-                contract = Stock(sym, exchange if exchange not in ("SMART", "") else "SMART", currency)
+                contract = Stock(
+                    sym, exchange if exchange not in ("SMART", "") else "SMART", currency
+                )
                 try:
                     bars = await ib.reqHistoricalDataAsync(
                         contract,
@@ -305,11 +317,11 @@ async def _fetch_ib_all(
                     if bars:
                         rows = [
                             {
-                                "date":   b.date,
-                                "Open":   b.open,
-                                "High":   b.high,
-                                "Low":    b.low,
-                                "Close":  b.close,
+                                "date": b.date,
+                                "Open": b.open,
+                                "High": b.high,
+                                "Low": b.low,
+                                "Close": b.close,
                                 "Volume": b.volume,
                             }
                             for b in bars
@@ -322,8 +334,8 @@ async def _fetch_ib_all(
                             results[sym] = df
                 except Exception as exc:
                     logger.warning(f"IBKR history {sym}: {exc}")
-                pbar.update(1)
-                pbar.set_postfix_str(sym, refresh=True)
+                pbar.advance(task_id, 1)
+                pbar.update(task_id, status=sym)
     finally:
         ib.disconnect()
 
@@ -333,6 +345,7 @@ async def _fetch_ib_all(
 # ---------------------------------------------------------------------------
 # Incremental merge
 # ---------------------------------------------------------------------------
+
 
 def _merge(
     existing: dict[str, pd.DataFrame],
@@ -367,10 +380,11 @@ def _merge(
 # Main async driver
 # ---------------------------------------------------------------------------
 
+
 async def _run_async(specs: list[SymbolSpec], log_fh: TextIO) -> None:
-    existing  = load_ohlc()
-    today     = date.today()
-    cutoff    = today - timedelta(days=MIN_DAYS)
+    existing = load_ohlc()
+    today = date.today()
+    cutoff = today - timedelta(days=MIN_DAYS)
 
     # Build per-symbol fetch plan: symbol → (spec, start_date)
     fetch_plan: dict[str, tuple[SymbolSpec, date]] = {}
@@ -399,8 +413,8 @@ async def _run_async(specs: list[SymbolSpec], log_fh: TextIO) -> None:
         log_fh.flush()
         return
 
-    earliest    = min(d for _, d in fetch_plan.values())
-    all_specs   = [spec for spec, _ in fetch_plan.values()]
+    earliest = min(d for _, d in fetch_plan.values())
+    all_specs = [spec for spec, _ in fetch_plan.values()]
 
     log_fh.write(f"Date range : {earliest} → {today}\n\n")
     log_fh.flush()
@@ -409,9 +423,7 @@ async def _run_async(specs: list[SymbolSpec], log_fh: TextIO) -> None:
     yf_results = await _fetch_yf_all(all_specs, earliest, today, log_fh)
 
     yf_failed = [spec for spec, _ in fetch_plan.values() if spec["symbol"] not in yf_results]
-    log_fh.write(
-        f"\nyfinance: {len(yf_results)} OK, {len(yf_failed)} failed\n"
-    )
+    log_fh.write(f"\nyfinance: {len(yf_results)} OK, {len(yf_failed)} failed\n")
     log_fh.flush()
 
     # ── Pre-IBKR retry: try .L suffix for bare symbols (e.g. CSPX → CSPX.L) ─
@@ -420,13 +432,16 @@ async def _run_async(specs: list[SymbolSpec], log_fh: TextIO) -> None:
     # IBKR historical-data path.
     if yf_failed:
         _bare_failed = [
-            spec for spec in yf_failed
-            if "." not in ib_to_yf(spec["symbol"], spec.get("exchange", "SMART"), spec.get("currency", "USD"))
+            spec
+            for spec in yf_failed
+            if "."
+            not in ib_to_yf(
+                spec["symbol"], spec.get("exchange", "SMART"), spec.get("currency", "USD")
+            )
         ]
         if _bare_failed:
             _lse_specs = [
-                {**s, "yf_ticker": s["symbol"].replace(" ", "-") + ".L"}
-                for s in _bare_failed
+                {**s, "yf_ticker": s["symbol"].replace(" ", "-") + ".L"} for s in _bare_failed
             ]
             log_fh.write(
                 f"  Retrying {len(_lse_specs)} as .L: "
@@ -465,9 +480,7 @@ async def _run_async(specs: list[SymbolSpec], log_fh: TextIO) -> None:
     added = _merge(existing, all_results, fetch_plan, cutoff)
     save_ohlc(existing)
 
-    still_missing = [
-        s["symbol"] for s in yf_failed if s["symbol"] not in ib_results
-    ]
+    still_missing = [s["symbol"] for s in yf_failed if s["symbol"] not in ib_results]
     log_fh.write(
         f"\nOHLC UPDATE COMPLETE\n"
         f"  Updated : {len(added)} symbols, {sum(added.values())} rows added\n"
@@ -486,6 +499,7 @@ async def _run_async(specs: list[SymbolSpec], log_fh: TextIO) -> None:
 # Public entry point  (called by fetch_ohlc.py subprocess)
 # ---------------------------------------------------------------------------
 
+
 def run_update(log_path: Path | None = None) -> None:
     """Incremental OHLC update.  Called by the fetch_ohlc.py runner."""
     specs = load_symbol_list()
@@ -499,9 +513,9 @@ def run_update(log_path: Path | None = None) -> None:
 
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_fh: TextIO = open(log_path, "w", encoding="utf-8")   # noqa: SIM115
+        log_fh: TextIO = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
     else:
-        log_fh = sys.stdout   # type: ignore[assignment]
+        log_fh = sys.stdout  # type: ignore[assignment]
 
     try:
         log_fh.write(f"OHLC update starting — {len(specs)} symbols\n")

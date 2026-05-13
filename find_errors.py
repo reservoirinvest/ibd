@@ -6,8 +6,7 @@ from typing import List, Sequence
 
 # pyrefly: ignore [missing-import]
 from build import ROOT, delete_pkl_files, get_option_chains, get_qualified_symbols, pickle_me
-# pyrefly: ignore [untyped-import]
-from tqdm import tqdm
+from rich.progress import Progress
 
 
 def _fetch_qualified_contracts(weeklies: bool = True) -> List:
@@ -35,24 +34,25 @@ def find_chain_failures(contracts: Sequence, batch_size: int | None = None):
 
     effective_batch = batch_size or max(1, len(contracts_list) // 10)
 
-    pbar = tqdm(total=len(contracts_list), desc="Checking option chains", unit="symbol")
+    with Progress() as pbar:
+        task_id = pbar.add_task("Checking option chains", total=len(contracts_list))
 
-    def drill_down(subset: Sequence):
-        if not subset:
-            return
+        def drill_down(subset: Sequence):
+            if not subset:
+                return
 
-        subset_list = list(subset)
-        local_batch = min(effective_batch, len(subset_list))
+            subset_list = list(subset)
+            local_batch = min(effective_batch, len(subset_list))
 
-        if subset_list:
-            pbar.set_postfix_str(f"{subset_list[0].symbol} ... {subset_list[-1].symbol}")
+            if subset_list:
+                pbar.update(task_id, description=f"Checking {subset_list[0].symbol} ... {subset_list[-1].symbol}")
 
         try:
             df = get_option_chains(subset_list, market="SNP", batch_size=local_batch)
         except Exception as exc:  # pragma: no cover - diagnostic script
             if len(subset_list) == 1:
                 failures.append({"symbol": subset_list[0].symbol, "error": str(exc)})
-                pbar.update(1)
+                pbar.advance(task_id, 1)
             else:
                 mid = len(subset_list) // 2
                 drill_down(subset_list[:mid])
@@ -62,7 +62,7 @@ def find_chain_failures(contracts: Sequence, batch_size: int | None = None):
         missing = _missing_symbols(subset_list, df)
         processed = len(subset_list) - len(missing)
         if processed:
-            pbar.update(processed)
+            pbar.advance(task_id, processed)
 
         if not missing:
             return
@@ -81,12 +81,12 @@ def find_chain_failures(contracts: Sequence, batch_size: int | None = None):
 
         drill_down([contract for contract in subset_list if contract.symbol in missing])
 
-    # Phase 1: sweep through batches quickly to identify suspect chunks
-    for start in range(0, len(contracts_list), effective_batch):
-        chunk = contracts_list[start : start + effective_batch]
+        # Phase 1: sweep through batches quickly to identify suspect chunks
+        for start in range(0, len(contracts_list), effective_batch):
+            chunk = contracts_list[start : start + effective_batch]
 
-        if chunk:
-            pbar.set_postfix_str(f"{chunk[0].symbol} ... {chunk[-1].symbol}")
+            if chunk:
+                pbar.update(task_id, description=f"Checking {chunk[0].symbol} ... {chunk[-1].symbol}")
 
         try:
             df = get_option_chains(chunk, market="SNP", batch_size=len(chunk))
@@ -97,17 +97,16 @@ def find_chain_failures(contracts: Sequence, batch_size: int | None = None):
         missing = _missing_symbols(chunk, df)
         processed = len(chunk) - len(missing)
         if processed:
-            pbar.update(processed)
+            pbar.advance(task_id, processed)
 
         if missing:
             suspects.append([contract for contract in chunk if contract.symbol in missing])
 
-    # Phase 2: targeted drill-down on problematic chunks
-    for suspect in suspects:
-        drill_down(suspect)
+        # Phase 2: targeted drill-down on problematic chunks
+        for suspect in suspects:
+            drill_down(suspect)
 
-    pbar.set_postfix_str("")
-    pbar.close()
+        pbar.update(task_id, description="Complete")
 
     return failures
 

@@ -23,9 +23,8 @@ from dotenv import find_dotenv, load_dotenv
 from ib_async import IB, Contract, Stock
 from loguru import logger
 from pyprojroot import here
+from rich.progress import track
 from scipy.stats import norm
-# pyrefly: ignore [untyped-import]
-from tqdm import tqdm
 # pyrefly: ignore [untyped-import]
 from tqdm.asyncio import tqdm as async_tqdm
 
@@ -93,11 +92,20 @@ def get_ib_connection(market: str = "SNP", account_no: str = '', msg: bool=False
     client_id = config.get("CID", 10)
     
     ib = IB()
-    ib.connect('127.0.0.1', PORT, clientId=client_id, account=account_no)
-    if msg:
-        print(f"Connected to IB on port {PORT} with client ID {client_id} (market: {market}, account: {account_no or 'default'})")
     
-    return ib
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            ib.connect('127.0.0.1', PORT, clientId=client_id, account=account_no)
+            if msg:
+                print(f"Connected to IB on port {PORT} with client ID {client_id} (market: {market}, account: {account_no or 'default'})")
+            return ib
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"Connection attempt {attempt + 1} failed ({e}), retrying in 2s...")
+                time.sleep(2)
+            else:
+                raise
 
 def get_safe_ib_connection(client_id, max_retries=3):
     """Create a new IB connection with retry logic."""
@@ -431,9 +439,10 @@ def qualify_stock_contracts(symbols: pd.Series, market: str = "SNP") -> list:
         # Qualify contracts asynchronously with progress bar
         print(f"Qualifying {len(contracts)} contracts asynchronously...")
         
-        with async_tqdm(total=len(contracts), desc="Qualifying contracts", unit="contract") as pbar:
-            # pyrefly: ignore [not-iterable]
-            qualified, failed = ib.run(_qualify_batch(ib, contracts, pbar))
+        # We pass a None pbar to avoid async_tqdm dependency, or implement a simple tracking.
+        # Since qualify_batch updates it via postfix, we will just omit the pbar for now.
+        # pyrefly: ignore [not-iterable]
+        qualified, failed = ib.run(_qualify_batch(ib, contracts, None))
         
         print(f"\n✓ Successfully qualified {len(qualified)}/{len(contracts)} contracts")
         if failed:
@@ -479,57 +488,47 @@ def qualify_me(
         # Calculate number of batches
         num_batches = (total_contracts + batch_size - 1) // batch_size
 
-        with tqdm(
-            total=num_batches,
-            desc=desc,
-            bar_format="{l_bar}{bar:10}{r_bar}",
-            ncols=80,
-        ) as pbar:
-            for batch_num in range(num_batches):
-                start_idx = batch_num * batch_size
-                end_idx = min(start_idx + batch_size, total_contracts)
-                batch_contracts = contracts[start_idx:end_idx]
+        # Since we use rich track, we don't need the context manager tqdm.
+        for batch_num in track(range(num_batches), description=desc):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, total_contracts)
+            batch_contracts = contracts[start_idx:end_idx]
 
-                # Per-batch try with one automatic retry on transient socket errors.
-                _batch_ok = False
-                for _attempt in range(2):
-                    try:
-                        # pyrefly: ignore [not-iterable]
-                        q_batch, f_batch = ib.run(_qualify_batch(ib, batch_contracts, None))
-                        qualified.extend(q_batch)
-                        failed_total.extend(f_batch)
-                        _batch_ok = True
-                        break
-                    except Exception as _be:
-                        if _attempt == 0:
-                            logger.warning(
-                                f"Batch {batch_num + 1}/{num_batches} error ({_be}) — "
-                                f"retrying in 3 s…"
-                            )
-                            time.sleep(3)
-                        else:
-                            logger.warning(
-                                f"Batch {batch_num + 1}/{num_batches} failed ({_be}), skipping"
-                            )
-                            failed_total.extend(
-                                getattr(c, "symbol", repr(c)) for c in batch_contracts
-                            )
-
-                pbar.update(1)
-                pbar.set_postfix_str(
-                    f"{len(qualified)}/{total_contracts} ok", refresh=True
-                )
-
-                # If socket is gone after a failed batch, stop early rather than
-                # hammering through the remaining batches with guaranteed failures.
-                if not _batch_ok and not ib.isConnected():
-                    logger.warning("IB socket disconnected — stopping qualification early")
-                    remaining = contracts[end_idx:]
-                    failed_total.extend(getattr(c, "symbol", repr(c)) for c in remaining)
+            # Per-batch try with one automatic retry on transient socket errors.
+            _batch_ok = False
+            for _attempt in range(2):
+                try:
+                    # pyrefly: ignore [not-iterable]
+                    q_batch, f_batch = ib.run(_qualify_batch(ib, batch_contracts, None))
+                    qualified.extend(q_batch)
+                    failed_total.extend(f_batch)
+                    _batch_ok = True
                     break
+                except Exception as _be:
+                    if _attempt == 0:
+                        logger.warning(
+                            f"Batch {batch_num + 1}/{num_batches} error ({_be}) — "
+                            f"retrying in 3 s…"
+                        )
+                        time.sleep(3)
+                    else:
+                        logger.warning(
+                            f"Batch {batch_num + 1}/{num_batches} failed ({_be}), skipping"
+                        )
+                        failed_total.extend(
+                            getattr(c, "symbol", repr(c)) for c in batch_contracts
+                        )
 
-                if batch_num < num_batches - 1:
-                    ib.sleep(1)  # 1-second pause to avoid rate limiting
+            # If socket is gone after a failed batch, stop early rather than
+            # hammering through the remaining batches with guaranteed failures.
+            if not _batch_ok and not ib.isConnected():
+                logger.warning("IB socket disconnected — stopping qualification early")
+                remaining = contracts[end_idx:]
+                failed_total.extend(getattr(c, "symbol", repr(c)) for c in remaining)
+                break
+
+            if batch_num < num_batches - 1:
+                ib.sleep(1)  # 1-second pause to avoid rate limiting
 
         if failed_total:
             print(f"  Failed to qualify {len(failed_total)} symbols: {', '.join(str(s) for s in failed_total[:10])}"
@@ -575,7 +574,8 @@ def get_prices(
     market: str = "SNP",
     max_wait_time: int = 10,
     snapshot: bool = True,
-    batch_size: int = 50
+    batch_size: int = 50,
+    ib: IB = None
 ) -> pd.DataFrame:
     """
     Get market prices for a list of qualified contracts.
@@ -586,15 +586,17 @@ def get_prices(
         max_wait_time: Maximum seconds to wait for each ticker to populate (default: 10)
         snapshot: If True, request snapshot; if False, stream data (default: True)
         batch_size: Number of contracts to request at once (default: 50)
+        ib: Optional existing IB connection
     
     Returns:
         DataFrame with symbol, bid, ask, last, close, volume, and other price data
     """
-    ib = None
-    
     try:
         # Connect to IB
-        ib = get_ib_connection(market)
+        disconnect = False
+        if ib is None:
+            ib = get_ib_connection(market)
+            disconnect = True
         
         # Process contracts in batches to avoid ticker limit
         all_price_data = []
@@ -609,7 +611,7 @@ def get_prices(
             except (TypeError, ValueError):
                 return False
         
-        for batch_num in tqdm(range(total_batches), desc="Fetching prices", unit="batch"):
+        for batch_num in track(range(total_batches), description="Fetching prices"):
             start_idx = batch_num * batch_size
             end_idx = min(start_idx + batch_size, len(contracts))
             batch_contracts = contracts[start_idx:end_idx]
@@ -733,6 +735,7 @@ def get_volatilities_snapshot(
     market: str = "SNP",
     batch_size: int = 50,
     max_wait_time: int = 10,  # Note: max_wait_time is used as sleep_time in async call
+    ib: IB = None
 ) -> pd.DataFrame:
     """
     Get a one-time snapshot of price, implied volatility (IV), and historical volatility (HV)
@@ -748,17 +751,19 @@ def get_volatilities_snapshot(
     Returns:
         DataFrame with symbol, price, implied volatility (iv), and historical volatility (hv).
     """
-    ib = None
     all_vol_data = []
 
     try:
         # Connect to IB
-        ib = get_ib_connection(market)
+        disconnect = False
+        if ib is None:
+            ib = get_ib_connection(market)
+            disconnect = True
 
         # Process contracts in batches
         total_batches = (len(contracts) + batch_size - 1) // batch_size
 
-        for batch_num in tqdm(range(total_batches), desc="Fetching volatilities", unit="batch"):
+        for batch_num in track(range(total_batches), description="Fetching volatilities"):
             start_idx = batch_num * batch_size
             end_idx = min(start_idx + batch_size, len(contracts))
             batch_contracts = contracts[start_idx:end_idx]
@@ -810,7 +815,7 @@ def get_volatilities_snapshot(
 
     finally:
         # Disconnect from IB
-        if ib and ib.isConnected():
+        if disconnect and ib and ib.isConnected():
             ib.disconnect()
             print("Disconnected from IB\n")
 
@@ -897,7 +902,8 @@ def get_option_chains(
     market: str = "SNP",
     batch_size: int = 50,
     max_wait_time: int = 10,
-    inter_batch_delay: float = 0.5
+    inter_batch_delay: float = 0.5,
+    ib: IB = None
 ) -> pd.DataFrame:
     """
     Get option chain parameters (expiries, strikes) for a list of underlying contracts.
@@ -914,18 +920,20 @@ def get_option_chains(
     Returns:
         DataFrame with columns: symbol, conId, tradingClass, expiry, strike, dte
     """
-    ib = None
     all_chain_data = []
     failed_symbols = []
 
     try:
         # Connect to IB
-        ib = get_ib_connection(market)
+        disconnect = False
+        if ib is None:
+            ib = get_ib_connection(market)
+            disconnect = True
 
         # Process contracts in batches
         total_batches = (len(contracts) + batch_size - 1) // batch_size
 
-        for batch_num in tqdm(range(total_batches), desc="Fetching option chains", unit="batch"):
+        for batch_num in track(range(total_batches), description="Fetching option chains"):
             start_idx = batch_num * batch_size
             end_idx = min(start_idx + batch_size, len(contracts))
             batch_contracts = contracts[start_idx:end_idx]
@@ -1042,7 +1050,7 @@ def get_option_chains(
 
     finally:
         # Disconnect from IB
-        if ib and ib.isConnected():
+        if disconnect and ib and ib.isConnected():
             ib.disconnect()
             print("Disconnected from IB\n")
 
@@ -1126,14 +1134,23 @@ def chains_n_unds(msg: bool = False):
     config = load_config('SNP')
     virgin_dte = float(config.get('VIRGIN_DTE', 30))  # Default to 30 if not specified
 
-    # Apply the ATM margin calculation
-    # pyrefly: ignore [no-matching-overload]
-    df_unds['margin'] = df_unds.apply(
-        lambda row: calculate_atm_margin(row, df_chains, virgin_dte),
-        axis=1
-    )
+    # Apply the ATM margin calculation.
+    # Guard: get_volatilities_snapshot returns pd.DataFrame() (no columns) on
+    # connection failure; apply(axis=1) on a column-less frame returns a
+    # DataFrame rather than a Series, breaking the column assignment.
+    if not df_unds.empty and 'symbol' in df_unds.columns:
+        # pyrefly: ignore [no-matching-overload]
+        df_unds['margin'] = df_unds.apply(
+            lambda row: calculate_atm_margin(row, df_chains, virgin_dte),
+            axis=1
+        )
+    else:
+        df_unds['margin'] = pd.Series(dtype=float)
 
-    print(df_unds[['symbol', 'iv', 'hv', 'margin', 'price']].head(10))
+    if not df_unds.empty and 'symbol' in df_unds.columns:
+        print(df_unds[['symbol', 'iv', 'hv', 'margin', 'price']].head(10))
+    else:
+        print("Warning: df_unds is empty — no volatility data retrieved")
     pickle_me(df_unds, file_path=ROOT / 'data' / 'df_unds.pkl')
 
     return df_chains, df_unds
@@ -1174,12 +1191,15 @@ if __name__ == "__main__":
     config = load_config('SNP')
     virgin_dte = float(config.get('VIRGIN_DTE', 30))  # Default to 30 if not specified
 
-    # Apply the ATM margin calculation
-    # pyrefly: ignore [no-matching-overload]
-    df_unds['margin'] = df_unds.apply(
-        lambda row: calculate_atm_margin(row, df_chains, virgin_dte),
-        axis=1
-    )
+    # Apply the ATM margin calculation (same guard as chains_n_unds above).
+    if not df_unds.empty and 'symbol' in df_unds.columns:
+        # pyrefly: ignore [no-matching-overload]
+        df_unds['margin'] = df_unds.apply(
+            lambda row: calculate_atm_margin(row, df_chains, virgin_dte),
+            axis=1
+        )
+    else:
+        df_unds['margin'] = pd.Series(dtype=float)
 
     print(df_unds[['symbol', 'iv', 'hv', 'margin', 'price']].head(10))
     pickle_me(df_unds, file_path=ROOT/'data'/'df_unds.pkl')

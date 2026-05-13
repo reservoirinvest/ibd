@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     min_reap_dte: int = 1
 
     # display / market config (from snp_config.yml only)
-    currency: str = "USD"      # base currency shown in header (CURRENCY key in YAML)
+    currency: str = "USD"  # base currency shown in header (CURRENCY key in YAML)
     protect_me: bool = False
     cover_std_mult: float = 0.65
     covxpmult: float = 1.2

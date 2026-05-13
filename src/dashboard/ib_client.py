@@ -16,7 +16,7 @@ from decimal import Decimal
 from typing import Any
 
 import pandas as pd
-from ib_async import IB, Contract, PortfolioItem, Ticker, Trade
+from ib_async import IB, Contract, MarketOrder, PortfolioItem, Ticker, Trade
 from loguru import logger
 
 from .settings import Settings, get_settings
@@ -99,6 +99,7 @@ class IBClient:
 
     _instance: IBClient | None = None
     _lock = threading.Lock()
+    _log_sink_added: bool = False  # class-level guard — prevents duplicate loguru sinks
 
     def __new__(cls) -> IBClient:
         with cls._lock:
@@ -120,32 +121,54 @@ class IBClient:
         self._subscribed: set[int] = set()
         self._settings: Settings | None = None
         self._managed_accounts: list[str] = []
-        self._started = False
         self._connecting = False  # True while _connect_with_retry coroutine is alive
-        self._frozen = False      # True while derive.py holds the CID exclusively
+        self._frozen = False  # True while derive.py holds the CID exclusively
         self._loop_ready = threading.Event()  # set once run_forever() is live
 
     # ---- public API --------------------------------------------------------
 
     def start(self, settings: Settings | None = None) -> None:
-        """Start the background event loop (idempotent)."""
-        if self._started:
-            return
-        self._started = True
+        """Start the background event loop (idempotent, thread-safe).
+
+        Guards against both race conditions and hot-reload scenarios:
+        - Thread object is created inside the lock so any racing concurrent caller
+          sees it immediately and returns without double-starting.
+        - ident-is-None check treats a just-created (not-yet-started) thread as
+          alive-for-guard purposes, closing the window between lock release and
+          thread.start().
+        - _log_sink_added prevents a second loguru file sink per Python process.
+        - Thread-liveness check (ident set + not alive) allows restart if the
+          daemon thread has crashed unexpectedly.
+        """
+        with self._lock:
+            if self._thread is not None:
+                # Thread alive, OR created but not yet started (ident is None) → no-op
+                if self._thread.is_alive() or self._thread.ident is None:
+                    return
+            # First call, or restart after the daemon thread died
+            add_sink = not IBClient._log_sink_added
+            if add_sink:
+                IBClient._log_sink_added = True
+            # Create thread INSIDE the lock so concurrent callers see it immediately
+            self._loop_ready.clear()
+            self._thread = threading.Thread(target=self._run_loop, name="ib-client", daemon=True)
+
         self._settings = settings or get_settings()
 
-        # Wire file log sink exactly once per process (app.py reruns don't duplicate it).
-        from pyprojroot import here as _here  # avoid circular at module level
-        _log_path = _here() / "log" / "dashboard.log"
-        _log_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.add(
-            str(_log_path),
-            rotation="1 day",
-            retention="3 days",
-            encoding="utf-8",
-            level="DEBUG",
-            format="{time:HH:mm:ss.SSS} | {level:<7} | {message}",
-        )
+        if add_sink:
+            from pyprojroot import here as _here  # avoid circular at module level
+
+            _log_path = _here() / "log" / "dashboard.log"
+            _log_path.parent.mkdir(parents=True, exist_ok=True)
+            logger.add(
+                str(_log_path),
+                rotation="1 day",
+                retention="3 days",
+                encoding="utf-8",
+                level="DEBUG",
+                format="{time:HH:mm:ss.SSS} | {level:<7} | {message}",
+            )
+
         logger.info(
             "IBClient.start() — host={} port={} cid={}",
             self._settings.ib_host,
@@ -157,12 +180,11 @@ class IBClient:
         # ProactorEventLoop's IOCP handle is thread-affine: creating it in the
         # main thread then running it in a daemon thread silently prevents any
         # coroutines from executing.
-        self._thread = threading.Thread(
-            target=self._run_loop, name="ib-client", daemon=True
-        )
         self._thread.start()
         if not self._loop_ready.wait(timeout=5):
-            logger.error("ib-client event loop did not start in 5 s — daemon thread may have crashed")
+            logger.error(
+                "ib-client event loop did not start in 5 s — daemon thread may have crashed"
+            )
             return
         fut = asyncio.run_coroutine_threadsafe(self._connect_with_retry(), self._loop)
 
@@ -197,14 +219,17 @@ class IBClient:
         Sets _frozen=True BEFORE disconnecting so the _on_disconnect handler
         will not spawn a reconnect loop while derive is running.
         """
-        self._frozen = True          # guard must be set first
+        self._frozen = True  # guard must be set first
         if self._loop:
             self._loop.call_soon_threadsafe(self._subscribed.clear)
         if self._loop and self._ib:
             asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop)
         with self._snap_lock:
             self._snap.connected = False
-        logger.info("Dashboard frozen — CID {} released for derive.py", self._settings.ib_client_id if self._settings else "?")
+        logger.info(
+            "Dashboard frozen — CID {} released for derive.py",
+            self._settings.ib_client_id if self._settings else "?",
+        )
 
     def unfreeze(self) -> None:
         """Clear frozen flag and reconnect after a brief pause.
@@ -216,7 +241,7 @@ class IBClient:
         """
         self._frozen = False
         if self._loop and not self._connecting:
-            self._connecting = True   # block any parallel reconnect attempts
+            self._connecting = True  # block any parallel reconnect attempts
 
             async def _delayed_connect() -> None:
                 try:
@@ -246,9 +271,7 @@ class IBClient:
 
     def stop(self) -> None:
         if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop).result(
-                timeout=3
-            )
+            asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop).result(timeout=3)
             self._loop.call_soon_threadsafe(self._loop.stop)
 
     # ---- loop --------------------------------------------------------------
@@ -259,14 +282,14 @@ class IBClient:
         # handle is thread-affine to the thread that runs run_forever().
         try:
             self._loop = asyncio.new_event_loop()
-        except Exception as e:          # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             logger.error("_run_loop: asyncio.new_event_loop() failed: {!r}", e)
             return
         asyncio.set_event_loop(self._loop)
-        self._loop_ready.set()          # unblock start() → run_coroutine_threadsafe
+        self._loop_ready.set()  # unblock start() → run_coroutine_threadsafe
         try:
             self._loop.run_forever()
-        except Exception as e:          # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             logger.error("ib-client event loop crashed: {}", e)
         finally:
             logger.info("ib-client event loop stopped")
@@ -358,7 +381,7 @@ class IBClient:
         await asyncio.sleep(3.0)
 
         # force one immediate portfolio pull (in case events were missed)
-        for acct in (managed or [""]):
+        for acct in managed or [""]:
             try:
                 for item in self._ib.portfolio(acct):
                     self._on_portfolio(item)
@@ -400,7 +423,6 @@ class IBClient:
         `margin_init` and `margin_maint` columns.
         """
         assert self._ib is not None
-        from ib_async import MarketOrder  # lazy import
 
         with self._snap_lock:
             pos_df = self._snap.positions.copy()
@@ -435,11 +457,13 @@ class IBClient:
             async with sem:
                 try:
                     state = await self._ib.whatIfOrderAsync(contract, order)
+
                     def _parse(v: object) -> float:
                         try:
                             return abs(float(str(v)))  # type: ignore[arg-type]
                         except (TypeError, ValueError):
                             return float("nan")
+
                     return (
                         int(row["conId"]),
                         str(row.get("account", "")),
@@ -447,9 +471,7 @@ class IBClient:
                         _parse(state.maintMarginChange),
                     )
                 except Exception as e:  # noqa: BLE001
-                    logger.debug(
-                        "whatIfOrder {} {}: {}", row.get("symbol", "?"), action, e
-                    )
+                    logger.debug("whatIfOrder {} {}: {}", row.get("symbol", "?"), action, e)
                     return (
                         int(row["conId"]),
                         str(row.get("account", "")),
@@ -461,16 +483,17 @@ class IBClient:
 
         # Build (conId, account) → (init, maint)
         margin_map: dict[tuple[int, str], tuple[float, float]] = {
-            (con_id, acct): (init_m, maint_m)
-            for con_id, acct, init_m, maint_m in results
+            (con_id, acct): (init_m, maint_m) for con_id, acct, init_m, maint_m in results
         }
 
         margin_rows = [
             {"conId": con_id, "account": acct, "margin_init": im, "margin_maint": mm}
             for (con_id, acct), (im, mm) in margin_map.items()
         ]
-        margin_df = pd.DataFrame(margin_rows) if margin_rows else pd.DataFrame(
-            columns=["conId", "account", "margin_init", "margin_maint"]
+        margin_df = (
+            pd.DataFrame(margin_rows)
+            if margin_rows
+            else pd.DataFrame(columns=["conId", "account", "margin_init", "margin_maint"])
         )
 
         with self._snap_lock:
@@ -486,7 +509,8 @@ class IBClient:
         total_init = sum(im for im, _ in valid)
         logger.info(
             "What-if margins done: {} positions, sum init margin ${:,.0f}",
-            len(valid), total_init,
+            len(valid),
+            total_init,
         )
 
     async def _resubscribe_market_data(self) -> None:
@@ -586,9 +610,7 @@ class IBClient:
             self._snap.positions = df.reset_index(drop=True)
             self._snap.as_of = datetime.now(timezone.utc)
         if self._loop is not None:
-            asyncio.run_coroutine_threadsafe(
-                self._resubscribe_market_data(), self._loop
-            )
+            asyncio.run_coroutine_threadsafe(self._resubscribe_market_data(), self._loop)
 
     def _on_position(self, position) -> None:
         """Fallback handler from reqPositions — only adds rows not already seen
@@ -626,9 +648,7 @@ class IBClient:
             ).reset_index(drop=True)
             self._snap.as_of = datetime.now(timezone.utc)
         if self._loop is not None:
-            asyncio.run_coroutine_threadsafe(
-                self._resubscribe_market_data(), self._loop
-            )
+            asyncio.run_coroutine_threadsafe(self._resubscribe_market_data(), self._loop)
 
     def _on_account_value(self, value: Any) -> None:
         try:

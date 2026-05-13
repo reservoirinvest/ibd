@@ -40,22 +40,24 @@ class IBClient:
                 cls._instance = inst
             return cls._instance
 
-    def start(self, host, port, client_id):
-        if self._started: return
-        self._started = True
-        # Create loop INSIDE the daemon thread (Windows ProactorEventLoop IOCP
-        # handles are thread-affine — creating in main thread then running in
-        # daemon thread silently prevents all coroutines from executing).
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+    def start(self, settings):
+        with self._lock:
+            if self._thread is not None:
+                if self._thread.is_alive() or self._thread.ident is None:
+                    return   # already running or just created
+            self._loop_ready.clear()
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        # Create loop INSIDE daemon thread — Windows ProactorEventLoop IOCP
+        # handles are thread-affine; creating in main thread breaks coroutines.
         self._thread.start()
-        self._loop_ready.wait(timeout=5)   # blocks until _run_loop signals
-        fut = asyncio.run_coroutine_threadsafe(
-            self._connect(host, port, client_id), self._loop
-        )
-        def _on_done(f: concurrent.futures.Future):
-            if (exc := f.exception()) is not None:
-                print(f"connect coroutine raised: {exc!r}")
-        fut.add_done_callback(_on_done)
+        self._loop_ready.wait(timeout=5)
+        asyncio.run_coroutine_threadsafe(self._connect_with_retry(), self._loop)
+
+# In app.py — wrap in st.cache_resource to prevent concurrent reruns double-starting:
+# @st.cache_resource(show_spinner=False)
+# def _start_ib_client():
+#     c = get_client(); c.start(settings); return c
+# client = _start_ib_client()
 
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
@@ -127,6 +129,11 @@ def greek_sums(positions: pd.DataFrame, tickers: dict) -> dict:
 | Cushion shown as 0 | `accountValueEvent` not yet fired | Show `—` until `as_of` is set |
 | Logs show `IBClient.start()` then complete silence, dashboard stays 🔴 | `ib_async` imported lazily inside coroutine → circular import → `ImportError` swallowed by asyncio task handler | Import `from ib_async import IB` at module level, never inside `TYPE_CHECKING` or a coroutine |
 | Logs show `IBClient.start()` then silence even with eager import | `asyncio.new_event_loop()` called in main thread, `run_forever()` in daemon thread → Windows ProactorEventLoop IOCP thread-affinity breaks coroutine dispatch | Move `asyncio.new_event_loop()` into `_run_loop` (daemon thread); use `threading.Event` to sync before `run_coroutine_threadsafe` |
+| `IBClient.start()` logged 2–3× at same millisecond; error 326 cascade | Concurrent Streamlit reruns all execute module-level `client.start()` — thread guard alone cannot block N simultaneous callers that all see dead thread before any creates T2 | Wrap start in `@st.cache_resource(show_spinner=False)` — Streamlit guarantees exactly-once execution per server process. Thread guard is now a safety-net for crash-restart only |
+| derive.py: "Connection attempt N failed ()" — empty error for qualify/chains/volatilities | derive.py called `ib = get_ib_connection()` BEFORE `classifed_results()` — its open CID=10 blocks all internal connections in `chains_n_unds` | Move `ib = get_ib_connection()` to AFTER `classifed_results()` and `get_open_orders()` |
+| `get_volatilities_snapshot(ib=ib)` / `get_option_chains(ib=ib)` ignored the passed connection | `ib = None` as first line of function body unconditionally overrode the `ib` parameter — always created a fresh connection | Remove the `ib = None` override line; `if ib is None: ib = get_ib_connection()` guard then works correctly |
+| derive.py: "Connection attempt N failed ()" — subprocess freeze was called first | Button handler called `st.rerun()` after `Popen()` — full-page rerun fires `_connect_with_retry` on daemon thread, dashboard reclaims CID=10 before subprocess connects | **Never** call `st.rerun()` after `freeze()` + `Popen()` in a button handler; rely on `run_every` timer |
+| `chains_n_unds` crashes: `ValueError: Cannot set a DataFrame without columns` | `get_volatilities_snapshot` returns `pd.DataFrame()` (no columns) on failure; `apply(axis=1)` returns a DataFrame not a Series; column access also KeyErrors | Guard: `if not df_unds.empty and 'symbol' in df_unds.columns:` before apply AND before column access |
 
 ## Don't
 
@@ -138,54 +145,32 @@ def greek_sums(positions: pd.DataFrame, tickers: dict) -> dict:
 
 ## IBKR subprocess / CID rules ← READ BEFORE WRITING ANY SUBPROCESS
 
-**The hardest rule in this repo:** Every OS process connecting to IBKR must use a *unique* client ID.
-The live dashboard owns **CID=10** (from `snp_config.yml → CID`).
-No other code path may connect with CID=10 without first calling `client.freeze()`.
-
-### The freeze / unfreeze pattern (mandatory for all subprocesses that touch IBKR)
+Dashboard owns **CID=10**. No other process may connect without `client.freeze()` first.
+Full rules in `CLAUDE.md § SUBPROCESS / CID RULES`. Key pattern:
 
 ```python
-# 1. Button handler — freeze BEFORE launching subprocess
-client.freeze()                              # disconnect CID=10
-st.session_state["frozen_for"] = "mytask"   # track why we froze
+# Button handler — freeze BEFORE Popen, NO st.rerun() after
+st.session_state["frozen_for"] = "mytask"
+client.freeze()
 proc = subprocess.Popen([sys.executable, "myscript.py"], ...)
 st.session_state["mytask_proc"] = proc
+# run_every timer handles UI refresh — no st.rerun() needed here
 
-# 2. Same fragment, next run_every cycle — auto-unfreeze when done
+# Auto-unfreeze in next run_every cycle
 if client.is_frozen() and proc.poll() is not None \
         and st.session_state.get("frozen_for") == "mytask":
-    client.unfreeze()                        # schedules 5-second delayed reconnect
+    client.unfreeze()   # 5-second delayed reconnect — IBKR needs time to release CID
     st.session_state.pop("frozen_for", None)
     st.rerun()
 ```
 
-### `client.freeze()` / `client.unfreeze()` semantics
-
 | Call | Effect |
 |---|---|
-| `freeze()` | Sets `_frozen=True`, disconnects the IB socket. Snapshot remains readable (last-known data). |
-| `unfreeze()` | Sets `_frozen=False`, schedules `_connect_with_retry` after 5 s (IBKR needs time to release CID). |
+| `freeze()` | `_frozen=True`, disconnects socket. Snapshot readable (last-known). |
+| `unfreeze()` | `_frozen=False`, schedules reconnect after 5 s. |
 
-The 5-second delay in `unfreeze` is critical. If you reconnect immediately after the subprocess exits, IBKR hasn't freed the CID yet → **error 326**.
-
-### Subprocess design checklist
-
-- [ ] Script does **not** import `src.dashboard.ib_client` (no singleton side-effects)
-- [ ] If the script needs IBKR: dashboard must be frozen **before** `subprocess.Popen`
-- [ ] If the script uses only yfinance / HTTP: no freeze needed, no CID conflict
-- [ ] Script uses its **own** client ID (e.g., CID from settings, or a dedicated offset)
-- [ ] UTF-8 env vars set: `PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8` (Windows cp1252 breaks Unicode tqdm output)
-
-### Why yfinance subprocesses still break the dashboard
-
-yfinance itself is fine — it never touches IBKR.
-The failure mode is: yfinance misses some symbols → code falls through to an IBKR fallback →
-fallback connects with wrong CID (or right CID but without freeze) → 326.
-**Always freeze before any subprocess that might touch IBKR, even as a fallback.**
-
-### asyncio loop ownership
-
-The dashboard daemon thread owns the event loop. Never call `asyncio.run()` inside that thread.
-Subprocesses get their own process + event loop via `asyncio.run()` — that is fine.
-The pattern `asyncio.run_coroutine_threadsafe(coro, self._loop)` is the only safe bridge
-between Streamlit's main thread and the daemon loop.
+Subprocess checklist:
+- [ ] Does **not** import `src.dashboard.ib_client`
+- [ ] Dashboard frozen **before** `Popen` if script touches IBKR (even as yfinance fallback)
+- [ ] Own client ID (not CID=10)
+- [ ] `PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8` in env
