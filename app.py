@@ -11,6 +11,7 @@ import pickle
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import plotly.express as px
@@ -50,26 +51,45 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Force dark Plotly hover tooltips via SVG CSS — the Python hoverlabel API is
-# unreliable in Streamlit; targeting the SVG layer directly is the only sure fix.
+# Apply minimal CSS to position navigation and allow native Streamlit dark/light mode
 st.markdown(
     """
     <style>
-    /* Plotly hover tooltip: dark background */
-    .js-plotly-plot .plotly .hoverlayer .hovertext path {
-        fill: #1e2130 !important;
-        stroke: #475569 !important;
+    /* Nav row (columns container holding radio + account selector) — fixed at top.
+       :has() is supported Chrome 105+, Safari 15.4+, Firefox 121+, Edge 105+. */
+    [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) {
+        position: fixed !important;
+        top: 0 !important;
+        left: 0 !important;
+        right: 14rem !important;
+        z-index: 999999 !important;
+        background-color: var(--background-color) !important;
+        padding: 0 0.5rem !important;
+        margin: 0 !important;
     }
-    /* Plotly hover tooltip: light text (OHLC values, etc.) */
-    .js-plotly-plot .plotly .hoverlayer .hovertext text,
-    .js-plotly-plot .plotly .hoverlayer .hovertext text tspan {
-        fill: #f1f5f9 !important;
+    /* Style radio as tab pills */
+    [data-testid="stRadio"] > div {
+        gap: 0.5rem;
     }
-    /* Trace-name badge: Plotly renders a white <rect> + <text class="name">.
-       The global white-text rule above makes the name unreadable on white.
-       Override it back to near-black so it reads clearly on the white badge. */
-    .js-plotly-plot .plotly .hoverlayer .hovertext .name {
-        fill: #1e2130 !important;
+    [data-testid="stRadio"] label {
+        padding: 0.25rem 1rem;
+        border-radius: 999px;
+        background-color: transparent;
+        border: 1px solid transparent;
+        transition: all 0.2s ease;
+    }
+    [data-testid="stRadio"] label:hover {
+        background-color: var(--secondary-background-color);
+    }
+    [data-testid="stRadio"] label[data-checked="true"] {
+        background-color: var(--secondary-background-color);
+        border: 1px solid var(--text-color);
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        font-weight: 600;
+    }
+    /* Push main content below fixed nav bar */
+    section[data-testid="stMain"] > div.block-container {
+        padding-top: 3.5rem !important;
     }
     </style>
     """,
@@ -77,8 +97,16 @@ st.markdown(
 )
 
 settings = get_settings()
-client = get_client()
-client.start(settings)
+
+# st.cache_resource ensures start() is called at most once per Streamlit server
+# process — survives hot-reload reruns and concurrent multi-session calls.
+@st.cache_resource(show_spinner=False)
+def _start_ib_client():
+    c = get_client()
+    c.start(settings)
+    return c
+
+client = _start_ib_client()
 
 # ---------------------------------------------------------------------------
 # Account selector — build label → account-number mapping from settings
@@ -91,6 +119,7 @@ _MASTER_DIR  = _DATA_DIR / "master"
 _CFG_PATH    = _here() / "config" / "snp_config.yml"
 _DERIVE_LOG  = _here() / "log" / "derive_progress.log"
 _OHLC_LOG    = _here() / "log" / "ohlc_progress.log"
+_DASHBOARD_LOG = _here() / "log" / "dashboard.log"
 
 # Known derive.py output markers → progress percentage
 _DERIVE_PHASES: list[tuple[str, int]] = [
@@ -139,8 +168,8 @@ def _filter_positions(positions, account: str):
     return positions[positions["account"] == account].reset_index(drop=True)
 
 
-_EVEN_BG = "background-color: rgba(255, 255, 255, 0.08)"   # subtle white overlay for dark mode
-_ODD_BG  = "background-color: rgba(255, 255, 255, 0.03)"   # lighter band for dark mode
+_EVEN_BG = "background-color: rgba(128, 128, 128, 0.05)"   # subtle overlay for both modes
+_ODD_BG  = "background-color: transparent"
 _ITM_BG  = "background-color: rgba(251, 191, 36, 0.25)"    # amber tint, works in dark/light
 
 
@@ -402,7 +431,7 @@ def header() -> None:
     snap = client.snapshot()
     acct = _selected_account()
     positions_filt = _filter_positions(snap.positions, acct)
-    cols = st.columns([3, 2, 2, 2, 2])
+    cols = st.columns([3, 2, 2, 2])
     with cols[0]:
         if client.is_frozen():
             status = "🧊 FROZEN"
@@ -423,18 +452,6 @@ def header() -> None:
         f"port: {settings.ib_port}  •  cid: {settings.ib_client_id}"
     )
     cols[3].caption(f"positions: {len(positions_filt)}")
-    with cols[4]:
-        if len(_REAL_ACCOUNTS) > 1:
-            # Multiple accounts — show ALL / US / SG selector
-            st.selectbox(
-                "Account",
-                list(_ACCOUNT_OPTIONS.keys()),
-                key="acct_sel",
-                label_visibility="collapsed",
-            )
-        elif _REAL_ACCOUNTS:
-            # Single account — label only, no interaction needed
-            st.caption(next(iter(_REAL_ACCOUNTS)))
 
     # ── Market drop withstand row ─────────────────────────────────────────────
     if snap.account_values and not snap.positions.empty:
@@ -483,23 +500,19 @@ def kpi_strip() -> None:
     g = greek_dollar_sums(positions, snap.tickers)
     av = _select_account_values(snap, acct)
     from decimal import Decimal as _D
-    cash = float(av.get("CashBalance", _D("0")) or 0)
+    opt_val = float(av.get("OptionMarketValue", _D("0")) or 0)
 
-    c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns(9)
+    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
     c1.metric(
         "NLV", money(k["nlv"]),
         help="Net Liquidating Value: total portfolio value if all positions were closed "
              "at current market prices.",
     )
     c2.metric(
-        f"Unreal P&L ({settings.currency})", signed_money(k["unrealized_pnl"]),
-        help="Unrealized P&L: mark-to-market gain/loss on all open positions.",
+        "Opt Value", money(opt_val),
+        help="Option Market Value: total mark-to-market value of all option positions.",
     )
     c3.metric(
-        "Cash", money(cash),
-        help="Cash Balance: uninvested cash in the account.",
-    )
-    c4.metric(
         "Cushion",
         pct(k["cushion"]),
         delta=f"min {pct(settings.min_cushion)}",
@@ -507,30 +520,30 @@ def kpi_strip() -> None:
         help="Excess Liquidity / NLV. Margin buffer remaining as a fraction of portfolio. "
              f"Red/alert when below the {pct(settings.min_cushion)} minimum.",
     )
-    c5.metric(
+    c4.metric(
         "Excess Liq", money(k["excess_liquidity"]),
         help="Funds available after satisfying all margin requirements. "
              "Dropping below zero triggers a margin call.",
     )
-    c6.metric(
+    c5.metric(
         "Maint Margin", money(k["maint_margin"]),
         help="Maintenance Margin Requirement: collateral required to hold current positions. "
              "Falling below this triggers a margin call. "
              "Sourced directly from IBKR account values.",
     )
-    c7.metric(
+    c6.metric(
         "Σ Δ ($)", signed_money(g["delta_$"]),
         help="Dollar delta: total directional exposure across the book. "
              "Each 1-point move in the market changes P&L by roughly this amount. "
              "Positive = long bias, negative = short bias.",
     )
-    c8.metric(
+    c7.metric(
         "Σ Θ ($/d)", signed_money(g["theta_$"]),
         help="Dollar theta: daily time-decay P&L across all options. "
              "Positive = book earns theta (net short options). "
              "Negative = book pays theta (net long options).",
     )
-    c9.metric(
+    c8.metric(
         "Σ ν ($)", signed_money(g["vega_$"]),
         help="Dollar vega: total sensitivity to a 1% rise in implied volatility. "
              "Positive = long vol (profits when IV spikes). "
@@ -570,21 +583,21 @@ def render_positions() -> None:
         all_states = (
             sorted(df["pf_state"].dropna().unique().tolist()) if "pf_state" in df.columns else []
         )
-        sel_sec = fc1.multiselect(
+        sym_filter = fc1.text_input(
+            "symbol (prefix)", value="", key="pos_f_sym",
+            help="Prefix match — 'A' shows AAPL, AMZN; not symbols containing A elsewhere",
+        )
+        sel_sec = fc2.multiselect(
             "secType", all_sectypes, placeholder="all", key="pos_f_sec",
             help="STK = stock position, OPT = option contract",
         )
-        sel_right = fc2.multiselect(
+        sel_right = fc3.multiselect(
             "right (C/P)", all_rights, placeholder="all", key="pos_f_right",
             help="C = call option, P = put option",
         )
-        sel_state = fc3.multiselect(
+        sel_state = fc4.multiselect(
             "pf_state", all_states, placeholder="all", key="pos_f_state",
             help="Portfolio state assigned to each row",
-        )
-        sym_filter = fc4.text_input(
-            "symbol (prefix)", value="", key="pos_f_sym",
-            help="Prefix match — 'A' shows AAPL, AMZN; not symbols containing A elsewhere",
         )
         itm_only = fc5.checkbox(
             "ITM options only", key="pos_f_itm",
@@ -626,10 +639,11 @@ def render_positions() -> None:
         )
 
     # ---- display -----------------------------------------------------------
+    df["dte"] = _dte_series(df["expiry"]).fillna(0).astype(int)
     cols_show = [
-        "symbol", "secType", "underlying_px", "right", "strike", "expiry",
-        "position", "avgCost", "marketPrice", "marketValue",
-        "unrealizedPNL", "delta_$", margin_col, "delta", "theta", "vega", "iv", "pf_state",
+        "symbol", "secType", "underlying_px", "right", "strike", "expiry", "dte",
+        "position", "pf_state", "avgCost", "marketPrice", "marketValue",
+        "unrealizedPNL", "delta", "theta", "vega", "iv", "delta_$", margin_col,
     ]
     # Build view — df is already sorted & reset; extract ITM mask then drop helper col
     view = df[[c for c in cols_show if c in df.columns] + ["_itm"]].copy()
@@ -691,6 +705,10 @@ def render_positions() -> None:
                  "OPT: position x delta x 100 x underlying price. "
                  "Sum of this column = header Sigma-Delta.",
         ),
+        "dte": st.column_config.NumberColumn(
+            "DTE", format="%.0f",
+            help="Days to expiry.",
+        ),
         margin_col: st.column_config.NumberColumn(
             margin_label, format="$%,.0f",
             help=margin_help,
@@ -701,8 +719,21 @@ def render_positions() -> None:
     margins_label = (
         f"Margins as of {margins_ts.strftime('%H:%M:%S')}" if margins_ts else "Margins: pending"
     )
+
+    # ── Detect majority-null margins and auto-prompt / auto-schedule ──────────
+    _opt_view = view[view["secType"] == "OPT"] if "secType" in view.columns else view
+    _null_count = int(_opt_view[margin_col].isna().sum()) if margin_col in _opt_view.columns else len(_opt_view)
+    _majority_null = len(_opt_view) > 0 and _null_count > len(_opt_view) * 0.5
+    _now_ts = time.time()
+    _last_auto = float(st.session_state.get("_margin_auto_ts", 0.0))
+    if _majority_null and (_now_ts - _last_auto) > 30.0:
+        client.schedule_margin_refresh()
+        st.session_state["_margin_auto_ts"] = _now_ts
+
     hdr_left, hdr_right = st.columns([6, 2])
     with hdr_right:
+        if _majority_null:
+            st.caption("⚠️ Auto-refreshing margins…")
         if st.button("↻ Refresh Margins", help="Re-run what-if margin query for all positions"):
             client.schedule_margin_refresh()
             st.toast("Margin refresh scheduled — results in ~10 s")
@@ -926,6 +957,9 @@ def render_risk() -> None:
                 margin=dict(l=10, r=10, t=10, b=10),
                 xaxis_title="Dollar Delta ($)",
                 yaxis_title=None,
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#1e2130"),
             )
             st.plotly_chart(fig, width="stretch")
         else:
@@ -980,6 +1014,13 @@ def render_risk() -> None:
                         "if the position falls to zero."
                     ),
                 )
+                gap_col_cfg["protect_strike"] = st.column_config.TextColumn(
+                    "Protect Strike",
+                    help=(
+                        "Strike(s) of existing protective long option(s). "
+                        "Blank if the position has no protection yet."
+                    ),
+                )
             st.dataframe(
                 _banded(gaps), hide_index=True, width="stretch", column_config=gap_col_cfg,
             )
@@ -989,6 +1030,7 @@ def render_risk() -> None:
 def render_orders() -> None:
     snap = client.snapshot()
     acct = _selected_account()
+    _ok = account_kpis(snap, min_cushion=settings.min_cushion, account=acct)
 
     # ── Subprocess state ─────────────────────────────────────────────────────
     proc: subprocess.Popen | None       = st.session_state.get("derive_proc")
@@ -1036,13 +1078,16 @@ def render_orders() -> None:
         if st.button(
             "⚙️ Generate Orders",
             disabled=frozen,
-            use_container_width=True,
+            width="stretch",
             help="Freezes the dashboard (releases CID), runs derive.py, then reconnects. "
                  "Takes 2–5 min. Last-known data stays visible during the freeze.",
         ):
             _DERIVE_LOG.parent.mkdir(parents=True, exist_ok=True)
             log_fh = open(_DERIVE_LOG, "w", encoding="utf-8")  # noqa: SIM115
             _env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+            st.session_state.pop("_derive_exit", None)
+            st.session_state["frozen_for"] = "derive"
+            client.freeze()          # freeze BEFORE Popen so derive.py can claim CID=10
             new_proc = subprocess.Popen(
                 [sys.executable, str(_here() / "derive.py")],
                 stdout=log_fh,
@@ -1050,10 +1095,7 @@ def render_orders() -> None:
                 env=_env,
             )
             st.session_state["derive_proc"] = new_proc
-            st.session_state.pop("_derive_exit", None)
-            st.session_state["frozen_for"] = "derive"
-            client.freeze()          # release CID=10 for derive.py
-            st.rerun()
+            # No st.rerun() — fragment run_every=3.0 picks up frozen state automatically
         # Last-derive timestamp sits right under the button
         if "_derive_exit" not in st.session_state and not frozen:
             ages = [_pkl_age(n) for n in ["df_cov.pkl", "df_nkd.pkl", "df_reap.pkl"]]
@@ -1065,7 +1107,7 @@ def render_orders() -> None:
         if st.button(
             "📊 Generate OHLCs",
             disabled=frozen,
-            use_container_width=True,
+            width="stretch",
             help=(
                 "Fetch / update 1.5 yr daily OHLC for S&P500 weekly underlyings + "
                 "portfolio positions. Freezes dashboard while running; reconnects after."
@@ -1090,10 +1132,13 @@ def render_orders() -> None:
                     seen.add(_sym)
             write_symbol_list(sp500_specs + port_specs)
 
-            # Launch subprocess, then freeze so IBKR fallback inside it can connect.
+            # Freeze BEFORE Popen so fetch_ohlc.py can claim CID=10 for the IBKR fallback.
             _OHLC_LOG.parent.mkdir(parents=True, exist_ok=True)
             _ohlc_log_fh = open(_OHLC_LOG, "w", encoding="utf-8")   # noqa: SIM115
             _env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+            st.session_state.pop("_ohlc_exit", None)
+            st.session_state["frozen_for"] = "ohlc"
+            client.freeze()   # freeze BEFORE Popen so subprocess can claim CID=10
             _ohlc_new_proc = subprocess.Popen(
                 [sys.executable, str(_here() / "fetch_ohlc.py")],
                 stdout=_ohlc_log_fh,
@@ -1101,10 +1146,7 @@ def render_orders() -> None:
                 env=_env,
             )
             st.session_state["ohlc_proc"] = _ohlc_new_proc
-            st.session_state.pop("_ohlc_exit", None)
-            st.session_state["frozen_for"] = "ohlc"
-            client.freeze()   # release CID=10 — subprocess may need IBKR
-            st.rerun()
+            # No st.rerun() — fragment run_every=3.0 picks up frozen state automatically
         # Last-OHLC timestamp sits right under the button
         if "_ohlc_exit" not in st.session_state and not frozen:
             _ohlc_age = "never"
@@ -1122,7 +1164,7 @@ def render_orders() -> None:
     with clr_col:
         if st.button(
             "🗑️ Clear Data",
-            use_container_width=True,
+            width="stretch",
             help="Delete all top-level files in data/ (pickles, JSONs). "
                  "data/master/ (OHLC store) is never deleted.",
         ):
@@ -1241,7 +1283,7 @@ def render_orders() -> None:
         "C/P", ["C", "P"], key="ord_f_right", placeholder="C / P",
         label_visibility="collapsed",
     )
-    if _f3.button("✕ Clear", key="ord_clear_filter", use_container_width=True,
+    if _f3.button("✕ Clear", key="ord_clear_filter", width="stretch",
                   help="Clear symbol and C/P filters"):
         st.session_state.pop("ord_f_sym", None)
         st.session_state.pop("ord_f_right", None)
@@ -1339,7 +1381,12 @@ def render_orders() -> None:
         if n_nkd else "🌱 Sow — 0 orders"
     )
     with st.expander(nkd_label, expanded=True):
-        if _raw_nkd.empty:
+        if _raw_nkd.empty and _ok["cushion_breach"]:
+            st.info(
+                "No sow suggestions as cushion is less. "
+                "Adjust MINCUSHION and rerun generate, if sow is needed."
+            )
+        elif _raw_nkd.empty:
             st.info("No sow suggestions — run Generate Orders or no virgin/orphaned positions.")
         elif df_nkd.empty:
             st.info("No sow orders match the current filter.")
@@ -1505,7 +1552,7 @@ def render_config_panel() -> None:
                     key="cfg_mincushion",
                     help="Minimum excess-liquidity / NLV cushion (triggers alert below this)")
 
-    if st.button("💾 Save Config", type="primary", use_container_width=True,
+    if st.button("💾 Save Config", type="primary", width="stretch",
                  disabled=not _cfg_dirty()):
         try:
             _save_cfg()
@@ -1526,14 +1573,13 @@ def render_diagnostics() -> None:
     # IBKR tag names: StockMarketValue (not StockValue); Leverage-S (short leverage, ~3)
     _KEY_TAGS: list[tuple[str, str, bool]] = [
         # (ibkr_tag,           display_label,   is_ratio)
-        ("CashBalance",        "Cash Balance",   False),
+        ("OptionMarketValue",  "Opt Value",      False),
         ("StockMarketValue",   "Stock Value",    False),
         ("AccruedDividend",    "Dividend",       False),
         ("InitMarginReq",      "Init Margin",    False),
         ("AvailableFunds",     "Avail Funds",    False),
         ("BuyingPower",        "Buying Power",   False),
         ("Leverage-S",         "Leverage-S",     True),   # ratio e.g. 3.0×
-        ("UnrealizedPnL",      "Unreal P&L",     False),
     ]
 
     st.markdown("##### Key account values")
@@ -1585,8 +1631,8 @@ def render_diagnostics() -> None:
         })
 
     # Scan OHLC + derive logs for error-level lines (yfinance failures, etc.)
-    _ERR_KW = ("error", "failed", "fatal", "exception", "traceback", "missing")
-    for log_path, label in [(_OHLC_LOG, "ohlc"), (_DERIVE_LOG, "derive")]:
+    _ERR_KW = ("error", "failed", "fatal", "exception", "traceback", "missing", "critical")
+    for log_path, label in [(_OHLC_LOG, "ohlc"), (_DERIVE_LOG, "derive"), (_DASHBOARD_LOG, "dashboard")]:
         if log_path.exists():
             try:
                 lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -1633,67 +1679,55 @@ def render_analysis() -> None:
 
     all_symbols = sorted(ohlc_store.keys())
 
-    # ── Prefix filter ─────────────────────────────────────────────────────────
-    flt_col, cnt_col, rst_col = st.columns([3, 1, 1])
-    sym_prefix = flt_col.text_input(
-        "🔍 Filter symbols (prefix)",
-        key="analysis_sym_filter",
-        placeholder="e.g. C  →  C, CSCO, CSPX…",
-        help="Strict prefix match — type 'J' to see J only, 'JP' for JPM etc.",
-    )
-    if rst_col.button("↺ Reset filters", key="analysis_reset_btn", use_container_width=True):
-        for _rk in ["analysis_sym_filter", "analysis_chart_sym"]:
-            st.session_state.pop(_rk, None)
-        st.rerun()
-    filtered = (
-        [s for s in all_symbols if s.upper().startswith(sym_prefix.strip().upper())]
-        if sym_prefix.strip()
-        else all_symbols
-    )
-    cnt_col.metric("Symbols", f"{len(filtered)}", f"of {len(all_symbols)}")
+    st.caption(f"{len(all_symbols)} symbols in OHLC store")
 
-    # ── OHLC summary table ────────────────────────────────────────────────────
-    tbl_rows: list[dict] = []
-    for sym in filtered:
-        df_s = ohlc_store.get(sym)
-        if df_s is None or df_s.empty or "Close" not in df_s.columns:
-            continue
-        last_close = float(df_s["Close"].iloc[-1])
-        prev_close = float(df_s["Close"].iloc[-2]) if len(df_s) > 1 else last_close
-        chg_pct = (last_close - prev_close) / prev_close * 100 if prev_close else 0.0
-        tbl_rows.append({
-            "symbol":    sym,
-            "bars":      len(df_s),
-            "from":      str(df_s.index.min().date()),
-            "to":        str(df_s.index.max().date()),
-            "last_close": round(last_close, 2),
-            "1d_chg_%":  round(chg_pct, 2),
-        })
-
-    if tbl_rows:
-        st.dataframe(
-            pd.DataFrame(tbl_rows),
-            hide_index=True,
-            width="stretch",
-            height=min(320, len(tbl_rows) * 35 + 40),
-            column_config={
-                "symbol":     st.column_config.TextColumn("Symbol"),
-                "bars":       st.column_config.NumberColumn("Bars",       format="%,d"),
-                "from":       st.column_config.TextColumn("From"),
-                "to":         st.column_config.TextColumn("To"),
-                "last_close": st.column_config.NumberColumn("Last Close", format="$%,.2f"),
-                "1d_chg_%":   st.column_config.NumberColumn("1d Chg %",  format="%.2f%%"),
-            },
-        )
-
-    if not filtered:
-        st.info("No symbols match — try a shorter prefix.")
-        return
+    # ── Portfolio Treemap ─────────────────────────────────────────────────────
+    pos_df = _filter_positions(snap.positions, acct)
+    if not pos_df.empty:
+        df_tree = pos_df.copy()
+        if "margin_init" not in df_tree.columns:
+            df_tree["margin_est"] = position_margin_est(df_tree)
+            m_col = "margin_est"
+        else:
+            m_col = "margin_init"
+            
+        if "unrealizedPNL" in df_tree.columns and m_col in df_tree.columns:
+            df_tree["unrealizedPNL"] = df_tree["unrealizedPNL"].fillna(0)
+            df_tree[m_col] = df_tree[m_col].fillna(0)
+            
+            tree_agg = df_tree.groupby("symbol").agg({
+                "unrealizedPNL": "sum",
+                m_col: "sum",
+            }).reset_index()
+            
+            tree_agg = tree_agg[tree_agg[m_col] > 0]
+            if not tree_agg.empty:
+                fig_tree = px.treemap(
+                    tree_agg,
+                    path=["symbol"],
+                    values=m_col,
+                    color="unrealizedPNL",
+                    color_continuous_scale="RdYlGn",
+                    color_continuous_midpoint=0,
+                )
+                fig_tree.update_traces(
+                    marker=dict(line=dict(color='rgba(0,0,0,0)')),
+                    hovertemplate='<b>%{label}</b><br>Margin: $%{value:,.0f}<br>P&L: $%{color:,.0f}<extra></extra>'
+                )
+                fig_tree.update_layout(
+                    margin=dict(t=10, l=10, r=10, b=10),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    height=320,
+                )
+                st.plotly_chart(fig_tree, width="stretch")
+            else:
+                st.info("No positions with margin > 0.")
 
     # ── Chart symbol selector ─────────────────────────────────────────────────
     selected_sym: str | None = st.selectbox(
         "Select symbol for chart & position summary",
-        filtered,
+        all_symbols,
         key="analysis_chart_sym",
     )
     if not selected_sym or selected_sym not in ohlc_store:
@@ -1735,6 +1769,7 @@ def render_analysis() -> None:
         from src.dashboard.state import classify_portfolio as _cpf  # noqa: PLC0415
         sym_pos = _cpf(pos_df[pos_df["symbol"] == selected_sym].copy())
         sym_pos = _join_tickers(sym_pos, snap.tickers)
+        sym_pos["delta_$"] = position_delta_dollars(sym_pos)
 
     sum_c1, sum_c2, sum_c3, sum_c4 = st.columns(4)
     if not sym_pos.empty:
@@ -1772,7 +1807,35 @@ def render_analysis() -> None:
     )
     x = df_chart.index
 
-    # Row 1 — price
+    # Bollinger Bands first (behind candles)
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=bb_upper, name=f"BB Upper (SMA20+{bb_mult}σ)",
+            line={"color": "rgba(251,191,36,0.7)", "width": 1},
+            hovertemplate="<b>BB Upper</b>: %{y:,.2f}<br>%{x|%b %d}<extra></extra>",
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=bb_lower, name=f"BB Lower (SMA20-{bb_mult}σ)",
+            line={"color": "rgba(251,191,36,0.7)", "width": 1},
+            fill="tonexty",
+            fillcolor="rgba(251,191,36,0.10)",
+            hovertemplate="<b>BB Lower</b>: %{y:,.2f}<br>%{x|%b %d}<extra></extra>",
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=bb_mid, name="SMA 20",
+            line={"color": "rgba(251,191,36,1.0)", "width": 1, "dash": "dot"},
+            hovertemplate="<b>SMA 20</b>: %{y:,.2f}<br>%{x|%b %d}<extra></extra>",
+        ),
+        row=1, col=1,
+    )
+
+    # Row 1 — price (rendered on top of BB)
     if has_ohlc:
         fig.add_trace(
             go.Candlestick(
@@ -1783,11 +1846,12 @@ def render_analysis() -> None:
                 increasing_line_color="#22c55e",
                 decreasing_line_color="#ef4444",
                 showlegend=False,
-                hoverlabel={
-                    "bgcolor":     "#1e2130",
-                    "font_color":  "#f1f5f9",
-                    "bordercolor": "#475569",
-                },
+                hovertemplate=(
+                    "<b style='color:#1e2130'>" + selected_sym + "</b><br>"
+                    "O: %{open:,.2f}  H: %{high:,.2f}<br>"
+                    "L: %{low:,.2f}  C: %{close:,.2f}"
+                    "<extra></extra>"
+                ),
             ),
             row=1, col=1,
         )
@@ -1796,33 +1860,17 @@ def render_analysis() -> None:
             go.Scatter(x=x, y=close, name="Close", line={"color": "#60a5fa", "width": 1.5}),
             row=1, col=1,
         )
-
-    # Bollinger Bands — shaded ribbon (no hover: the legend already labels them)
-    fig.add_trace(
-        go.Scatter(
-            x=x, y=bb_upper, name=f"BB Upper (SMA20+{bb_mult}σ)",
-            line={"color": "rgba(251,191,36,0.7)", "width": 1},
-            hoverinfo="skip",
-        ),
+    
+    # Add horizontal line for current price
+    fig.add_hline(
+        y=_last_close_v,
+        line_color="#3b82f6", # blue
+        line_width=1,
+        line_dash="solid",
         row=1, col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x, y=bb_lower, name=f"BB Lower (SMA20-{bb_mult}σ)",
-            line={"color": "rgba(251,191,36,0.7)", "width": 1},
-            fill="tonexty",
-            fillcolor="rgba(251,191,36,0.10)",
-            hoverinfo="skip",
-        ),
-        row=1, col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x, y=bb_mid, name="SMA 20",
-            line={"color": "rgba(251,191,36,1.0)", "width": 1, "dash": "dot"},
-            hoverinfo="skip",
-        ),
-        row=1, col=1,
+        annotation_text=f"Px: ${_last_close_v:,.2f}",
+        annotation_position="top left",
+        annotation_font_color="#3b82f6",
     )
 
     # Row 2 — RSI
@@ -1924,15 +1972,15 @@ def render_analysis() -> None:
                 annotation_text=_label,
                 annotation_position="top left",
                 annotation_font_size=9,
-                annotation_font_color="#e2e8f0",       # white — always readable
-                annotation_bgcolor="rgba(10,10,10,0.88)",
+                annotation_font_color="#1e2130",       # dark — always readable
+                annotation_bgcolor="rgba(255,255,255,0.88)",
                 annotation_bordercolor=_lc,
                 row=1, col=1,
             )
 
     # ── Force dark tooltip on every trace (layout-level hoverlabel is ignored
     #    by Scatter/Candlestick in many Plotly versions) ──────────────────────
-    _hl = {"bgcolor": "#1e2130", "font": {"color": "#f1f5f9", "size": 11}, "bordercolor": "#475569"}
+    _hl = {"bgcolor": "#ffffff", "font": {"color": "#1e2130", "size": 11}, "bordercolor": "#cbd5e1"}
     fig.update_traces(hoverlabel=_hl)
 
     # ── Layout & tooltip colours ──────────────────────────────────────────────
@@ -1941,8 +1989,8 @@ def render_analysis() -> None:
         showlegend=True,
         legend={
             "orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1,
-            "bgcolor": "rgba(14,17,23,0.82)",
-            "font": {"color": "#e2e8f0"},
+            "bgcolor": "rgba(248, 249, 250, 0.82)",
+            "font": {"color": "#1e2130"},
         },
         margin={"l": 10, "r": 10, "t": 60, "b": 10},
         xaxis_rangeslider_visible=False,
@@ -1950,9 +1998,9 @@ def render_analysis() -> None:
         paper_bgcolor="rgba(0,0,0,0)",
         # Fix white-on-white tooltip: force dark background with light text
         hoverlabel={
-            "bgcolor":     "#1e2130",
-            "font_color":  "#f1f5f9",
-            "bordercolor": "#475569",
+            "bgcolor":     "#ffffff",
+            "font_color":  "#1e2130",
+            "bordercolor": "#cbd5e1",
             "font_size":   11,
         },
     )
@@ -1960,29 +2008,60 @@ def render_analysis() -> None:
 
     st.plotly_chart(fig, width="stretch")
 
-    # ── Per-symbol position detail table ──────────────────────
-    if not sym_pos.empty:
-        st.markdown(f"**{selected_sym} — positions**")
+    # ── Per-symbol position detail table (always rendered) ──────────────────────
+    st.markdown(f"**{selected_sym} — positions**")
+    if sym_pos.empty:
+        st.caption(f"No positions held for {selected_sym}.")
+    else:
+        sym_pos = sym_pos.copy()
+        # Add DTE column
+        if "expiry" in sym_pos.columns:
+            sym_pos["dte"] = _dte_series(sym_pos["expiry"]).fillna(0).astype(int)
+        # Add margin column
+        if "margin_init" in sym_pos.columns:
+            _sym_mcol = "margin_init"
+            _sym_mlabel = "Margin"
+        else:
+            sym_pos["margin_est"] = position_margin_est(sym_pos)
+            _sym_mcol = "margin_est"
+            _sym_mlabel = "Margin*"
+        # ITM mask for row shading
+        _s_und = sym_pos["underlying_px"] if "underlying_px" in sym_pos.columns else pd.Series(float("nan"), index=sym_pos.index)
+        _s_str = sym_pos["strike"] if "strike" in sym_pos.columns else pd.Series(float("nan"), index=sym_pos.index)
+        _s_rgt = sym_pos["right"] if "right" in sym_pos.columns else pd.Series("", index=sym_pos.index)
+        _s_itm = (
+            ((sym_pos["secType"] == "OPT") & (_s_rgt == "C") & (_s_und > _s_str))
+            | ((sym_pos["secType"] == "OPT") & (_s_rgt == "P") & (_s_und < _s_str))
+        ).to_numpy(dtype=bool)
+
         disp_cols = [
-            "account", "secType", "right", "strike", "expiry",
-            "position", "avgCost", "marketPrice", "marketValue",
-            "unrealizedPNL", "delta", "theta",
+            "symbol", "secType", "underlying_px", "right", "strike", "expiry", "dte",
+            "position", "pf_state", "avgCost", "marketPrice", "marketValue",
+            "unrealizedPNL", "delta", "theta", "vega", "iv", "delta_$",
         ]
-        if "pf_state" in sym_pos.columns:
-            disp_cols.append("pf_state")
-        view = sym_pos[[c for c in disp_cols if c in sym_pos.columns]].copy()
+        if _sym_mcol in sym_pos.columns:
+            disp_cols.append(_sym_mcol)
+        sym_view = sym_pos[[c for c in disp_cols if c in sym_pos.columns]].reset_index(drop=True)
         st.dataframe(
-            _banded(view),
+            _banded(sym_view, _s_itm),
             hide_index=True,
             width="stretch",
             column_config={
+                "symbol":        st.column_config.TextColumn("Symbol"),
+                "underlying_px": st.column_config.NumberColumn("Underlying", format="$%.2f"),
+                "right":         st.column_config.TextColumn("C/P"),
+                "dte":           st.column_config.NumberColumn("DTE",        format="%.0f"),
                 "strike":        st.column_config.NumberColumn("Strike",     format="$%,.1f"),
                 "avgCost":       st.column_config.NumberColumn("Avg Cost",   format="$%,.2f"),
                 "marketPrice":   st.column_config.NumberColumn("Mkt Px",     format="$%,.2f"),
                 "marketValue":   st.column_config.NumberColumn("Mkt Val",    format="$%,.0f"),
                 "unrealizedPNL": st.column_config.NumberColumn("Unreal P&L", format="$%,.0f"),
-                "delta":         st.column_config.NumberColumn("Δ Delta",   format="%.3f"),
-                "theta":         st.column_config.NumberColumn("Θ Theta",   format="%.3f"),
+                "delta":         st.column_config.NumberColumn("Δ Delta",    format="%.3f"),
+                "theta":         st.column_config.NumberColumn("Θ Theta",    format="%.3f"),
+                "vega":          st.column_config.NumberColumn("ν Vega",     format="%.3f"),
+                "iv":            st.column_config.NumberColumn("IV",         format="%.3f"),
+                "delta_$":       st.column_config.NumberColumn("Delta $",    format="$%,.0f"),
+                _sym_mcol:       st.column_config.NumberColumn(_sym_mlabel,  format="$%,.0f"),
                 "pf_state":      st.column_config.TextColumn("State"),
             },
         )
@@ -1992,21 +2071,40 @@ def render_analysis() -> None:
 # Layout
 # ---------------------------------------------------------------------------
 
+_nav_c1, _nav_c2, _ = st.columns([4, 1, 6])
+with _nav_c1:
+    nav = st.radio(
+        "Navigation",
+        ["Positions", "Orders", "Analysis", "Diagnostics"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+with _nav_c2:
+    if len(_REAL_ACCOUNTS) > 1:
+        st.selectbox(
+            "Account",
+            list(_ACCOUNT_OPTIONS.keys()),
+            key="acct_sel",
+            label_visibility="collapsed",
+        )
+    elif _REAL_ACCOUNTS:
+        st.caption(next(iter(_REAL_ACCOUNTS)))
+
 header()
 kpi_strip()
+st.divider()
 
-tabs = st.tabs(["Positions", "Orders", "Analysis", "Diagnostics"])
-with tabs[0]:
+if nav == "Positions":
     render_positions()
     st.divider()
     render_risk()
-with tabs[1]:
+elif nav == "Orders":
     _ord_col, _cfg_col = st.columns([3, 1])
     with _ord_col:
         render_orders()
     with _cfg_col:
         render_config_panel()
-with tabs[2]:
+elif nav == "Analysis":
     render_analysis()
-with tabs[3]:
+elif nav == "Diagnostics":
     render_diagnostics()
