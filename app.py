@@ -1035,10 +1035,12 @@ def render_orders() -> None:
     # ── Subprocess state ─────────────────────────────────────────────────────
     proc: subprocess.Popen | None       = st.session_state.get("derive_proc")
     ohlc_proc: subprocess.Popen | None  = st.session_state.get("ohlc_proc")
+    exec_proc: subprocess.Popen | None  = st.session_state.get("execute_proc")
     frozen     = client.is_frozen()
     proc_done  = proc is not None and proc.poll() is not None
     ohlc_done  = ohlc_proc is not None and ohlc_proc.poll() is not None
-    frozen_for = st.session_state.get("frozen_for", "")   # "derive" | "ohlc" | ""
+    exec_done  = exec_proc is not None and exec_proc.poll() is not None
+    frozen_for = st.session_state.get("frozen_for", "")   # "derive" | "ohlc" | "execute" | ""
 
     # Auto-unfreeze: derive finished
     if frozen and proc_done and frozen_for == "derive":
@@ -1056,12 +1058,21 @@ def render_orders() -> None:
         st.session_state.pop("frozen_for", None)
         st.rerun()
 
+    # Auto-unfreeze: Execute finished
+    if frozen and exec_done and frozen_for == "execute":
+        client.unfreeze()
+        st.session_state["execute_proc"] = None
+        st.session_state.pop("_execute_exit", None)
+        st.session_state.pop("frozen_for", None)
+        st.rerun()
 
     # Capture exit codes the moment each process ends
     if proc is not None and proc.poll() is not None and "_derive_exit" not in st.session_state:
         st.session_state["_derive_exit"] = proc.poll()
     if ohlc_proc is not None and ohlc_proc.poll() is not None and "_ohlc_exit" not in st.session_state:
         st.session_state["_ohlc_exit"] = ohlc_proc.poll()
+    if exec_proc is not None and exec_proc.poll() is not None and "_execute_exit" not in st.session_state:
+        st.session_state["_execute_exit"] = exec_proc.poll()
 
     # ── Imports needed by Generate OHLCs ──────────────────────────────────────
     from src.dashboard.ohlc import (   # noqa: PLC0415  (local import inside fragment)
@@ -1070,7 +1081,7 @@ def render_orders() -> None:
         write_symbol_list,
     )
 
-    # ── Action buttons — all three on one row ─────────────────────────────────
+    # ── Action buttons — row 1: generate/fetch/clear ────────────────────────────
     gen_col, ohlc_col, clr_col, _btn_spacer = st.columns([2, 2, 2, 5])
 
     # ── Generate Orders ────────────────────────────────────────────────────────
@@ -1189,9 +1200,57 @@ def render_orders() -> None:
             # which can race with the IBKR connection and produce error 326.
         st.caption("Keeps OHLC store.")
 
-    # ── Status row (derive + OHLC) ────────────────────────────────────────────
-    if frozen or "_derive_exit" in st.session_state or "_ohlc_exit" in st.session_state:
-        gen_status_col, ohlc_status_col, _st_spacer = st.columns([3, 3, 5])
+    # ── Action buttons — row 2: execute orders ────────────────────────────────
+    exec_col, _exec_spacer = st.columns([2, 9])
+    with exec_col:
+        # Execute Orders button with confirmation dialog
+        @st.dialog("⚠️ Confirm Order Execution", width="small")
+        def _confirm_execute():
+            st.markdown(
+                "This will execute all orders from the Suggested Orders section. "
+                "**This action is irreversible.** Are you sure?"
+            )
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Execute", width="stretch", use_container_width=True):
+                    st.session_state["_exec_confirmed"] = True
+                    st.rerun()
+            with col2:
+                if st.button("❌ Cancel", width="stretch", use_container_width=True):
+                    st.session_state["_exec_confirmed"] = False
+                    st.rerun()
+
+        if st.button(
+            "▶️ Execute Orders",
+            disabled=frozen,
+            width="stretch",
+            help="Execute all orders from the Suggested Orders section. "
+                 "Freezes the dashboard, runs execute.py, then reconnects. "
+                 "⚠️ This is IRREVERSIBLE.",
+        ):
+            _confirm_execute()
+
+        # Check if user confirmed and execute
+        if st.session_state.get("_exec_confirmed"):
+            st.session_state.pop("_exec_confirmed", None)
+            _EXECUTE_LOG = _here() / "log" / "execute.log"
+            _EXECUTE_LOG.parent.mkdir(parents=True, exist_ok=True)
+            log_fh = open(_EXECUTE_LOG, "w", encoding="utf-8")  # noqa: SIM115
+            _env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+            st.session_state.pop("_execute_exit", None)
+            st.session_state["frozen_for"] = "execute"
+            client.freeze()
+            exec_proc = subprocess.Popen(
+                [sys.executable, str(_here() / "execute.py")],
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                env=_env,
+            )
+            st.session_state["execute_proc"] = exec_proc
+
+    # ── Status row (derive + OHLC + execute) ────────────────────────────────────
+    if frozen or "_derive_exit" in st.session_state or "_ohlc_exit" in st.session_state or "_execute_exit" in st.session_state:
+        gen_status_col, ohlc_status_col, exec_status_col, _st_spacer = st.columns([2.5, 2.5, 2.5, 2.5])
         with gen_status_col:
             if frozen and frozen_for == "derive":
                 _pct, phase, _ = _derive_progress()
@@ -1211,12 +1270,30 @@ def render_orders() -> None:
                     st.success("✅ OHLCs up to date")
                 else:
                     st.error(f"❌ OHLC fetch failed (exit {rc})")
+        with exec_status_col:
+            if frozen and frozen_for == "execute":
+                st.progress(0.5, text="⏳ Executing orders…")
+            elif "_execute_exit" in st.session_state:
+                rc = st.session_state["_execute_exit"]
+                if rc == 0:
+                    st.success("✅ Orders executed")
+                else:
+                    st.error(f"❌ Order execution failed (exit {rc})")
 
     # ── Scrollable log (live during freeze; collapsible after) ────────────────
     if frozen and frozen_for == "ohlc":
         _ohlc_live = _ohlc_log_lines(30)
         if _ohlc_live:
             st.code("\n".join(_ohlc_live), language=None)
+    elif frozen and frozen_for == "execute":
+        _exec_log = _here() / "log" / "execute.log"
+        if _exec_log.exists():
+            try:
+                _exec_live = _exec_log.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
+                if _exec_live:
+                    st.code("\n".join(_exec_live), language=None)
+            except Exception:
+                pass
     elif frozen:
         log_lines = _derive_log_lines(35)
         if log_lines:
@@ -1245,6 +1322,20 @@ def render_orders() -> None:
                     )
                 except Exception as _e:
                     st.warning(f"Could not read OHLC log: {_e}")
+
+    # Post-run Execute log — collapsible after freeze ends
+    if "_execute_exit" in st.session_state:
+        rc = st.session_state["_execute_exit"]
+        _EXECUTE_LOG = _here() / "log" / "execute.log"
+        with st.expander("📋 execute.py log", expanded=rc != 0):
+            if _EXECUTE_LOG.exists():
+                try:
+                    st.code(
+                        _EXECUTE_LOG.read_text(encoding="utf-8", errors="replace"),
+                        language=None,
+                    )
+                except Exception as _e:
+                    st.warning(f"Could not read execute log: {_e}")
 
     st.divider()
 
