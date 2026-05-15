@@ -1,87 +1,52 @@
-# Programs for optimized sowing, covering, protecting, reaping and de-orphaning SNPs
+# IB Monitor — IBKR Portfolio Dashboard
 
-The programs are structured along the following lines:
+## Start
 
-## build.py
+```bash
+uv run streamlit run app.py --server.address=127.0.0.1
+```
 
-- builds underlyings and option chains
+## What it does
 
-## classify.py
+Real-time portfolio risk monitor for IBKR accounts. Connects via IB Gateway/TWS and streams live positions, Greeks, and account metrics.
 
-* classifes portfolio, underlyings and open orders to states, as per state logic given below
+## Tabs
 
-## derive.py
+| Tab | Purpose |
+|---|---|
+| **Positions** | Live portfolio with filter bar, Greek columns, ITM row highlighting, margin estimates |
+| **Orders** | Generate derive orders, fetch OHLCs, execute — each as a subprocess that freezes/unfreezes the IBKR connection |
+| **Analysis** | Symbol OHLC chart (candlestick + Bollinger Bands + RSI + Volume), portfolio treemap, per-symbol position detail |
+| **Diagnostics** | Raw account values, connection health, open orders |
 
-* gets the best set of options orders for covering, sowing, protecting, reaping and de-orphaning.
+## Configuration
 
-## execute.py
+Edit `config/snp_config.yml` for PORT, CID, MINCUSHION, MAX_DTE, and strategy parameters.
+Set `US_ACCOUNT` and `SG_ACCOUNT` in `.env`.
 
-* executes the order pickles generated - like df_nkd, df_protect, df_reap.
+## Batch pipeline (run from project root)
 
-## guage.py
+| Command | Purpose |
+|---|---|
+| `uv run python src/build.py` | Fetch qualified contracts and option chains |
+| `uv run python src/derive.py` | Generate optimal option orders |
+| `uv run python src/execute.py` | Execute derived orders in IBKR |
+| `uv run python src/analyze.py` | Portfolio analysis |
+| `uv run python src/fetch_ohlc.py` | Update OHLC history |
+| `uv run python src/clear.py` | Clear data files (preserves `data/master/`) |
 
-* it reports the health of the portfolio and the logic data structures.
+Add `--debug` to any script to show DEBUG output in terminal. DEBUG always goes to `log/<script>.log`.
 
-# State logic is as follows
+## Checks
 
-## Identifying states
+```bash
+uv run ruff check .
+uv run pytest tests/ -q
+uv run python -c "from src.dashboard import settings, ib_client, state, risk, ohlc; print('imports ok')"
+```
 
-There are three dataframes viz: pf, df_openords and df_unds.
-Each of them have the following fields:
+## Requirements
 
-- symbol: for name of the symbol
-- secType: with STK for stock, OPT for option
-- right: with P for put and C for call. Only secType == 'OPT' will have right.
-- action: with SELL or BUY
-- position: an integer that can be positive or negative
-
-### Portfolio state
-
-Portfolio states are derived from dataframe 'pf'
-
-**Note**: Portfolio has 'state' field.
-
-    - 'zen': Perfect. Stock with both covering and protecting option positions
-
-    - 'exposed': Stock positions without any covering or protecting options
-    - 'unprotected': Stock with only covering option position
-    - 'uncovered': Stock with only protecting options position
-
-    - 'straddled': Matching call and put options with no underlying stock
-      - ... straddles are for stocks having earnings declaration within naked time horizon
-
-    - 'covering': Short calls or puts with underlying stock
-    - 'protecting': Long calls or puts with underlying stock
-    - 'sowed': Short options without matching stock positions
-    - 'orphaned': Long options without matching stock position
-
-### Order state
-
-Order states are derived from df_openords
-
-    - 'covering' - an option order symbol with action: SELL, having an underlying stock position derived from pf dataframe
-    - 'protecting' - an option order symbol with action: BUY, having an underlying stock position derived from pf dataframe
-    - 'sowing' - an option order with action: SELL, having no underlying stock position
-    - 'reaping' - an option order with action: BUY, having an underlying option position for the same right and strike
-    - 'straddling' - two option orders with action: BUY for the same symbol, not in portfolio position
-    - 'de-orphaning' - an option order with action: SELL having no underlying stock or any option position
-
-### Symbol States
-
-* Symbol state are derived from portfolio state and order state. They are reflected in df_unds.
-
-  - 'zen': symbol
-    - has a stock both covering and protecting portfolio positions or orders
-    - has 'straddled' portfolio state
-    - has a short 'sowing' order
-    - is in 'unprotected' portfolio state with a 'protecting' order
-    - is in 'uncovered' portfolio state with a 'covering' order
-    - has long option 'orphaned' position with an open 'de-orphaning' order
-    - has short option 'sowed' position with a on open 'reaping' order
-  - 'unreaped': Symbol has a short option position with no open 'reaping' order
-  - 'exposed': Symbol has a stock, but has not covering or protecting order or option position
-  - 'uncovered': Symbol has a stock that is protected, but not covered
-  - 'unprotected': Symbol has a stock that is covered, but not protected
-  - 'virgin': Symbol is not sowed and ready for naked orders
-  - 'orphaned': Symbol has a put or call buy position, but without any underlying
-  - 'unknown': Anything that is not in any one of the above states. (Should not be there!!
+- IBKR Gateway or TWS running with API enabled on the port in `snp_config.yml` (default 1300)
+- `127.0.0.1` in the TWS trusted IP list
+- Python 3.12 · `uv` package manager

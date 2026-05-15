@@ -1,14 +1,25 @@
-  {
-    "permissions": {
-      "allow": [
-        "Edit",
-        "Write",
-        "Bash(echo \"EXIT: $?\")",
-        "Bash(uv add *)",
-        "Bash(echo \"EXIT:$?\")",
-        "Bash(dir \"G:\\\\My Drive\\\\zWIP\\\\ibt\" /b)",
-        "Bash(findstr /i \".md\")",
-        "Bash(echo \"exit:$?\")"
-      ]
-    }
+{
+  "permissions": {
+    "allow": [
+      "Edit",
+      "Write",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(uv add *)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(dir \"G:\\\\My Drive\\\\zWIP\\\\ibt\" /b)",
+      "Bash(findstr /i \".md\")",
+      "Bash(echo \"exit:$?\")",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\kashi\\\\python\\\\ibd\\\\src\\\\dashboard\" -File)",
+      "Bash(Select-Object Name)",
+      "Bash(Remove-Item \"C:\\\\Users\\\\kashi\\\\.claude\\\\projects\\\\C--Users-kashi-python-ibd\\\\memory\\\\feedback_cache_resource_start.md\" -ErrorAction SilentlyContinue)",
+      "Bash(Remove-Item \"C:\\\\Users\\\\kashi\\\\.claude\\\\projects\\\\C--Users-kashi-python-ibd\\\\memory\\\\feedback_ib_client_double_sink.md\" -ErrorAction SilentlyContinue)",
+      "Bash(Remove-Item \"C:\\\\Users\\\\kashi\\\\.claude\\\\projects\\\\C--Users-kashi-python-ibd\\\\memory\\\\feedback_derive_cid_self_conflict.md\" -ErrorAction SilentlyContinue)",
+      "Bash(Remove-Item \"C:\\\\Users\\\\kashi\\\\.claude\\\\projects\\\\C--Users-kashi-python-ibd\\\\memory\\\\feedback_ib_none_override_bug.md\" -ErrorAction SilentlyContinue)",
+      "Bash(Get-ChildItem \"C:\\\\Users\\\\kashi\\\\.claude\\\\projects\\\\C--Users-kashi-python-ibd\\\\memory\\\\\" | Select-Object Name)",
+      "Bash(grep -n \"except Exception$\\\\|except Exception as\" C:/Users/kashi/python/ibd/app.py)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\kashi\\\\python\\\\ibd\" | Where-Object {$_.PSIsContainer} | Format-List Name)",
+      "Bash(git mv *)",
+      "Bash(Move-Item profile_hotpaths.py scripts/profile_hotpaths.py)"
+    ]
   }
+}

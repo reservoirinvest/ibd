@@ -5,6 +5,8 @@ description = "IB vibe programmed"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic>=0.28.0",
+    "google-genai>=1.0.0",
     "basedpyright>=1.32.1",
     "black>=25.9.0",
     "from-root>=1.3.0",

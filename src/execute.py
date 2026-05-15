@@ -11,7 +11,7 @@ from ib_async import LimitOrder
 
 # Import from provided modules
 # pyrefly: ignore [missing-import]
-from build import (
+from src.build import (
     ROOT,
     load_config,
     pickle_me,
@@ -22,7 +22,7 @@ from build import (
 )
 
 # pyrefly: ignore [missing-import]
-from classify import get_financials
+from src.classify import get_financials
 
 # Load environment variables
 dotenv_path = find_dotenv()

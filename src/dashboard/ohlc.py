@@ -43,6 +43,9 @@ MASTER_DIR = here() / "data" / "master"
 OHLC_PATH = MASTER_DIR / "ohlc.pkl"
 SYMS_PATH = here() / "data" / "ohlc_symbols.json"  # written by button, read by subprocess
 LOG_PATH = here() / "log" / "ohlc_progress.log"
+# Persists learned IBKR-symbol → yfinance-ticker overrides (e.g. CSPX → CSPX.L).
+# Auto-updated whenever a .L retry succeeds, so subsequent runs fetch directly.
+_YF_OVERRIDES_PATH = here() / "data" / "yf_ticker_overrides.json"
 
 MIN_DAYS = 548  # 1.5 years ≈ 548 calendar days
 _OHLC_COLS = ["Open", "High", "Low", "Close", "Volume"]
@@ -103,14 +106,13 @@ def ib_to_yf(symbol: str, exchange: str = "SMART", currency: str = "USD") -> str
 
 def load_ohlc() -> dict[str, pd.DataFrame]:
     """Load OHLC store; return {} if not yet created or unreadable."""
-    MASTER_DIR.mkdir(parents=True, exist_ok=True)
     if not OHLC_PATH.exists():
         return {}
     try:
         data = pd.read_pickle(OHLC_PATH)
         return data if isinstance(data, dict) else {}
     except Exception as exc:
-        logger.warning(f"ohlc.pkl unreadable ({exc}) — starting fresh")
+        logger.warning("ohlc.pkl unreadable ({}) — starting fresh", exc)
         return {}
 
 
@@ -140,7 +142,7 @@ def get_sp500_symbols() -> list[SymbolSpec]:
             for s in stocks
         ]
     except Exception as exc:
-        logger.warning(f"symbols.pkl read error: {exc}")
+        logger.warning("symbols.pkl read error: {}", exc)
         return []
 
 
@@ -159,6 +161,24 @@ def load_symbol_list() -> list[SymbolSpec]:
             pass
     # Fallback: S&P500 only (allows running fetch_ohlc.py standalone)
     return get_sp500_symbols()
+
+
+def _load_yf_overrides() -> dict[str, str]:
+    """Load persisted IBKR-symbol → yfinance-ticker overrides (e.g. CSPX → CSPX.L)."""
+    if _YF_OVERRIDES_PATH.exists():
+        try:
+            return json.loads(_YF_OVERRIDES_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_yf_overrides(overrides: dict[str, str]) -> None:
+    _YF_OVERRIDES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _YF_OVERRIDES_PATH.write_text(
+        json.dumps(overrides, indent=2, sort_keys=True, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +234,7 @@ async def _fetch_one_yf(
         cleaned = _clean_df(df)
         return ib_sym, (cleaned if not cleaned.empty else None)
     except Exception as exc:
-        logger.debug(f"yf {yf_tick}: {exc}")
+        logger.debug("yf {}: {}", yf_tick, exc)
         return ib_sym, None
 
 
@@ -333,7 +353,7 @@ async def _fetch_ib_all(
                         if not df.empty:
                             results[sym] = df
                 except Exception as exc:
-                    logger.warning(f"IBKR history {sym}: {exc}")
+                    logger.warning("IBKR history {}: {}", sym, exc)
                 pbar.advance(task_id, 1)
                 pbar.update(task_id, status=sym)
     finally:
@@ -419,6 +439,18 @@ async def _run_async(specs: list[SymbolSpec], log_fh: TextIO) -> None:
     log_fh.write(f"Date range : {earliest} → {today}\n\n")
     log_fh.flush()
 
+    # Apply persisted yfinance ticker overrides (e.g. LSE ETFs: CSPX → CSPX.L).
+    # Overrides are learned automatically from successful .L retries below.
+    _ov = _load_yf_overrides()
+    _ov_applied = 0
+    for spec in all_specs:
+        if spec["symbol"] in _ov and "yf_ticker" not in spec:
+            spec["yf_ticker"] = _ov[spec["symbol"]]
+            _ov_applied += 1
+    if _ov_applied:
+        log_fh.write(f"Applied {_ov_applied} persisted ticker override(s)\n")
+        log_fh.flush()
+
     # ── yfinance pass ────────────────────────────────────────────────────────
     yf_results = await _fetch_yf_all(all_specs, earliest, today, log_fh)
 
@@ -457,6 +489,18 @@ async def _run_async(specs: list[SymbolSpec], log_fh: TextIO) -> None:
                 f"{len(yf_failed)} still need IBKR fallback\n"
             )
             log_fh.flush()
+            # Persist successful .L mappings so next run fetches them directly.
+            if _lse_results:
+                _ov = _load_yf_overrides()
+                for s in _lse_specs:
+                    if s["symbol"] in _lse_results:
+                        _ov[s["symbol"]] = s["yf_ticker"]
+                _save_yf_overrides(_ov)
+                log_fh.write(
+                    f"  Saved {len(_lse_results)} ticker override(s) → "
+                    f"{_YF_OVERRIDES_PATH.name}\n"
+                )
+                log_fh.flush()
 
     if yf_failed:
         log_fh.write(

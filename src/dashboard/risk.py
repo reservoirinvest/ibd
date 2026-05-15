@@ -22,8 +22,17 @@ def _parse_expiry(s: str) -> date | None:
 
 def _dte_series(expiry: pd.Series, today: date | None = None) -> pd.Series:
     today = today or date.today()
-    out = expiry.map(_parse_expiry)
-    return out.map(lambda d: (d - today).days if d else np.nan)
+    today_ord = today.toordinal()
+
+    def _to_dte(s: str) -> float:
+        if not s:
+            return np.nan
+        try:
+            return date(int(s[:4]), int(s[4:6]), int(s[6:8])).toordinal() - today_ord
+        except (ValueError, IndexError):
+            return np.nan
+
+    return expiry.map(_to_dte)
 
 
 def position_delta_dollars(df: pd.DataFrame) -> pd.Series:
@@ -113,33 +122,25 @@ def _join_tickers(positions: pd.DataFrame, tickers: dict[int, TickerSnap]) -> pd
     """
     if positions.empty:
         return positions
-    # Drop any pre-existing ticker columns to keep the merge clean
     existing = [c for c in _TICKER_COLS if c in positions.columns]
     pos = positions.drop(columns=existing) if existing else positions
-    rows = [
-        {
-            "conId": k,
-            "delta": v.delta,
-            "gamma": v.gamma,
-            "theta": v.theta,
-            "vega": v.vega,
-            "iv": v.iv,
-            "underlying_px": v.underlying_px,
-            "last_px": v.last,
-        }
-        for k, v in tickers.items()
-    ]
-    if not rows:
+    if not tickers:
         return pos.assign(
-            delta=np.nan,
-            gamma=np.nan,
-            theta=np.nan,
-            vega=np.nan,
-            iv=np.nan,
-            underlying_px=np.nan,
-            last_px=np.nan,
+            delta=np.nan, gamma=np.nan, theta=np.nan, vega=np.nan,
+            iv=np.nan, underlying_px=np.nan, last_px=np.nan,
         )
-    return pos.merge(pd.DataFrame(rows), on="conId", how="left")
+    # Direct per-row dict lookup — avoids building an intermediate DataFrame and merge.
+    nan = float("nan")
+    ids = pos["conId"].astype(int).values
+    return pos.assign(
+        delta      =np.array([tickers[k].delta       if k in tickers else nan for k in ids], dtype=float),
+        gamma      =np.array([tickers[k].gamma       if k in tickers else nan for k in ids], dtype=float),
+        theta      =np.array([tickers[k].theta       if k in tickers else nan for k in ids], dtype=float),
+        vega       =np.array([tickers[k].vega        if k in tickers else nan for k in ids], dtype=float),
+        iv         =np.array([tickers[k].iv          if k in tickers else nan for k in ids], dtype=float),
+        underlying_px=np.array([tickers[k].underlying_px if k in tickers else nan for k in ids], dtype=float),
+        last_px    =np.array([tickers[k].last        if k in tickers else nan for k in ids], dtype=float),
+    )
 
 
 def _select_account_values(snap: Snapshot, account: str = "") -> dict[str, Decimal]:
@@ -178,11 +179,20 @@ def account_kpis(
     }
 
 
-def greek_dollar_sums(positions: pd.DataFrame, tickers: dict[int, TickerSnap]) -> dict[str, float]:
-    """Sum of dollar delta, theta, vega across the book."""
+def greek_dollar_sums(
+    positions: pd.DataFrame,
+    tickers: dict[int, TickerSnap] | None = None,
+    *,
+    pre_joined: bool = False,
+) -> dict[str, float]:
+    """Sum of dollar delta, theta, vega across the book.
+
+    Pass pre_joined=True when positions has already been through _join_tickers()
+    to avoid a redundant merge.
+    """
     if positions.empty:
         return {"delta_$": 0.0, "theta_$": 0.0, "vega_$": 0.0, "gamma_$": 0.0}
-    df = _join_tickers(positions, tickers).copy()
+    df = positions.copy() if pre_joined else _join_tickers(positions, tickers or {}).copy()
     df["mult"] = np.where(df.secType == "OPT", 100, 1)
     delta = df["delta"].where(df.secType == "OPT", 1.0).fillna(0.0)
     theta = df["theta"].where(df.secType == "OPT", 0.0).fillna(0.0)
@@ -284,11 +294,18 @@ def cover_protect_gaps(
                 except (TypeError, ValueError):
                     pass
 
+    # Pre-group options by symbol: O(n) once vs O(n) per stock in loop.
+    # _empty_opt preserves column schema so downstream attribute access is safe.
+    _empty_opt = opt.iloc[0:0]
+    opt_by_sym: dict[str, pd.DataFrame] = (
+        {s: g for s, g in opt.groupby("symbol")} if not opt.empty else {}
+    )
+
     rows: list[dict] = []
     for sym, grp_stk in stk.groupby("symbol"):
         if (grp_stk.position == 0).all():
             continue
-        sym_opt = opt[opt.symbol == sym]
+        sym_opt = opt_by_sym.get(str(sym), _empty_opt)
         has_short = (sym_opt.position < 0).any()
         has_long = (sym_opt.position > 0).any()
 
@@ -313,13 +330,17 @@ def cover_protect_gaps(
         if needs_protect:
             gap_needs.append("protect")
 
-        # Existing protective long option strike(s), if any
+        # Protective strike: existing long strikes when held; target put when gap exists
         protect_strike_str = ""
-        if protect_me and has_long and "strike" in sym_opt.columns:
-            long_opts = sym_opt[sym_opt["position"] > 0]
-            if not long_opts.empty:
-                strikes = sorted(long_opts["strike"].dropna().unique())
-                protect_strike_str = ", ".join(f"{s:.1f}" for s in strikes)
+        if protect_me:
+            if has_long and "strike" in sym_opt.columns:
+                long_opts = sym_opt[sym_opt["position"] > 0]
+                if not long_opts.empty:
+                    strikes = sorted(long_opts["strike"].dropna().unique())
+                    protect_strike_str = ", ".join(f"{s:.1f}" for s in strikes)
+            elif needs_protect:
+                protect_target = round(mkt_px - cover_std_mult * std_move, 1)
+                protect_strike_str = f"~{protect_target:,.1f}"
 
         rec: dict = {
             "symbol": sym,

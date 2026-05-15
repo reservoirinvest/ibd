@@ -17,61 +17,7 @@ A Streamlit script reruns on every interaction. IBKR connections are expensive a
 3. **The Streamlit script reads** the snapshot — never connects, never awaits.
 4. **`st.fragment(run_every=N)`** triggers partial reruns of just the panel that needs new data.
 
-## The streaming pattern (canonical)
-
-```python
-# src/dashboard/ib_client.py
-import asyncio, concurrent.futures, threading
-# IMPORTANT: import ib_async at MODULE LEVEL — never lazily inside a coroutine.
-# ib_async has a circular import (ib_async.__init__ ↔ ib_async.contract) that
-# raises ImportError when first imported inside a running asyncio event loop.
-from ib_async import IB
-
-class IBClient:
-    _instance = None
-    _lock = threading.Lock()
-
-    def __new__(cls, *a, **kw):
-        with cls._lock:
-            if cls._instance is None:
-                inst = super().__new__(cls)
-                inst._started = False
-                inst._loop_ready = threading.Event()
-                cls._instance = inst
-            return cls._instance
-
-    def start(self, settings):
-        with self._lock:
-            if self._thread is not None:
-                if self._thread.is_alive() or self._thread.ident is None:
-                    return   # already running or just created
-            self._loop_ready.clear()
-            self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        # Create loop INSIDE daemon thread — Windows ProactorEventLoop IOCP
-        # handles are thread-affine; creating in main thread breaks coroutines.
-        self._thread.start()
-        self._loop_ready.wait(timeout=5)
-        asyncio.run_coroutine_threadsafe(self._connect_with_retry(), self._loop)
-
-# In app.py — wrap in st.cache_resource to prevent concurrent reruns double-starting:
-# @st.cache_resource(show_spinner=False)
-# def _start_ib_client():
-#     c = get_client(); c.start(settings); return c
-# client = _start_ib_client()
-
-    def _run_loop(self):
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._loop_ready.set()    # unblocks start()
-        self._loop.run_forever()
-
-    async def _connect(self, host, port, cid):
-        self.ib = IB()
-        self.ib.portfolioEvent += self._on_portfolio
-        self.ib.accountValueEvent += self._on_acct
-        self.ib.pendingTickersEvent += self._on_tickers
-        await self.ib.connectAsync(host, port, clientId=cid)
-```
+Key startup rule: `IBClient.start()` is wrapped in `@st.cache_resource` in `app.py` — see `CLAUDE.md § IBClient`.
 
 ## Pacing rules (memorize)
 
@@ -79,6 +25,7 @@ class IBClient:
 - `genericTickList="106"` = model option computation (greeks). Use this; do not compute greeks yourself for live monitoring.
 - Cancel `reqMktData` on disconnect or when a position closes — `IB.tickers()` is not a free leak.
 - On `error 165` / `error 322`, back off; on `error 1100` (connectivity lost), let `disconnectedEvent` trigger reconnect with exponential backoff.
+- Dashboard logs a warning when subscription count exceeds 50 (added in A2).
 
 ## Streamlit idioms
 
@@ -86,37 +33,26 @@ class IBClient:
 # UI side — no awaits, no IB calls
 @st.fragment(run_every=2.0)
 def kpi_strip():
-    snap = ib_client.snapshot()
+    snap = client.snapshot()
     cols = st.columns(5)
     cols[0].metric("NLV", money(snap.nlv))
     cols[1].metric("Cushion", pct(snap.cushion),
-                   delta=None,
                    delta_color="inverse" if snap.cushion < 0.20 else "normal")
-    ...
 ```
 
-Use `st.cache_data(ttl=...)` only for derivations of the snapshot, not for the snapshot itself (it must be fresh).
+Use `st.cache_data(ttl=...)` only for derivations of the snapshot (e.g. `_cached_ohlc()`), not for the snapshot itself (it must be fresh).
 
-## Greek aggregation (vectorized)
+## Greek aggregation
+
+Implemented as `greek_dollar_sums()` in `src/dashboard/risk.py`. Accepts a positions DataFrame and a `tickers: dict[int, TickerSnap]`. Call with `pre_joined=True` when positions have already been through `_join_tickers()` to avoid a redundant merge:
 
 ```python
-# risk.py
-def greek_sums(positions: pd.DataFrame, tickers: dict) -> dict:
-    df = positions.merge(
-        pd.DataFrame.from_records(
-            [(k, v.delta, v.gamma, v.theta, v.vega) for k, v in tickers.items()],
-            columns=["conId", "delta", "gamma", "theta", "vega"]
-        ),
-        on="conId", how="left",
-    )
-    df["mult"] = np.where(df.secType == "OPT", 100, 1)
-    df["dollar_delta"] = df.position * df.delta.fillna(1) * df.mult * df.underlying_px
-    return {
-        "delta_$":  df.dollar_delta.sum(),
-        "theta_$":  (df.position * df.theta.fillna(0) * df.mult).sum(),
-        "vega_$":   (df.position * df.vega.fillna(0)  * df.mult).sum(),
-    }
+from src.dashboard.risk import greek_dollar_sums
+sums = greek_dollar_sums(df, snap.tickers)             # standard call
+sums = greek_dollar_sums(joined_df, pre_joined=True)   # skip redundant join
 ```
+
+Returns `{"delta_$": float, "theta_$": float, "vega_$": float, "gamma_$": float}`.
 
 ## Common pitfalls
 
@@ -132,7 +68,7 @@ def greek_sums(positions: pd.DataFrame, tickers: dict) -> dict:
 | `IBClient.start()` logged 2–3× at same millisecond; error 326 cascade | Concurrent Streamlit reruns all execute module-level `client.start()` — thread guard alone cannot block N simultaneous callers that all see dead thread before any creates T2 | Wrap start in `@st.cache_resource(show_spinner=False)` — Streamlit guarantees exactly-once execution per server process. Thread guard is now a safety-net for crash-restart only |
 | derive.py: "Connection attempt N failed ()" — empty error for qualify/chains/volatilities | derive.py called `ib = get_ib_connection()` BEFORE `classifed_results()` — its open CID=10 blocks all internal connections in `chains_n_unds` | Move `ib = get_ib_connection()` to AFTER `classifed_results()` and `get_open_orders()` |
 | `get_volatilities_snapshot(ib=ib)` / `get_option_chains(ib=ib)` ignored the passed connection | `ib = None` as first line of function body unconditionally overrode the `ib` parameter — always created a fresh connection | Remove the `ib = None` override line; `if ib is None: ib = get_ib_connection()` guard then works correctly |
-| derive.py: "Connection attempt N failed ()" — subprocess freeze was called first | Button handler called `st.rerun()` after `Popen()` — full-page rerun fires `_connect_with_retry` on daemon thread, dashboard reclaims CID=10 before subprocess connects | **Never** call `st.rerun()` after `freeze()` + `Popen()` in a button handler; rely on `run_every` timer |
+| derive.py: error 326 cascade after subprocess freeze | Button handler called `st.rerun()` after `Popen()` — full-page rerun fires `_connect_with_retry` on daemon thread, dashboard reclaims CID=10 before subprocess connects | **Never** call `st.rerun()` after `freeze()` + `Popen()` in a button handler; rely on `run_every` timer |
 | `chains_n_unds` crashes: `ValueError: Cannot set a DataFrame without columns` | `get_volatilities_snapshot` returns `pd.DataFrame()` (no columns) on failure; `apply(axis=1)` returns a DataFrame not a Series; column access also KeyErrors | Guard: `if not df_unds.empty and 'symbol' in df_unds.columns:` before apply AND before column access |
 
 ## Don't
@@ -143,31 +79,15 @@ def greek_sums(positions: pd.DataFrame, tickers: dict) -> dict:
 
 ---
 
-## IBKR subprocess / CID rules ← READ BEFORE WRITING ANY SUBPROCESS
+## IBKR subprocess / CID rules
 
-Dashboard owns **CID=10**. No other process may connect without `client.freeze()` first.
-Full rules in `CLAUDE.md § SUBPROCESS / CID RULES`. Key pattern:
-
-```python
-# Button handler — freeze BEFORE Popen, NO st.rerun() after
-st.session_state["frozen_for"] = "mytask"
-client.freeze()
-proc = subprocess.Popen([sys.executable, "myscript.py"], ...)
-st.session_state["mytask_proc"] = proc
-# run_every timer handles UI refresh — no st.rerun() needed here
-
-# Auto-unfreeze in next run_every cycle
-if client.is_frozen() and proc.poll() is not None \
-        and st.session_state.get("frozen_for") == "mytask":
-    client.unfreeze()   # 5-second delayed reconnect — IBKR needs time to release CID
-    st.session_state.pop("frozen_for", None)
-    st.rerun()
-```
+Dashboard owns **CID=10**. No other process may connect without `client.freeze()` first.  
+Full pattern in `CLAUDE.md § SUBPROCESS / CID RULES`. Auto-unfreeze uses the `_auto_unfreeze(tag, proc_key)` helper in `render_orders()`.
 
 | Call | Effect |
 |---|---|
 | `freeze()` | `_frozen=True`, disconnects socket. Snapshot readable (last-known). |
-| `unfreeze()` | `_frozen=False`, schedules reconnect after 5 s. |
+| `unfreeze()` | `_frozen=False`, schedules reconnect after `_UNFREEZE_DELAY_SECS` (5 s). |
 
 Subprocess checklist:
 - [ ] Does **not** import `src.dashboard.ib_client`

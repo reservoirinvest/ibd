@@ -6,10 +6,11 @@ Snapshot's positions DataFrame, with no IBKR side-effects.
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 
-def _flag_by_symbol(df: pd.DataFrame, mask: pd.Series, all_syms) -> pd.Series:
+def _flag_by_symbol(df: pd.DataFrame, mask: pd.Series, all_syms: np.ndarray) -> pd.Series:
     return df[mask].groupby("symbol")["position"].size().reindex(all_syms, fill_value=0).gt(0)
 
 

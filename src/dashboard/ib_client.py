@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import math
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -53,12 +55,33 @@ class Snapshot:
     errors: deque[tuple] = field(default_factory=lambda: deque(maxlen=50))
     # Set after _fetch_what_if_margins completes; None = not yet fetched
     margins_as_of: datetime | None = None
+    # Set when connection drops; cleared when reconnected. Used for UI staleness display.
+    stale_since: datetime | None = None
 
 
 # ---------------------------------------------------------------------------
 # Singleton client
 # ---------------------------------------------------------------------------
 
+
+_UNFREEZE_DELAY_SECS = 5.0    # IBKR needs this long to release the CID after disconnect
+_BOOTSTRAP_SETTLE_SECS = 3.0  # wait for TWS to push initial portfolio/account events
+
+# Circuit breaker — stops hammering IBKR after repeated failures
+_CB_FAILURE_THRESHOLD: int = 5      # consecutive failures before circuit opens
+_CB_RESET_SECS: float = 300.0       # seconds the circuit stays OPEN before half-open attempt
+
+# Health check — detects zombie connections where isConnected() is stale
+_HEALTH_CHECK_INTERVAL_SECS: float = 30.0
+
+# Market-data pacing ceiling — warn when active OPT reqMktData feeds exceed this.
+# IBKR Pro accounts support far more than 50 concurrent streams; 100 is a safe
+# operational limit before errors 100/165 become likely under load.
+_MKTDATA_PACING_CEILING: int = 100
+
+# Error code classification
+_IBKR_INFO_CODES: frozenset[int] = frozenset({2104, 2106, 2158, 2107, 2103, 2105, 2108})
+_IBKR_PACING_CODES: frozenset[int] = frozenset({100, 165, 322})
 
 _POSITION_COLUMNS = [
     "account",
@@ -124,6 +147,31 @@ class IBClient:
         self._connecting = False  # True while _connect_with_retry coroutine is alive
         self._frozen = False  # True while derive.py holds the CID exclusively
         self._loop_ready = threading.Event()  # set once run_forever() is live
+        # Circuit breaker state
+        self._cb_failures: int = 0
+        self._cb_opened_at: float = 0.0
+        self._cb_state: str = "closed"  # "closed" | "open" | "half_open"
+        # Health check generation counter — incremented on each successful connect
+        self._health_gen: int = 0
+        # Connection timing and attempt tracking for structured logging
+        self._connect_start_time: float = 0.0  # monotonic timestamp of last successful connect
+        self._connect_attempts: int = 0         # resets to 0 on each successful connect
+        # Dict-backed position store: (conId, account) → row dict.
+        # _on_portfolio and _on_position write here (O(1) per event);
+        # _snap.positions is rebuilt from this dict after each write.
+        # Reading through snapshot() is unaffected.
+        self._positions_store: dict[tuple[int, str], dict] = {}
+        # Bootstrap gate: False during initial portfolio push so _on_portfolio /
+        # _on_position don't queue 100+ resubscription coroutines. Set True once
+        # _bootstrap() has called _resubscribe_market_data() directly.
+        self._bootstrapped: bool = False
+        # Debounce: True while a _resubscribe_market_data coroutine is already queued.
+        # Prevents a storm of duplicate coroutines when TWS sends a burst of
+        # updatePortfolioEvent refreshes (e.g. periodic account statement updates).
+        self._resubscribe_pending: bool = False
+        # Tracks conIds with active reqMktData calls (OPT only).
+        # Distinct from _subscribed which counts all positions (STK + OPT).
+        self._mktdata_subs: set[int] = set()
 
     # ---- public API --------------------------------------------------------
 
@@ -156,7 +204,16 @@ class IBClient:
         self._settings = settings or get_settings()
 
         if add_sink:
+            import sys
             from pyprojroot import here as _here  # avoid circular at module level
+
+            logger.remove()  # clear default stderr sink (DEBUG) that spams terminal
+            logger.add(
+                sys.stderr,
+                level="INFO",
+                colorize=True,
+                format="<green>{time:HH:mm:ss}</green> | <level>{level:<7}</level> | {message}",
+            )
 
             _log_path = _here() / "log" / "dashboard.log"
             _log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -211,6 +268,7 @@ class IBClient:
                 orders=s.orders.copy(deep=False),
                 errors=deque(s.errors, maxlen=50),
                 margins_as_of=s.margins_as_of,
+                stale_since=s.stale_since,
             )
 
     def freeze(self) -> None:
@@ -220,8 +278,10 @@ class IBClient:
         will not spawn a reconnect loop while derive is running.
         """
         self._frozen = True  # guard must be set first
+        self._bootstrapped = False
         if self._loop:
             self._loop.call_soon_threadsafe(self._subscribed.clear)
+            self._loop.call_soon_threadsafe(self._mktdata_subs.clear)
         if self._loop and self._ib:
             asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop)
         with self._snap_lock:
@@ -245,7 +305,7 @@ class IBClient:
 
             async def _delayed_connect() -> None:
                 try:
-                    await asyncio.sleep(5.0)
+                    await asyncio.sleep(_UNFREEZE_DELAY_SECS)
                     if not self._frozen:
                         # _connect_with_retry manages _connecting itself; reset first
                         self._connecting = False
@@ -259,6 +319,17 @@ class IBClient:
     def is_frozen(self) -> bool:
         return self._frozen
 
+    @property
+    def circuit_state(self) -> str:
+        """Current circuit breaker state: 'closed', 'open', or 'half_open'."""
+        return self._cb_state
+
+    def reset_circuit_breaker(self) -> None:
+        """Manually reset the circuit breaker to closed state and retry immediately."""
+        self._cb_failures = 0
+        self._cb_state = "closed"
+        logger.info("Circuit breaker manually reset to CLOSED")
+
     def schedule_margin_refresh(self) -> None:
         """Kick off a background what-if margin refresh (non-blocking)."""
         if self._loop and self._ib and self._ib.isConnected():
@@ -270,6 +341,7 @@ class IBClient:
         return list(self._managed_accounts)
 
     def stop(self) -> None:
+        """Gracefully disconnect and stop the daemon event loop. Used in tests and shutdown."""
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop).result(timeout=3)
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -295,7 +367,12 @@ class IBClient:
             logger.info("ib-client event loop stopped")
 
     async def _connect_with_retry(self) -> None:
-        """Connect with exponential backoff. Idempotent — at most one live instance."""
+        """Connect with exponential backoff and circuit breaker.
+
+        Circuit breaker opens after _CB_FAILURE_THRESHOLD consecutive failures and
+        pauses all reconnection attempts for _CB_RESET_SECS. After the pause it enters
+        HALF_OPEN and allows a single probe attempt; success → CLOSED, failure → OPEN again.
+        """
         if self._connecting:
             return
         self._connecting = True
@@ -306,6 +383,23 @@ class IBClient:
                 if self._frozen:
                     logger.info("Connection retry suppressed — dashboard frozen")
                     return
+
+                # ---- Circuit breaker guard ----
+                if self._cb_state == "open":
+                    elapsed = time.monotonic() - self._cb_opened_at
+                    remaining = max(0.0, _CB_RESET_SECS - elapsed)
+                    if remaining > 0:
+                        logger.warning(
+                            "Circuit breaker OPEN ({} failures) — waiting {:.0f}s before retry",
+                            self._cb_failures,
+                            remaining,
+                        )
+                        await asyncio.sleep(remaining)
+                        continue  # re-check frozen + circuit state
+                    # Reset timeout elapsed → allow one probe attempt
+                    self._cb_state = "half_open"
+                    logger.info("Circuit breaker HALF-OPEN — probing connection")
+
                 try:
                     # always tear down the previous IB before a new attempt
                     if self._ib is not None:
@@ -313,6 +407,15 @@ class IBClient:
                             self._ib.disconnect()
                         except Exception:  # noqa: BLE001
                             pass
+                    self._connect_attempts += 1
+                    logger.info(
+                        "IBKR connect attempt #{} host={} port={} cid={}",
+                        self._connect_attempts,
+                        self._settings.ib_host,
+                        self._settings.ib_port,
+                        self._settings.ib_client_id,
+                    )
+                    self._bootstrapped = False
                     self._ib = IB()
                     self._wire_handlers(self._ib)
                     await self._ib.connectAsync(
@@ -321,15 +424,30 @@ class IBClient:
                         clientId=self._settings.ib_client_id,
                         timeout=10,
                     )
+                    self._connect_start_time = time.monotonic()
+                    self._connect_attempts = 0
                     logger.info(
                         "IBKR connected host={} port={} cid={}",
                         self._settings.ib_host,
                         self._settings.ib_port,
                         self._settings.ib_client_id,
                     )
+                    # Success — reset circuit breaker
+                    self._cb_failures = 0
+                    self._cb_state = "closed"
                     await self._bootstrap()
                     return
                 except Exception as e:  # noqa: BLE001 — network surface
+                    self._cb_failures += 1
+                    if self._cb_failures >= _CB_FAILURE_THRESHOLD:
+                        self._cb_state = "open"
+                        self._cb_opened_at = time.monotonic()
+                        logger.error(
+                            "Circuit breaker OPEN after {} consecutive failures — "
+                            "pausing reconnection for {:.0f}s",
+                            self._cb_failures,
+                            _CB_RESET_SECS,
+                        )
                     logger.warning("IBKR connect failed: {} — retry in {:.1f}s", e, backoff)
                     with self._snap_lock:
                         self._snap.connected = False
@@ -340,6 +458,7 @@ class IBClient:
                             (datetime.now(timezone.utc), -1, f"Connect failed: {e}")
                         )
                     self._subscribed.clear()
+                    self._mktdata_subs.clear()
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 1.7, 60.0)
         finally:
@@ -348,6 +467,7 @@ class IBClient:
     async def _bootstrap(self) -> None:
         """Initial pull of portfolio + account values + orders + subscribe to greeks."""
         assert self._ib is not None and self._settings is not None
+        _bootstrap_t0 = time.monotonic()
         # Discover managed accounts (populated immediately post-connect)
         managed = list(self._ib.managedAccounts())
         self._managed_accounts = managed
@@ -356,6 +476,7 @@ class IBClient:
             masked = ", ".join(self._mask(a) for a in managed) if managed else "<default>"
             self._snap.account = masked
             self._snap.connected = True
+            self._snap.stale_since = None  # clear staleness on successful reconnect
 
         # 1) Subscribe to account updates for each managed account.
         #    reqAccountUpdatesAsync is the async form — safe inside a coroutine.
@@ -378,7 +499,7 @@ class IBClient:
             logger.debug("reqPositionsAsync() skipped: {}", e)
 
         # let TWS push portfolio/account-value events
-        await asyncio.sleep(3.0)
+        await asyncio.sleep(_BOOTSTRAP_SETTLE_SECS)
 
         # force one immediate portfolio pull (in case events were missed)
         for acct in managed or [""]:
@@ -399,14 +520,25 @@ class IBClient:
 
         with self._snap_lock:
             n = len(self._snap.positions)
-        logger.info("Bootstrap complete — {} positions in snapshot", n)
+        logger.info(
+            "Bootstrap complete — {} positions, {:.1f}s elapsed",
+            n,
+            time.monotonic() - _bootstrap_t0,
+        )
 
         # Use frozen data so greeks arrive even when the market is closed.
         # Type 2 = FROZEN: TWS uses last-known prices after hours and automatically
         # upgrades to live data during market hours when a live subscription is active.
         self._ib.reqMarketDataType(2)
         await self._resubscribe_market_data()
+        self._bootstrapped = True
+        logger.info("Bootstrap complete — live resubscription enabled")
         await self._fetch_what_if_margins()
+
+        # Start health check for this connection generation. Each successful connect
+        # increments _health_gen, which causes any older health check loop to exit.
+        self._health_gen += 1
+        asyncio.ensure_future(self._health_check_loop(self._health_gen))
 
     @staticmethod
     def _mask(account: str) -> str:
@@ -516,6 +648,7 @@ class IBClient:
     async def _resubscribe_market_data(self) -> None:
         """Subscribe to market data for currently held option contracts only."""
         assert self._ib is not None
+        self._resubscribe_pending = False  # debounce: allow next event to queue again
         with self._snap_lock:
             held = self._snap.positions.copy()
         if held.empty:
@@ -531,6 +664,7 @@ class IBClient:
                 )
                 if contract is not None:
                     self._ib.cancelMktData(contract)
+                    self._mktdata_subs.discard(con_id)
             except Exception as e:  # noqa: BLE001
                 logger.debug("cancelMktData {}: {}", con_id, e)
         # subscribe to new option contracts
@@ -551,8 +685,47 @@ class IBClient:
         for c in new_cons:
             # 106 = OptionImpliedVolatility / model greeks
             self._ib.reqMktData(c, genericTickList="106", snapshot=False)
+            self._mktdata_subs.add(c.conId)
         if new_cons:
-            logger.info("Subscribed to {} new tickers", len(new_cons))
+            logger.info("Subscribed to {} new tickers ({} total active feeds)",
+                        len(new_cons), len(self._mktdata_subs))
+        if len(self._mktdata_subs) > _MKTDATA_PACING_CEILING:
+            logger.warning(
+                "Active market-data subscriptions {} exceeds pacing ceiling ({}) — "
+                "risk of error 100/165 under load",
+                len(self._mktdata_subs),
+                _MKTDATA_PACING_CEILING,
+            )
+
+    async def _health_check_loop(
+        self, gen: int, interval: float = _HEALTH_CHECK_INTERVAL_SECS
+    ) -> None:
+        """Periodic liveness check while connected.
+
+        Detects zombie connections where the socket appears open but IBKR has stopped
+        responding. Exits automatically when superseded by a newer generation (reconnect)
+        or when frozen. Schedules _connect_with_retry if connection is found dead.
+
+        The `interval` parameter is intentionally overridable for tests (pass a tiny value).
+        """
+        while True:
+            await asyncio.sleep(interval)
+            if gen != self._health_gen or self._frozen:
+                return  # superseded or frozen — exit silently
+            if self._ib is None or not self._ib.isConnected():
+                logger.warning(
+                    "Health check: connection lost (gen={}) — scheduling reconnect", gen
+                )
+                with self._snap_lock:
+                    self._snap.connected = False
+                    if self._snap.stale_since is None:
+                        self._snap.stale_since = datetime.now(timezone.utc)
+                self._subscribed.clear()
+                self._mktdata_subs.clear()
+                if not self._connecting:
+                    asyncio.ensure_future(self._connect_with_retry())
+                return
+            logger.debug("Health check OK (gen={})", gen)
 
     async def _disconnect(self) -> None:
         if self._ib and self._ib.isConnected():
@@ -570,84 +743,97 @@ class IBClient:
         ib.errorEvent += self._on_error
         ib.disconnectedEvent += self._on_disconnect
 
+    @staticmethod
+    def _build_position_row(
+        contract: Contract,
+        account: str,
+        position: float,
+        avg_cost: float,
+        market_price: float = float("nan"),
+        market_value: float = float("nan"),
+        unrealized_pnl: float = float("nan"),
+        realized_pnl: float = float("nan"),
+    ) -> dict[str, object]:
+        c = contract
+        return {
+            "account":      account,
+            "conId":        c.conId,
+            "symbol":       c.symbol,
+            "secType":      c.secType,
+            "currency":     getattr(c, "currency", "") or "",
+            "primaryExch":  getattr(c, "primaryExch", "") or "",
+            "right":        getattr(c, "right", "") or "",
+            "strike":       float(getattr(c, "strike", 0.0) or 0.0),
+            "expiry":       getattr(c, "lastTradeDateOrContractMonth", "") or "",
+            "position":     position,
+            "avgCost":      avg_cost,
+            "marketPrice":  market_price,
+            "marketValue":  market_value,
+            "unrealizedPNL": unrealized_pnl,
+            "realizedPNL":  realized_pnl,
+            "_contract":    c,
+        }
+
     def _on_portfolio(self, item: PortfolioItem) -> None:
         c = item.contract
         acct = item.account or ""
-        row = {
-            "account": acct,
-            "conId": c.conId,
-            "symbol": c.symbol,
-            "secType": c.secType,
-            "currency": getattr(c, "currency", "") or "",
-            "primaryExch": getattr(c, "primaryExch", "") or "",
-            "right": getattr(c, "right", "") or "",
-            "strike": float(getattr(c, "strike", 0.0) or 0.0),
-            "expiry": getattr(c, "lastTradeDateOrContractMonth", "") or "",
-            # pyrefly: ignore [unnecessary-type-conversion]
-            "position": float(item.position),
-            # pyrefly: ignore [unnecessary-type-conversion]
-            "avgCost": float(item.averageCost),
-            # pyrefly: ignore [unnecessary-type-conversion]
-            "marketPrice": float(item.marketPrice),
-            # pyrefly: ignore [unnecessary-type-conversion]
-            "marketValue": float(item.marketValue),
-            # pyrefly: ignore [unnecessary-type-conversion]
-            "unrealizedPNL": float(item.unrealizedPNL),
-            # pyrefly: ignore [unnecessary-type-conversion]
-            "realizedPNL": float(item.realizedPNL),
-            "_contract": c,
-        }
+        logger.debug(
+            "Portfolio event: {} {} {} pos={:.0f} val=${:,.0f}",
+            self._mask(acct),
+            c.symbol,
+            c.secType,
+            float(item.position),
+            float(item.marketValue),
+        )
+        # pyrefly: ignore [unnecessary-type-conversion]
+        row = self._build_position_row(
+            c, acct,
+            float(item.position),
+            float(item.averageCost),
+            float(item.marketPrice),
+            float(item.marketValue),
+            float(item.unrealizedPNL),
+            float(item.realizedPNL),
+        )
+        key = (c.conId, acct)
         with self._snap_lock:
-            df = self._snap.positions
-            if df.empty:
-                df = pd.DataFrame([row])
+            # O(1) dict update; DataFrame rebuilt from the full dict in one shot.
+            # This replaces the old mask→filter→concat→reset_index pattern which
+            # allocated O(n) new arrays on every event even for existing-row updates.
+            if item.position == 0:
+                self._positions_store.pop(key, None)
             else:
-                # key is (conId, account) — same stock can appear in multiple accounts
-                mask = (df["conId"] == c.conId) & (df["account"] == acct)
-                df = df[~mask]
-                if item.position != 0:
-                    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-            self._snap.positions = df.reset_index(drop=True)
+                self._positions_store[key] = row
+            self._snap.positions = (
+                pd.DataFrame(self._positions_store.values())
+                if self._positions_store
+                else pd.DataFrame()
+            )
             self._snap.as_of = datetime.now(timezone.utc)
-        if self._loop is not None:
+        if self._loop is not None and self._bootstrapped and not self._resubscribe_pending:
+            self._resubscribe_pending = True
             asyncio.run_coroutine_threadsafe(self._resubscribe_market_data(), self._loop)
 
-    def _on_position(self, position) -> None:
+    def _on_position(self, position: Any) -> None:
         """Fallback handler from reqPositions — only adds rows not already seen
         via updatePortfolioEvent (which carries richer marketValue/PnL data)."""
         c = position.contract
         acct = position.account or ""
+        key = (c.conId, acct)
         with self._snap_lock:
-            df = self._snap.positions
-            if not df.empty:
-                mask = (df["conId"] == c.conId) & (df["account"] == acct)
-                if mask.any():
-                    return  # already have a richer PortfolioItem for this (conId, account)
-            row = {
-                "account": acct,
-                "conId": c.conId,
-                "symbol": c.symbol,
-                "secType": c.secType,
-                "currency": getattr(c, "currency", "") or "",
-                "primaryExch": getattr(c, "primaryExch", "") or "",
-                "right": getattr(c, "right", "") or "",
-                "strike": float(getattr(c, "strike", 0.0) or 0.0),
-                "expiry": getattr(c, "lastTradeDateOrContractMonth", "") or "",
-                "position": float(position.position),
-                "avgCost": float(position.avgCost),
-                "marketPrice": float("nan"),
-                "marketValue": float("nan"),
-                "unrealizedPNL": float("nan"),
-                "realizedPNL": float("nan"),
-                "_contract": c,
-            }
+            if key in self._positions_store:
+                return  # already have a richer PortfolioItem for this (conId, account)
             if position.position == 0:
                 return
-            self._snap.positions = pd.concat(
-                [df, pd.DataFrame([row])], ignore_index=True
-            ).reset_index(drop=True)
+            # pyrefly: ignore [unnecessary-type-conversion]
+            row = self._build_position_row(
+                c, acct, float(position.position), float(position.avgCost)
+            )
+            self._positions_store[key] = row
+            self._snap.positions = pd.DataFrame(self._positions_store.values())
             self._snap.as_of = datetime.now(timezone.utc)
-        if self._loop is not None:
+        if self._loop is not None and self._bootstrapped and not self._resubscribe_pending:
+            self._resubscribe_pending = True
             asyncio.run_coroutine_threadsafe(self._resubscribe_market_data(), self._loop)
 
     def _on_account_value(self, value: Any) -> None:
@@ -668,13 +854,13 @@ class IBClient:
                 # pyrefly: ignore [missing-attribute]
                 con_id = t.contract.conId
                 snap = self._snap.tickers.get(con_id) or TickerSnap()
-                if t.last == t.last:  # NaN check
+                if not math.isnan(t.last):
                     # pyrefly: ignore [unnecessary-type-conversion]
                     snap.last = float(t.last)
-                if t.bid == t.bid:
+                if not math.isnan(t.bid):
                     # pyrefly: ignore [unnecessary-type-conversion]
                     snap.bid = float(t.bid)
-                if t.ask == t.ask:
+                if not math.isnan(t.ask):
                     # pyrefly: ignore [unnecessary-type-conversion]
                     snap.ask = float(t.ask)
                 mg = t.modelGreeks
@@ -739,20 +925,40 @@ class IBClient:
         self._update_order(trade)
 
     def _on_error(self, reqId: int, errorCode: int, errorString: str, contract) -> None:  # noqa: N803
-        # 2104/2106/2158 are info; ignore noise but keep last 50 in the ring
-        if errorCode in {2104, 2106, 2158, 2107, 2103, 2105, 2108}:
-            return
+        if errorCode in _IBKR_INFO_CODES:
+            return  # farm-connection chatter — not actionable
         with self._snap_lock:
             self._snap.errors.append((datetime.now(timezone.utc), errorCode, errorString))
-        logger.warning("IB err {} ({}): {}", errorCode, reqId, errorString)
+        sym = getattr(contract, "symbol", None) if contract is not None else None
+        if errorCode in _IBKR_PACING_CODES:
+            # Pacing violations degrade data quality and indicate over-subscription.
+            # Log at ERROR so they surface in dashboard.log even when scrolled past.
+            logger.error(
+                "IB PACING err {} ({}){}: {} — active subscriptions: {}",
+                errorCode,
+                reqId,
+                f" [{sym}]" if sym else "",
+                errorString,
+                len(self._subscribed),
+            )
+        else:
+            if sym:
+                logger.warning("IB err {} ({}) [{}]: {}", errorCode, reqId, sym, errorString)
+            else:
+                logger.warning("IB err {} ({}): {}", errorCode, reqId, errorString)
 
     def _on_disconnect(self) -> None:
+        uptime = time.monotonic() - self._connect_start_time if self._connect_start_time else 0.0
         with self._snap_lock:
             self._snap.connected = False
+            if self._snap.stale_since is None:
+                self._snap.stale_since = datetime.now(timezone.utc)
         if self._frozen:
-            logger.info("IBKR disconnected (frozen — derive.py has the CID)")
+            logger.info(
+                "IBKR disconnected (frozen — derive.py has the CID) uptime={:.0f}s", uptime
+            )
             return
-        logger.warning("IBKR disconnected — reconnecting")
+        logger.warning("IBKR disconnected after {:.0f}s — reconnecting", uptime)
         if self._loop is not None:
             self._subscribed.clear()
             if not self._connecting:  # don't spawn a second retry loop

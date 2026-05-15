@@ -12,12 +12,14 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import yaml
+from loguru import logger
 from plotly.subplots import make_subplots
 from pyprojroot import here as _here
 
@@ -25,6 +27,8 @@ from pyprojroot import here as _here
 from src.dashboard.formatting import money, pct, signed_money
 # pyrefly: ignore [missing-import]
 from src.dashboard.ib_client import get_client
+# pyrefly: ignore [missing-import]
+from src.dashboard.llm_query import query_data, query_data_deepseek, query_data_gemini
 # pyrefly: ignore [missing-import]
 import pandas as pd
 from src.dashboard.risk import (
@@ -36,7 +40,6 @@ from src.dashboard.risk import (
     greek_dollar_sums,
     position_delta_dollars,
     position_margin_est,
-    reap_candidates,
 )
 # pyrefly: ignore [missing-import]
 from src.dashboard.settings import get_settings
@@ -55,7 +58,7 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* Nav row (columns container holding radio + account selector) — fixed at top.
+    /* Nav row (header + radio + account selector) — fixed at top.
        :has() is supported Chrome 105+, Safari 15.4+, Firefox 121+, Edge 105+. */
     [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) {
         position: fixed !important;
@@ -66,6 +69,7 @@ st.markdown(
         background-color: var(--background-color) !important;
         padding: 0 0.5rem !important;
         margin: 0 !important;
+        align-items: center !important;
     }
     /* Style radio as tab pills */
     [data-testid="stRadio"] > div {
@@ -87,10 +91,51 @@ st.markdown(
         box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         font-weight: 600;
     }
-    /* Push main content below fixed nav bar */
-    section[data-testid="stMain"] > div.block-container {
-        padding-top: 3.5rem !important;
+    /* Opaque background for all expander content */
+    [data-testid="stExpanderDetails"] {
+        background-color: var(--secondary-background-color) !important;
+        backdrop-filter: none !important;
     }
+    /* Fixed band (nav → status bar → KPI+AI) — JS adds .kpi-bar-fixed and sets top dynamically */
+    .kpi-bar-fixed {
+        position: fixed !important;
+        top: 2.5rem;           /* fallback — JS overrides with actual nav height */
+        left: 0 !important;
+        right: 14rem !important;
+        z-index: 999998 !important;
+        background-color: var(--background-color) !important;
+        padding: 0 0.5rem !important;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.15) !important;
+    }
+    /* Ask AI column: allow natural height (answer expander drives it) */
+    .ask-ai-col { overflow: visible !important; }
+    /* Compact status bar inside left column of the fixed band */
+    .hdr-bar { font-size: 0.72rem; line-height: 1.5; padding: 3px 0; }
+    .hdr-title { font-weight: 700; font-size: 0.86rem; }
+    .hdr-cur { color: #22c55e; font-weight: 700; font-size: 0.86rem; }
+    .hdr-item { opacity: 0.8; }
+    /* Push main content below nav + KPI/AI bar (JS refines this dynamically) */
+    section[data-testid="stMain"] > div.block-container {
+        padding-top: 7rem !important;
+    }
+    /* Analysis symbol selectbox — narrow to ~10 chars */
+    .sym-sel-narrow [data-baseweb="select"] {
+        min-width: 0 !important;
+        width: 10ch !important;
+    }
+    /* KPI compact banded table */
+    .kpi-tbl { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+    .kpi-tbl td { padding: 3px 6px; white-space: nowrap; }
+    .kpi-lbl { opacity: 0.6; font-size: 0.74rem; }
+    .kpi-val { font-weight: 600; font-size: 0.92rem; text-align: right; }
+    .kpi-row-a { background-color: rgba(128,128,128,0.04); }
+    .kpi-row-b { background-color: rgba(128,128,128,0.1); }
+    .kpi-breach { color: #ef4444 !important; }
+    /* Left padding on the second/third label — visual gap between pairs */
+    .kpi-lbl2 { padding-left: 1.2rem !important; }
+    .kpi-lbl3 { padding-left: 1.2rem !important; }
+    /* Tooltip trigger (?) inside KPI table — superscript, muted */
+    .kpi-help { cursor: help; opacity: 0.45; font-size: 0.6rem; vertical-align: super; margin-left: 1px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -117,8 +162,9 @@ _SG = settings.sg_account.get_secret_value()
 _DATA_DIR    = _here() / "data"
 _MASTER_DIR  = _DATA_DIR / "master"
 _CFG_PATH    = _here() / "config" / "snp_config.yml"
-_DERIVE_LOG  = _here() / "log" / "derive_progress.log"
-_OHLC_LOG    = _here() / "log" / "ohlc_progress.log"
+_DERIVE_LOG    = _here() / "log" / "derive_progress.log"
+_OHLC_LOG      = _here() / "log" / "ohlc_progress.log"
+_EXECUTE_LOG   = _here() / "log" / "execute.log"
 _DASHBOARD_LOG = _here() / "log" / "dashboard.log"
 
 # Known derive.py output markers → progress percentage
@@ -161,7 +207,7 @@ def _selected_account() -> str:
     return _ACCOUNT_OPTIONS.get(label, "")
 
 
-def _filter_positions(positions, account: str):
+def _filter_positions(positions: pd.DataFrame, account: str) -> pd.DataFrame:
     """Filter a positions DataFrame to the selected account (no-op for ALL)."""
     if not account or positions.empty or "account" not in positions.columns:
         return positions
@@ -203,10 +249,9 @@ def _load_pkl(name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _pkl_age(name: str) -> str:
-    """Human-readable age of a pickle file, e.g. '3 m ago'."""
-    from datetime import datetime
-    p = _DATA_DIR / name
+def _pkl_age(name: str, *, path: Path | None = None) -> str:
+    """Human-readable age of a file, e.g. '3m ago'. Pass path= to override _DATA_DIR/name."""
+    p = path or (_DATA_DIR / name)
     if not p.exists():
         return "never"
     secs = (datetime.now() - datetime.fromtimestamp(p.stat().st_mtime)).total_seconds()
@@ -221,6 +266,32 @@ def _pkl_age(name: str) -> str:
 # snp_config.yml helpers
 # ---------------------------------------------------------------------------
 
+# Single registry: (session_key, yaml_key, cast_fn, default)
+# All three config helpers (init/save/dirty) are driven by this list —
+# adding a new config key requires only one entry here.
+_CFG_KEYS: list[tuple[str, str, type, object]] = [
+    ("cfg_cover_me",         "COVER_ME",             bool,  True),
+    ("cfg_cover_min_dte",    "COVER_MIN_DTE",         int,   4),
+    ("cfg_cover_std_mult",   "COVER_STD_MULT",        float, 0.65),
+    ("cfg_covxpmult",        "COVXPMULT",             float, 1.2),
+    ("cfg_sow_nakeds",       "SOW_NAKEDS",            bool,  True),
+    ("cfg_virgin_dte",       "VIRGIN_DTE",            int,   5),
+    ("cfg_virgin_call_std",  "VIRGIN_CALL_STD_MULT",  float, 3.8),
+    ("cfg_virgin_put_std",   "VIRGIN_PUT_STD_MULT",   float, 1.2),
+    ("cfg_nakedxpmult",      "NAKEDXPMULT",           float, 4.95),
+    ("cfg_minnaked",         "MINNAKEDOPTPRICE",      float, 2.5),
+    ("cfg_virgin_qty_mult",  "VIRGIN_QTY_MULT",       float, 0.055),
+    ("cfg_protect_me",       "PROTECT_ME",            bool,  False),
+    ("cfg_protect_dte",      "PROTECT_DTE",           int,   35),
+    ("cfg_protection_strip", "PROTECTION_STRIP",      int,   5),
+    ("cfg_reap_me",          "REAP_ME",               bool,  True),
+    ("cfg_reapratio",        "REAPRATIO",             float, 0.025),
+    ("cfg_minreapdte",       "MINREAPDTE",            int,   1),
+    ("cfg_max_dte",          "MAX_DTE",               int,   50),
+    ("cfg_mincushion",       "MINCUSHION",            float, 0.2),
+]
+
+
 def _init_cfg_state() -> None:
     """Seed session_state from snp_config.yml exactly once per browser session."""
     if st.session_state.get("_cfg_inited"):
@@ -229,29 +300,8 @@ def _init_cfg_state() -> None:
         cfg = yaml.safe_load(_CFG_PATH.read_text(encoding="utf-8")) or {}
     except Exception:
         cfg = {}
-    defaults: dict[str, object] = {
-        "cfg_cover_me":          cfg.get("COVER_ME", True),
-        "cfg_cover_min_dte":     cfg.get("COVER_MIN_DTE", 4),
-        "cfg_cover_std_mult":    cfg.get("COVER_STD_MULT", 0.65),
-        "cfg_covxpmult":         cfg.get("COVXPMULT", 1.2),
-        "cfg_sow_nakeds":        cfg.get("SOW_NAKEDS", True),
-        "cfg_virgin_dte":        cfg.get("VIRGIN_DTE", 5),
-        "cfg_virgin_call_std":   cfg.get("VIRGIN_CALL_STD_MULT", 3.8),
-        "cfg_virgin_put_std":    cfg.get("VIRGIN_PUT_STD_MULT", 1.2),
-        "cfg_nakedxpmult":       cfg.get("NAKEDXPMULT", 4.95),
-        "cfg_minnaked":          cfg.get("MINNAKEDOPTPRICE", 2.5),
-        "cfg_virgin_qty_mult":   cfg.get("VIRGIN_QTY_MULT", 0.055),
-        "cfg_protect_me":        cfg.get("PROTECT_ME", False),
-        "cfg_protect_dte":       cfg.get("PROTECT_DTE", 35),
-        "cfg_protection_strip":  cfg.get("PROTECTION_STRIP", 5),
-        "cfg_reap_me":           cfg.get("REAP_ME", True),
-        "cfg_reapratio":         cfg.get("REAPRATIO", 0.025),
-        "cfg_minreapdte":        cfg.get("MINREAPDTE", 1),
-        "cfg_max_dte":           cfg.get("MAX_DTE", 50),
-        "cfg_mincushion":        cfg.get("MINCUSHION", 0.2),
-    }
-    for k, v in defaults.items():
-        st.session_state.setdefault(k, v)
+    for sk, yk, cast, default in _CFG_KEYS:
+        st.session_state.setdefault(sk, cast(cfg.get(yk, default)))
     st.session_state["_cfg_inited"] = True
 
 
@@ -261,31 +311,21 @@ def _save_cfg() -> None:
         cfg = yaml.safe_load(_CFG_PATH.read_text(encoding="utf-8")) or {}
     except Exception:
         cfg = {}
-    cfg.update({
-        "COVER_ME":           bool(st.session_state["cfg_cover_me"]),
-        "COVER_MIN_DTE":      int(st.session_state["cfg_cover_min_dte"]),
-        "COVER_STD_MULT":     float(st.session_state["cfg_cover_std_mult"]),
-        "COVXPMULT":          float(st.session_state["cfg_covxpmult"]),
-        "SOW_NAKEDS":         bool(st.session_state["cfg_sow_nakeds"]),
-        "VIRGIN_DTE":         int(st.session_state["cfg_virgin_dte"]),
-        "VIRGIN_CALL_STD_MULT": float(st.session_state["cfg_virgin_call_std"]),
-        "VIRGIN_PUT_STD_MULT":  float(st.session_state["cfg_virgin_put_std"]),
-        "NAKEDXPMULT":        float(st.session_state["cfg_nakedxpmult"]),
-        "MINNAKEDOPTPRICE":   float(st.session_state["cfg_minnaked"]),
-        "VIRGIN_QTY_MULT":    float(st.session_state["cfg_virgin_qty_mult"]),
-        "PROTECT_ME":         bool(st.session_state["cfg_protect_me"]),
-        "PROTECT_DTE":        int(st.session_state["cfg_protect_dte"]),
-        "PROTECTION_STRIP":   int(st.session_state["cfg_protection_strip"]),
-        "REAP_ME":            bool(st.session_state["cfg_reap_me"]),
-        "REAPRATIO":          float(st.session_state["cfg_reapratio"]),
-        "MINREAPDTE":         int(st.session_state["cfg_minreapdte"]),
-        "MAX_DTE":            int(st.session_state["cfg_max_dte"]),
-        "MINCUSHION":         float(st.session_state["cfg_mincushion"]),
-    })
+    changed: list[str] = []
+    for sk, yk, cast, _ in _CFG_KEYS:
+        new_val = cast(st.session_state[sk])
+        old_val = cast(cfg.get(yk, new_val))
+        if new_val != old_val:
+            changed.append(f"{yk}={new_val!r}")
+        cfg[yk] = new_val
     _CFG_PATH.write_text(
         yaml.dump(cfg, default_flow_style=False, sort_keys=False),
         encoding="utf-8",
     )
+    if changed:
+        logger.info("Config saved — changed: {}", ", ".join(changed))
+    else:
+        logger.debug("Config saved (no changes)")
 
 
 def _cfg_dirty() -> bool:
@@ -296,28 +336,55 @@ def _cfg_dirty() -> bool:
         cfg = yaml.safe_load(_CFG_PATH.read_text(encoding="utf-8")) or {}
     except Exception:
         return True
-    pairs: list[tuple[object, object]] = [
-        (bool(st.session_state.get("cfg_cover_me")),             bool(cfg.get("COVER_ME", True))),
-        (int(st.session_state.get("cfg_cover_min_dte", 4)),      int(cfg.get("COVER_MIN_DTE", 4))),
-        (float(st.session_state.get("cfg_cover_std_mult", 0.65)), float(cfg.get("COVER_STD_MULT", 0.65))),
-        (float(st.session_state.get("cfg_covxpmult", 1.2)),      float(cfg.get("COVXPMULT", 1.2))),
-        (bool(st.session_state.get("cfg_sow_nakeds")),           bool(cfg.get("SOW_NAKEDS", True))),
-        (int(st.session_state.get("cfg_virgin_dte", 5)),         int(cfg.get("VIRGIN_DTE", 5))),
-        (float(st.session_state.get("cfg_virgin_call_std", 3.8)), float(cfg.get("VIRGIN_CALL_STD_MULT", 3.8))),
-        (float(st.session_state.get("cfg_virgin_put_std", 1.2)), float(cfg.get("VIRGIN_PUT_STD_MULT", 1.2))),
-        (float(st.session_state.get("cfg_nakedxpmult", 4.95)),   float(cfg.get("NAKEDXPMULT", 4.95))),
-        (float(st.session_state.get("cfg_minnaked", 2.5)),       float(cfg.get("MINNAKEDOPTPRICE", 2.5))),
-        (float(st.session_state.get("cfg_virgin_qty_mult", 0.055)), float(cfg.get("VIRGIN_QTY_MULT", 0.055))),
-        (bool(st.session_state.get("cfg_protect_me")),           bool(cfg.get("PROTECT_ME", False))),
-        (int(st.session_state.get("cfg_protect_dte", 35)),       int(cfg.get("PROTECT_DTE", 35))),
-        (int(st.session_state.get("cfg_protection_strip", 5)),   int(cfg.get("PROTECTION_STRIP", 5))),
-        (bool(st.session_state.get("cfg_reap_me")),              bool(cfg.get("REAP_ME", True))),
-        (float(st.session_state.get("cfg_reapratio", 0.025)),    float(cfg.get("REAPRATIO", 0.025))),
-        (int(st.session_state.get("cfg_minreapdte", 1)),         int(cfg.get("MINREAPDTE", 1))),
-        (int(st.session_state.get("cfg_max_dte", 50)),           int(cfg.get("MAX_DTE", 50))),
-        (float(st.session_state.get("cfg_mincushion", 0.2)),     float(cfg.get("MINCUSHION", 0.2))),
-    ]
-    return any(a != b for a, b in pairs)
+    return any(
+        cast(st.session_state.get(sk, default)) != cast(cfg.get(yk, default))
+        for sk, yk, cast, default in _CFG_KEYS
+    )
+
+
+def _force_reload_cfg() -> None:
+    """Unconditionally re-read snp_config.yml → session_state (overwrites existing values)."""
+    try:
+        cfg = yaml.safe_load(_CFG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        cfg = {}
+    for sk, yk, cast, default in _CFG_KEYS:
+        st.session_state[sk] = cast(cfg.get(yk, default))
+    st.session_state["_cfg_inited"] = True
+
+
+def _itm_mask_vec(df: pd.DataFrame) -> list[bool]:
+    """Boolean list: True for in-the-money options (call: strike < und_px; put: strike > und_px)."""
+    if df.empty:
+        return []
+    is_opt = (df.get("secType", pd.Series("", index=df.index)) == "OPT")
+    und    = df.get("underlying_px", pd.Series(float("nan"), index=df.index)).fillna(float("nan"))
+    strike = df.get("strike",        pd.Series(float("nan"), index=df.index)).fillna(float("nan"))
+    right  = df.get("right",         pd.Series("",           index=df.index))
+    call_itm = is_opt & (right == "C") & (strike < und)
+    put_itm  = is_opt & (right == "P") & (strike > und)
+    return (call_itm | put_itm).fillna(False).tolist()
+
+
+def _capture_exit(proc: subprocess.Popen | None, key: str) -> None:
+    """Store a subprocess exit code in session_state exactly once."""
+    if proc is not None and proc.poll() is not None and key not in st.session_state:
+        rc = proc.poll()
+        st.session_state[key] = rc
+        logger.info("Subprocess exited: key={} rc={} pid={}", key, rc, proc.pid)
+
+
+def _sub_env() -> dict[str, str]:
+    """Build subprocess environment with project root on PYTHONPATH.
+
+    Scripts in src/ use 'from src.X import ...' which requires the project root
+    on sys.path. Python adds the script's own directory to sys.path[0], not the root,
+    so we pass PYTHONPATH explicitly.
+    """
+    root = str(_here())
+    existing = os.environ.get("PYTHONPATH", "")
+    pythonpath = f"{root}{os.pathsep}{existing}" if existing else root
+    return {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "PYTHONPATH": pythonpath}
 
 
 def _derive_progress() -> tuple[float, str, list[str]]:
@@ -339,6 +406,12 @@ def _derive_progress() -> tuple[float, str, list[str]]:
 
 
 _TQDM_BAR_RE = re.compile(r"^(.+?):\s+\d+%\|")
+_TQDM_PCT_RE = re.compile(r":\s+(\d+)%\|")
+_ANSI_RE     = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 def _log_lines(log_path: Path, n: int = 35) -> list[str]:
@@ -380,6 +453,32 @@ def _ohlc_log_lines(n: int = 30) -> list[str]:
     return _log_lines(_OHLC_LOG, n)
 
 
+def _ohlc_progress() -> tuple[float, str]:
+    """Parse ohlc_progress.log tqdm lines → (progress 0–1, latest bar label)."""
+    lines = _ohlc_log_lines(30)
+    if not lines:
+        return 0.01, "Initialising…"
+    last_pct = 0.0
+    last_label = ""
+    for ln in lines:
+        m_label = _TQDM_BAR_RE.match(_strip_ansi(ln))
+        m_pct   = _TQDM_PCT_RE.search(_strip_ansi(ln))
+        if m_label and m_pct:
+            last_label = m_label.group(1).strip()
+            last_pct   = int(m_pct.group(1)) / 100.0
+    return max(last_pct, 0.01), last_label or "Fetching OHLCs…"
+
+
+def _render_log_expander(label: str, log_path: Path, *, expanded: bool = False) -> None:
+    """Render a collapsible st.expander containing the full text of *log_path*."""
+    with st.expander(label, expanded=expanded):
+        if log_path.exists():
+            try:
+                st.code(log_path.read_text(encoding="utf-8", errors="replace"), language=None)
+            except Exception as e:
+                st.warning(f"Could not read log: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Technical-indicator helpers (used by Analysis tab)
 # ---------------------------------------------------------------------------
@@ -409,14 +508,6 @@ def _bollinger(
 # ---------------------------------------------------------------------------
 
 
-_DROP_HELP = (
-    "**Market drop withstand** = Excess Liquidity ÷ |Portfolio Dollar Delta| × 100%.\n\n"
-    "Estimates the % decline the broad market (or your underlying basket) can sustain "
-    "before your excess liquidity reaches zero, assuming linear (delta-only) exposure. "
-    "A well-hedged or net-short portfolio may show N/A — in that case a *rising* market "
-    "is your primary risk, not a drop."
-)
-
 
 def _drop_withstand(excess: float, delta_abs: float) -> str:
     """Format a market-drop withstand % string."""
@@ -428,67 +519,33 @@ def _drop_withstand(excess: float, delta_abs: float) -> str:
 
 @st.fragment(run_every=2.0)
 def header() -> None:
+    """Compact status bar — rendered in the nav row (left of tabs)."""
     snap = client.snapshot()
     acct = _selected_account()
     positions_filt = _filter_positions(snap.positions, acct)
-    cols = st.columns([3, 2, 2, 2])
-    with cols[0]:
-        if client.is_frozen():
-            status = "🧊 FROZEN"
-        elif snap.connected:
-            status = "🟢 LIVE"
-        else:
-            status = "🔴 DISCONNECTED"
-        st.markdown(
-            f"### IB Monitor &nbsp;&nbsp; {status} &nbsp;&nbsp;"
-            f"<span style='font-size:1rem;color:#22c55e;font-weight:700;'>"
-            f"{settings.currency}</span>",
-            unsafe_allow_html=True,
-        )
-    cols[1].caption(
-        f"as_of: {snap.as_of.strftime('%H:%M:%S UTC') if snap.as_of else '-'}"
+
+    if client.is_frozen():
+        st_html = "🧊 <b>FROZEN</b>"
+    elif snap.connected:
+        st_html = "🟢 <b>LIVE</b>"
+    else:
+        st_html = "🔴 <b>DISC.</b>"
+
+    as_of = snap.as_of.strftime('%H:%M:%S') if snap.as_of else '—'
+    pos_n = len(positions_filt)
+
+    st.markdown(
+        f'<div class="hdr-bar">'
+        f'<span class="hdr-title">IB Monitor</span>'
+        f'&nbsp;&nbsp;{st_html}&nbsp;&nbsp;'
+        f'<span class="hdr-cur">{settings.currency}</span>'
+        f'<br>'
+        f'<span class="hdr-item">as_of:&nbsp;{as_of}</span>'
+        f'&nbsp;&bull;&nbsp;<span class="hdr-item">port:&nbsp;{settings.ib_port}&nbsp;cid:&nbsp;{settings.ib_client_id}</span>'
+        f'&nbsp;&bull;&nbsp;<span class="hdr-item">pos:&nbsp;{pos_n}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
     )
-    cols[2].caption(
-        f"port: {settings.ib_port}  •  cid: {settings.ib_client_id}"
-    )
-    cols[3].caption(f"positions: {len(positions_filt)}")
-
-    # ── Market drop withstand row ─────────────────────────────────────────────
-    if snap.account_values and not snap.positions.empty:
-        k_sel = account_kpis(snap, min_cushion=settings.min_cushion, account=acct)
-        g_sel = greek_dollar_sums(positions_filt, snap.tickers)
-        delta_sel = g_sel["delta_$"]
-
-        if len(_REAL_ACCOUNTS) > 1 and _US and not acct:
-            # ALL view: show US-only AND combined (US+SG) columns side by side
-            pos_us    = _filter_positions(snap.positions, _US)
-            k_us      = account_kpis(snap, account=_US)
-            g_us      = greek_dollar_sums(pos_us, snap.tickers)
-            delta_us  = g_us["delta_$"]
-
-            dr_us  = _drop_withstand(k_us["excess_liquidity"],  abs(delta_us))
-            dr_all = _drop_withstand(k_sel["excess_liquidity"], abs(delta_sel))
-
-            dr1, dr2, _spacer = st.columns([2, 2, 7])
-            dr1.metric(
-                "US drop withstand",
-                "N/A (short)" if delta_us  <= 0 else dr_us,
-                help=_DROP_HELP,
-            )
-            dr2.metric(
-                "US+SG drop withstand",
-                "N/A (short)" if delta_sel <= 0 else dr_all,
-                help=_DROP_HELP,
-            )
-        else:
-            # Single account — one metric
-            dr_str = _drop_withstand(k_sel["excess_liquidity"], abs(delta_sel))
-            dr1, _spacer = st.columns([2, 9])
-            dr1.metric(
-                "Drop withstand",
-                "N/A (short)" if delta_sel <= 0 else dr_str,
-                help=_DROP_HELP,
-            )
 
 
 @st.fragment(run_every=2.0)
@@ -502,528 +559,91 @@ def kpi_strip() -> None:
     from decimal import Decimal as _D
     opt_val = float(av.get("OptionMarketValue", _D("0")) or 0)
 
-    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
-    c1.metric(
-        "NLV", money(k["nlv"]),
-        help="Net Liquidating Value: total portfolio value if all positions were closed "
-             "at current market prices.",
-    )
-    c2.metric(
-        "Opt Value", money(opt_val),
-        help="Option Market Value: total mark-to-market value of all option positions.",
-    )
-    c3.metric(
-        "Cushion",
-        pct(k["cushion"]),
-        delta=f"min {pct(settings.min_cushion)}",
-        delta_color="inverse" if k["cushion_breach"] else "off",
-        help="Excess Liquidity / NLV. Margin buffer remaining as a fraction of portfolio. "
-             f"Red/alert when below the {pct(settings.min_cushion)} minimum.",
-    )
-    c4.metric(
-        "Excess Liq", money(k["excess_liquidity"]),
-        help="Funds available after satisfying all margin requirements. "
-             "Dropping below zero triggers a margin call.",
-    )
-    c5.metric(
-        "Maint Margin", money(k["maint_margin"]),
-        help="Maintenance Margin Requirement: collateral required to hold current positions. "
-             "Falling below this triggers a margin call. "
-             "Sourced directly from IBKR account values.",
-    )
-    c6.metric(
-        "Σ Δ ($)", signed_money(g["delta_$"]),
-        help="Dollar delta: total directional exposure across the book. "
-             "Each 1-point move in the market changes P&L by roughly this amount. "
-             "Positive = long bias, negative = short bias.",
-    )
-    c7.metric(
-        "Σ Θ ($/d)", signed_money(g["theta_$"]),
-        help="Dollar theta: daily time-decay P&L across all options. "
-             "Positive = book earns theta (net short options). "
-             "Negative = book pays theta (net long options).",
-    )
-    c8.metric(
-        "Σ ν ($)", signed_money(g["vega_$"]),
-        help="Dollar vega: total sensitivity to a 1% rise in implied volatility. "
-             "Positive = long vol (profits when IV spikes). "
-             "Negative = short vol (profits when IV falls).",
-    )
-
-
-@st.fragment(run_every=5.0)
-def render_positions() -> None:
-    snap = client.snapshot()
-    acct = _selected_account()
-    if snap.positions.empty:
-        st.info("Waiting for portfolio data…")
-        return
-    df = classify_portfolio(_filter_positions(snap.positions, acct))
-    df = _join_tickers(df, snap.tickers)
-
-    # ---- dollar delta per row (needed before ITM, which filters need) ------
-    df["delta_$"] = position_delta_dollars(df)
-
-    # ---- ITM flag (computed before filters so the ITM filter can use it) ---
-    und_px = (
-        df["underlying_px"] if "underlying_px" in df.columns
-        else pd.Series(float("nan"), index=df.index)
-    )
-    strike_col = df["strike"] if "strike" in df.columns else pd.Series(float("nan"), index=df.index)
-    right_col  = df["right"]  if "right"  in df.columns else pd.Series("",           index=df.index)
-    _itm_call  = (df["secType"] == "OPT") & (right_col == "C") & (und_px > strike_col)
-    _itm_put   = (df["secType"] == "OPT") & (right_col == "P") & (und_px < strike_col)
-    df["_itm"] = _itm_call | _itm_put
-
-    # ---- filter bar --------------------------------------------------------
-    with st.expander("🔍 Filters", expanded=False):
-        fc1, fc2, fc3, fc4, fc5 = st.columns(5)
-        all_sectypes = sorted(df["secType"].dropna().unique().tolist())
-        all_rights = sorted(df["right"].dropna().unique().tolist()) if "right" in df.columns else []
-        all_states = (
-            sorted(df["pf_state"].dropna().unique().tolist()) if "pf_state" in df.columns else []
-        )
-        sym_filter = fc1.text_input(
-            "symbol (prefix)", value="", key="pos_f_sym",
-            help="Prefix match — 'A' shows AAPL, AMZN; not symbols containing A elsewhere",
-        )
-        sel_sec = fc2.multiselect(
-            "secType", all_sectypes, placeholder="all", key="pos_f_sec",
-            help="STK = stock position, OPT = option contract",
-        )
-        sel_right = fc3.multiselect(
-            "right (C/P)", all_rights, placeholder="all", key="pos_f_right",
-            help="C = call option, P = put option",
-        )
-        sel_state = fc4.multiselect(
-            "pf_state", all_states, placeholder="all", key="pos_f_state",
-            help="Portfolio state assigned to each row",
-        )
-        itm_only = fc5.checkbox(
-            "ITM options only", key="pos_f_itm",
-            help="Show only options that are currently in-the-money (amber rows)",
-        )
-
-    # apply filters — all symbol text inputs use strict prefix matching
-    if sel_sec:
-        df = df[df["secType"].isin(sel_sec)]
-    if sel_right and "right" in df.columns:
-        df = df[df["right"].isin(sel_right)]
-    if sel_state and "pf_state" in df.columns:
-        df = df[df["pf_state"].isin(sel_state)]
-    if sym_filter:
-        df = df[df["symbol"].str.upper().str.startswith(sym_filter.strip().upper())]
-    if itm_only:
-        df = df[df["_itm"]]
-
-    # Sort so ITM mask index aligns with view index
-    df = df.sort_values(["pf_state", "symbol"]).reset_index(drop=True)
-
-    # ---- margin column: prefer live what-if data, fall back to Reg T est --
-    if "margin_init" in df.columns:
-        margin_col = "margin_init"
-        margin_label = "Margin"
-        margin_help = (
-            "Initial margin for this position per IBKR what-if calculation. "
-            "Based on a closing what-if order; reflects Portfolio Margin netting "
-            "at the time of the last refresh."
-        )
+    # Drop withstand — goes into row 1 col 3 (in line with NLV)
+    if snap.account_values and not snap.positions.empty:
+        delta_sel = g["delta_$"]
+        if len(_REAL_ACCOUNTS) > 1 and _US and not acct:
+            pos_us   = _filter_positions(snap.positions, _US)
+            k_us     = account_kpis(snap, account=_US)
+            g_us     = greek_dollar_sums(pos_us, snap.tickers)
+            delta_us = g_us["delta_$"]
+            _dr_r1_lbl = "US+SG drop"
+            _dr_r1_val = "N/A" if delta_sel <= 0 else _drop_withstand(k["excess_liquidity"], abs(delta_sel))
+            _dr_r1_tip = "US+SG drop withstand = Total Excess Liquidity ÷ |Total Dollar Delta| × 100%. Combined US+SG portfolio."
+            _dr_r4_lbl = "US drop"
+            _dr_r4_val = "N/A" if delta_us  <= 0 else _drop_withstand(k_us["excess_liquidity"],  abs(delta_us))
+            _dr_r4_tip = "US drop withstand = US Excess Liquidity ÷ |US Dollar Delta| × 100%. Approximate % broad market decline before US account margin call (delta-only, linear)."
+        else:
+            _dr_r1_lbl = "Drop withstand"
+            _dr_r1_val = "N/A" if delta_sel <= 0 else _drop_withstand(k["excess_liquidity"], abs(delta_sel))
+            _dr_r1_tip = "Drop withstand = Excess Liquidity ÷ |Dollar Delta| × 100%. Approximate % broad market decline before margin call (delta-only, linear). N/A when net-short or delta near zero."
+            _dr_r4_lbl = ""
+            _dr_r4_val = ""
+            _dr_r4_tip = ""
     else:
-        df["margin_est"] = position_margin_est(df)
-        margin_col = "margin_est"
-        margin_label = "Margin*"
-        margin_help = (
-            "Estimated Reg T initial margin (what-if data not yet available). "
-            "STK long: 50%, STK short: 150%, OPT short: max(20%-OTM, 10%) x notional, "
-            "OPT long: 0. Approximate only."
-        )
+        _dr_r1_lbl = "Drop withstand"
+        _dr_r1_val = "—"
+        _dr_r1_tip = "Drop withstand = Excess Liquidity ÷ |Dollar Delta| × 100%. Waiting for account data."
+        _dr_r4_lbl = ""
+        _dr_r4_val = ""
+        _dr_r4_tip = ""
 
-    # ---- display -----------------------------------------------------------
-    df["dte"] = _dte_series(df["expiry"]).fillna(0).astype(int)
-    cols_show = [
-        "symbol", "secType", "underlying_px", "right", "strike", "expiry", "dte",
-        "position", "pf_state", "avgCost", "marketPrice", "marketValue",
-        "unrealizedPNL", "delta", "theta", "vega", "iv", "delta_$", margin_col,
+    def _lbl(text: str, tip: str) -> str:
+        safe_tip = tip.replace('"', '&quot;')
+        return f'<span title="{safe_tip}">{text}&nbsp;<span class="kpi-help">?</span></span>'
+
+    c_cls = ' class="kpi-breach"' if k["cushion_breach"] else ""
+    min_c_pct = f"{settings.min_cushion:.0%}"
+    _dr_lbl1 = _lbl(_dr_r1_lbl, _dr_r1_tip) if _dr_r1_lbl else ""
+    _dr_lbl4 = _lbl(_dr_r4_lbl, _dr_r4_tip) if _dr_r4_lbl else ""
+
+    # Layout: col1 = NLV/Cushion, col2 = risk metrics, col3 = greeks
+    rows: list[tuple[str, str, str, str, str, str, str, str, str]] = [
+        (
+            _lbl("NLV", "Net Liquidation Value: total portfolio value including cash, stocks and options at current market prices."),
+            money(k["nlv"]), "",
+            _dr_lbl1, _dr_r1_val, "",
+            _lbl("&#x3A3;&#x394; ($)", "Portfolio Dollar Delta: P&amp;L change for a 1-point broad market move. Sum of position × delta × 100 × underlying price across all positions."),
+            signed_money(g["delta_$"]), "",
+        ),
+        (
+            _lbl(f"Cushion (min {min_c_pct})", f"Margin cushion = Excess Liquidity ÷ NLV. Alert threshold: {min_c_pct}. Breach turns red."),
+            pct(k["cushion"]), c_cls,
+            _lbl("Excess Liq", "Excess Liquidity: funds available above the maintenance margin requirement. Reaching zero triggers a margin call."),
+            money(k["excess_liquidity"]), "",
+            _lbl("&#x3A3;&#x398; ($/d)", "Portfolio Dollar Theta: daily time decay across all options in dollars. Positive = net premium seller collecting theta."),
+            signed_money(g["theta_$"]), "",
+        ),
+        (
+            _dr_lbl4, _dr_r4_val, "",
+            _lbl("Opt Value", "Option Market Value: total mark-to-market value of all option positions."),
+            money(opt_val), "",
+            _lbl("&#x3A3;&#x3B3; ($)", "Portfolio Dollar Gamma: rate of change of dollar delta per 1-point move. Positive gamma means delta grows in your favour as the market moves."),
+            signed_money(g["gamma_$"]), "",
+        ),
+        (
+            "", "", "",
+            _lbl("Maint Margin", "Maintenance Margin Requirement: minimum equity you must hold to keep current positions open."),
+            money(k["maint_margin"]), "",
+            _lbl("&#x3A3;&#x3BD; ($)", "Portfolio Dollar Vega: P&amp;L sensitivity to a 1% rise in implied volatility across all options."),
+            signed_money(g["vega_$"]), "",
+        ),
     ]
-    # Build view — df is already sorted & reset; extract ITM mask then drop helper col
-    view = df[[c for c in cols_show if c in df.columns] + ["_itm"]].copy()
-    itm_mask = view.pop("_itm").to_numpy(dtype=bool)
-    col_cfg: dict = {
-        "symbol": st.column_config.TextColumn(
-            "Symbol",
-            help="Ticker symbol of the underlying or security.",
-        ),
-        "secType": st.column_config.TextColumn(
-            "Type",
-            help="Security type: STK = stock/ETF position, OPT = option contract.",
-        ),
-        "underlying_px": st.column_config.NumberColumn(
-            "Underlying", format="$%.2f",
-            help="Current price of the underlying stock (for options). "
-                 "Used to determine ITM/OTM status (row shading).",
-        ),
-        "right": st.column_config.TextColumn(
-            "C/P",
-            help="Option right: C = call (right to buy), P = put (right to sell). "
-                 "Blank for stocks.",
-        ),
-        "strike": st.column_config.NumberColumn(
-            "Strike", format="%.1f",
-            help="Option strike price: the price at which the option can be exercised.",
-        ),
-        "expiry": st.column_config.TextColumn(
-            "Expiry",
-            help="Option expiration date (YYYYMMDD). After this date the option expires "
-                 "worthless if out-of-the-money.",
-        ),
-        "position": st.column_config.NumberColumn(
-            "Qty",
-            help="Number of shares (STK) or contracts (OPT). "
-                 "Negative = short position (sold/written).",
-        ),
-        "avgCost": st.column_config.NumberColumn(
-            "Avg Cost", format="%.2f",
-            help="Average cost basis per share or per contract (in contract-price terms, "
-                 "not multiplied by 100).",
-        ),
-        "marketPrice": st.column_config.NumberColumn(
-            "Mkt Px", format="%.2f",
-            help="Current market price (last trade or mid quote).",
-        ),
-        "marketValue": st.column_config.NumberColumn(
-            "Mkt Val", format="$%,.0f",
-            help="Market value = position x market price x multiplier (100 for options).",
-        ),
-        "unrealizedPNL": st.column_config.NumberColumn(
-            "Unreal P&L", format="$%,.0f",
-            help="Unrealized P&L: mark-to-market gain/loss vs average cost basis.",
-        ),
-        "delta_$": st.column_config.NumberColumn(
-            "Delta $", format="$%,.0f",
-            help="Dollar delta: P&L change for a 1-point move in the underlying. "
-                 "STK: equals market value (delta=1). "
-                 "OPT: position x delta x 100 x underlying price. "
-                 "Sum of this column = header Sigma-Delta.",
-        ),
-        "dte": st.column_config.NumberColumn(
-            "DTE", format="%.0f",
-            help="Days to expiry.",
-        ),
-        margin_col: st.column_config.NumberColumn(
-            margin_label, format="$%,.0f",
-            help=margin_help,
-        ),
-    }
-    snap_for_margins = client.snapshot()
-    margins_ts = snap_for_margins.margins_as_of
-    margins_label = (
-        f"Margins as of {margins_ts.strftime('%H:%M:%S')}" if margins_ts else "Margins: pending"
-    )
 
-    # ── Detect majority-null margins and auto-prompt / auto-schedule ──────────
-    _opt_view = view[view["secType"] == "OPT"] if "secType" in view.columns else view
-    _null_count = int(_opt_view[margin_col].isna().sum()) if margin_col in _opt_view.columns else len(_opt_view)
-    _majority_null = len(_opt_view) > 0 and _null_count > len(_opt_view) * 0.5
-    _now_ts = time.time()
-    _last_auto = float(st.session_state.get("_margin_auto_ts", 0.0))
-    if _majority_null and (_now_ts - _last_auto) > 30.0:
-        client.schedule_margin_refresh()
-        st.session_state["_margin_auto_ts"] = _now_ts
-
-    hdr_left, hdr_right = st.columns([6, 2])
-    with hdr_right:
-        if _majority_null:
-            st.caption("⚠️ Auto-refreshing margins…")
-        if st.button("↻ Refresh Margins", help="Re-run what-if margin query for all positions"):
-            client.schedule_margin_refresh()
-            st.toast("Margin refresh scheduled — results in ~10 s")
-        st.caption(margins_label)
-
-    st.dataframe(
-        _banded(view, itm_mask),
-        width="stretch",
-        hide_index=True,
-        column_config={
-            **col_cfg,
-            "delta": st.column_config.NumberColumn(
-                "Δ Delta", format="%.3f",
-                help="Rate of change of option price per 1-point move in the underlying. "
-                     "Range: 0 to +1 for calls, -1 to 0 for puts. "
-                     "A delta of 0.30 means the option moves 0.30 per 1-point move in the stock.",
-            ),
-            "theta": st.column_config.NumberColumn(
-                "Θ Theta", format="%.3f",
-                help="Daily time decay of the option's value in dollars per contract per day. "
-                     "Negative for long options (lose value daily); "
-                     "positive for short options (collect decay).",
-            ),
-            "vega": st.column_config.NumberColumn(
-                "ν Vega", format="%.3f",
-                help="Sensitivity of the option price to a 1% change in implied volatility. "
-                     "Positive for long options; negative for short options.",
-            ),
-            "iv": st.column_config.NumberColumn(
-                "IV", format="%.3f",
-                help="Implied Volatility: market-implied annualised volatility of the underlying. "
-                     "Higher IV means more expensive options.",
-            ),
-            "pf_state": st.column_config.TextColumn(
-                "State",
-                help=(
-                    "Portfolio state: zen (full hedge), covering (short option on stock), "
-                    "protecting (long option on stock), unprotected (stock + cover, no protect), "
-                    "uncovered (stock + protect, no cover), exposed (stock alone), "
-                    "sowed (short option alone), orphaned (long option alone), "
-                    "straddled (long call + put, no stock)"
-                ),
-            ),
-        },
-    )
-
-
-@st.fragment(run_every=5.0)
-def render_risk() -> None:
-    snap = client.snapshot()
-    acct = _selected_account()
-    if snap.positions.empty:
-        st.info("Waiting for portfolio data…")
-        return
-    df = classify_portfolio(_filter_positions(snap.positions, acct))
-    df = _join_tickers(df, snap.tickers)
-    df["delta_$"] = position_delta_dollars(df)
-    k = account_kpis(snap, min_cushion=settings.min_cushion, account=acct)
-
-    # ── Build "already addressed" sets from open orders + suggested orders ───
-    _ord_syms: set[str] = set()
-    if not snap.orders.empty and "symbol" in snap.orders.columns:
-        _ord_syms.update(snap.orders["symbol"].dropna().unique())
-    _cov_syms: set[str] = set()
-    _df_cov_risk = _load_pkl("df_cov.pkl")
-    if not _df_cov_risk.empty and "symbol" in _df_cov_risk.columns:
-        _cov_syms.update(_df_cov_risk["symbol"].dropna().unique())
-    _nkd_syms: set[str] = set()
-    _df_nkd_risk = _load_pkl("df_nkd.pkl")
-    if not _df_nkd_risk.empty and "symbol" in _df_nkd_risk.columns:
-        _nkd_syms.update(_df_nkd_risk["symbol"].dropna().unique())
-    _reap_syms: set[str] = set()
-    _df_reap_risk = _load_pkl("df_reap.pkl")
-    if not _df_reap_risk.empty and "symbol" in _df_reap_risk.columns:
-        _reap_syms.update(_df_reap_risk["symbol"].dropna().unique())
-    _addressed_cover = _ord_syms | _cov_syms
-    _addressed_reap = _ord_syms | _reap_syms
-
-    # ── Compute top risk-reduction actions ─────────────────────────────────
-    actions: list[tuple[str, str]] = []
-
-    # 1. Exposed stocks — exclude symbols already covered by open orders or suggested cover
-    exposed_stk = df[(df["pf_state"] == "exposed") & (df["secType"] == "STK")]
-    exposed_stk = exposed_stk[~exposed_stk["symbol"].isin(_addressed_cover)]
-    if not exposed_stk.empty:
-        top_exp = exposed_stk.sort_values("marketValue", ascending=False, key=abs)
-        syms = top_exp["symbol"].tolist()
-        sym_str = ", ".join(syms[:4]) + ("…" if len(syms) > 4 else "")
-        notional = abs(float(exposed_stk["marketValue"].sum()))
-        n = len(exposed_stk)
-        actions.append((
-            "error",
-            f"{n} exposed position{'s' if n > 1 else ''} with no hedge and no pending order: "
-            f"{sym_str} — ${notional:,.0f} at full market risk. "
-            "Write covered calls or buy protective puts.",
-        ))
-
-    # 2. Margin cushion breach
-    if k.get("cushion_breach"):
-        cushion_pct = float(k.get("cushion", 0)) * 100
-        min_pct = settings.min_cushion * 100
-        actions.append((
-            "error",
-            f"Margin cushion breach: {cushion_pct:.1f}% (minimum {min_pct:.0f}%). "
-            "Reduce delta exposure or add funds to avoid a margin call.",
-        ))
-
-    # 3. Short options ITM and near expiry (assignment risk)
-    opt_df = df[df["secType"] == "OPT"].copy()
-    if not opt_df.empty and "expiry" in opt_df.columns:
-        opt_df["_dte"] = _dte_series(opt_df["expiry"])
-        short_opts = opt_df[opt_df["position"] < 0].copy()
-        if not short_opts.empty and "underlying_px" in short_opts.columns and "strike" in short_opts.columns:
-            itm_calls = (short_opts["right"] == "C") & (short_opts["underlying_px"] > short_opts["strike"])
-            itm_puts  = (short_opts["right"] == "P") & (short_opts["underlying_px"] < short_opts["strike"])
-            near_assign = short_opts[(itm_calls | itm_puts) & (short_opts["_dte"] <= 14)].copy()
-            near_assign = near_assign[~near_assign["symbol"].isin(_ord_syms)]
-            if not near_assign.empty:
-                # compute how far ITM: calls → (und - strike) / und, puts → (strike - und) / und
-                und = near_assign["underlying_px"]
-                sk  = near_assign["strike"]
-                itm_pct = pd.Series(
-                    ((und - sk) / und).where(near_assign["right"] == "C", (sk - und) / und),
-                    index=near_assign.index,
-                ).fillna(0.0)
-                near_assign["_itm_pct"] = itm_pct
-                near_assign = near_assign.sort_values("_itm_pct", ascending=False)
-                rows_str = ", ".join(
-                    f"{r['symbol']} {r['right']}{r['strike']:.0f} ({r['_dte']:.0f}d {r['_itm_pct']*100:.1f}% ITM)"
-                    for _, r in near_assign.head(4).iterrows()
-                )
-                n = len(near_assign)
-                actions.append((
-                    "error",
-                    f"{n} short option{'s' if n > 1 else ''} ITM with ≤14 DTE — assignment risk: "
-                    f"{rows_str}. Roll or close immediately.",
-                ))
-
-    # 4. Delta concentration — single symbol > 15% of total abs(delta_$)
-    sym_delta = df.groupby("symbol")["delta_$"].sum().dropna()
-    total_abs_delta = float(sym_delta.abs().sum())
-    if total_abs_delta > 0 and not sym_delta.empty:
-        max_sym = str(sym_delta.abs().idxmax())
-        conc = float(sym_delta.abs().max()) / total_abs_delta
-        if conc > 0.15:
-            delta_val = float(sym_delta[max_sym])
-            actions.append((
-                "warning",
-                f"Delta concentration: {max_sym} is {conc * 100:.0f}% of total "
-                f"directional exposure (${delta_val:+,.0f}). "
-                "Consider writing a covered call or trimming the position.",
-            ))
-
-    # 5. Reap candidates — exclude symbols already in df_reap or open orders
-    cands = reap_candidates(
-        df, snap.tickers,
-        reap_ratio=settings.reap_ratio,
-        min_reap_dte=settings.min_reap_dte,
-    )
-    if not cands.empty:
-        cands = cands[~cands["symbol"].isin(_addressed_reap)]
-    if not cands.empty:
-        total_pnl = float(cands["pnl_if_reaped"].sum())
-        syms = cands["symbol"].unique().tolist()
-        sym_str = ", ".join(syms[:4]) + ("…" if len(syms) > 4 else "")
-        n = len(cands)
-        actions.append((
-            "info",
-            f"{n} reap candidate{'s' if n > 1 else ''} (no pending order): {sym_str}. "
-            f"Closing these short options locks in ${total_pnl:,.0f} profit.",
-        ))
-
-    # 6. Unprotected stocks (if PROTECT_ME enabled)
-    if settings.protect_me:
-        unprot = df[(df["pf_state"] == "unprotected") & (df["secType"] == "STK")]
-        if not unprot.empty:
-            syms = unprot["symbol"].tolist()
-            sym_str = ", ".join(syms[:4]) + ("…" if len(syms) > 4 else "")
-            notional = abs(float(unprot["marketValue"].sum()))
-            n = len(unprot)
-            actions.append((
-                "warning",
-                f"{n} unprotected position{'s' if n > 1 else ''} (covered but no put): "
-                f"{sym_str} — ${notional:,.0f} exposed to downside. Buy protective puts.",
-            ))
-
-    # Sort errors first, then warnings, then info; cap at 5
-    _rank = {"error": 0, "warning": 1, "info": 2}
-    actions = sorted(actions, key=lambda x: _rank.get(x[0], 3))[:5]
-
-    st.markdown("#### Top Risk-Reduction Actions")
-    if not actions:
-        st.success("No critical risks detected — portfolio appears well-hedged.")
-    else:
-        for i, (severity, text) in enumerate(actions, 1):
-            getattr(st, severity)(f"**{i}.** {text}")
-
-    # ── Delta concentration chart + Cover/Protect gaps ─────────────────────
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        _n_syms = int(sym_delta.notna().sum()) if not sym_delta.empty else 0
-        _top_n = min(15, _n_syms)
-        st.markdown(f"##### Delta concentration by symbol (top {_top_n} of {_n_syms})")
-        if total_abs_delta > 0 and not sym_delta.empty:
-            top15_idx = sym_delta.abs().nlargest(_top_n).index
-            plot_df = (
-                sym_delta.loc[top15_idx]
-                .sort_values(ascending=True)
-                .reset_index()
-            )
-            plot_df.columns = ["symbol", "delta_$"]
-            plot_df["color"] = plot_df["delta_$"].apply(
-                lambda v: "#22c55e" if v >= 0 else "#ef4444"
-            )
-            fig = px.bar(
-                plot_df, x="delta_$", y="symbol", orientation="h",
-                color="color", color_discrete_map="identity",
-            )
-            fig.update_layout(
-                showlegend=False, height=460,
-                margin=dict(l=10, r=10, t=10, b=10),
-                xaxis_title="Dollar Delta ($)",
-                yaxis_title=None,
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#1e2130"),
-            )
-            st.plotly_chart(fig, width="stretch")
-        else:
-            st.info("No delta data yet.")
-
-    with c2:
-        st.markdown("##### Cover / Protect gaps")
-        if not settings.protect_me:
-            st.caption("PROTECT_ME=False — protection not requested, cover gaps only.")
-        gaps = cover_protect_gaps(
-            df, snap.tickers,
-            protect_me=settings.protect_me,
-            cover_std_mult=settings.cover_std_mult,
-            max_dte=settings.max_dte,
+    html_parts = ['<table class="kpi-tbl">']
+    for i, (l1, v1, cls1, l2, v2, cls2, l3, v3, cls3) in enumerate(rows):
+        rc = "kpi-row-a" if i % 2 == 0 else "kpi-row-b"
+        html_parts.append(
+            f'<tr class="{rc}">'
+            f'<td class="kpi-lbl">{l1}</td><td class="kpi-val"{cls1}>{v1}</td>'
+            f'<td class="kpi-lbl kpi-lbl2">{l2}</td><td class="kpi-val"{cls2}>{v2}</td>'
+            f'<td class="kpi-lbl kpi-lbl3">{l3}</td><td class="kpi-val"{cls3}>{v3}</td>'
+            f'</tr>'
         )
-        if gaps.empty:
-            success_msg = (
-                "No cover gaps."
-                if not settings.protect_me
-                else "No gaps — all stocks covered and protected."
-            )
-            st.success(success_msg)
-        else:
-            gap_col_cfg: dict = {
-                "mkt_px": st.column_config.NumberColumn("Mkt Px", format="$%.2f"),
-                "avg_cost": st.column_config.NumberColumn("Avg Cost", format="$%.2f"),
-                "cover_strike": st.column_config.NumberColumn(
-                    "Cover Strike",
-                    format="$%.1f",
-                    help=(
-                        f"Target call strike: max(avgCost, mkt_px + "
-                        f"{settings.cover_std_mult}×IV×√(DTE/252)), "
-                        f"DTE={settings.max_dte}. "
-                        "IV sourced from existing option tickers, default 30%."
-                    ),
-                ),
-                "gain_if_called": st.column_config.NumberColumn(
-                    "Gain if Called",
-                    format="$%,.0f",
-                    help=(
-                        "Capital gain vs avg cost if the stock is called away "
-                        "at the cover strike."
-                    ),
-                ),
-            }
-            if settings.protect_me:
-                gap_col_cfg["max_downside"] = st.column_config.NumberColumn(
-                    "Max Downside",
-                    format="$%,.0f",
-                    help=(
-                        "Total cost basis at risk (avg cost x shares) "
-                        "if the position falls to zero."
-                    ),
-                )
-                gap_col_cfg["protect_strike"] = st.column_config.TextColumn(
-                    "Protect Strike",
-                    help=(
-                        "Strike(s) of existing protective long option(s). "
-                        "Blank if the position has no protection yet."
-                    ),
-                )
-            st.dataframe(
-                _banded(gaps), hide_index=True, width="stretch", column_config=gap_col_cfg,
-            )
+    html_parts.append('</table>')
+    st.markdown("\n".join(html_parts), unsafe_allow_html=True)
+
+
 
 
 @st.fragment(run_every=3.0)
@@ -1037,42 +657,27 @@ def render_orders() -> None:
     ohlc_proc: subprocess.Popen | None  = st.session_state.get("ohlc_proc")
     exec_proc: subprocess.Popen | None  = st.session_state.get("execute_proc")
     frozen     = client.is_frozen()
-    proc_done  = proc is not None and proc.poll() is not None
-    ohlc_done  = ohlc_proc is not None and ohlc_proc.poll() is not None
-    exec_done  = exec_proc is not None and exec_proc.poll() is not None
+    # OHLC runs without freezing (IBKR fallback uses CID=12, never conflicts with dashboard CID=10)
+    _ohlc_running = ohlc_proc is not None and ohlc_proc.poll() is None
     frozen_for = st.session_state.get("frozen_for", "")   # "derive" | "ohlc" | "execute" | ""
 
-    # Auto-unfreeze: derive finished
-    if frozen and proc_done and frozen_for == "derive":
-        client.unfreeze()
-        st.session_state["derive_proc"] = None
-        st.session_state.pop("_derive_exit", None)
-        st.session_state.pop("frozen_for", None)
-        st.rerun()
+    # Auto-unfreeze when each subprocess finishes (derive + execute only; ohlc runs without freeze)
+    def _auto_unfreeze(tag: str, proc_key: str) -> None:
+        proc_ = st.session_state.get(proc_key)
+        if frozen and proc_ is not None and proc_.poll() is not None and frozen_for == tag:
+            st.session_state[f"_{tag}_exit"] = proc_.poll()  # capture before clearing proc
+            client.unfreeze()
+            st.session_state[proc_key] = None
+            st.session_state.pop("frozen_for", None)
+            st.rerun()
 
-    # Auto-unfreeze: OHLC finished
-    if frozen and ohlc_done and frozen_for == "ohlc":
-        client.unfreeze()
-        st.session_state["ohlc_proc"] = None
-        st.session_state.pop("_ohlc_exit", None)
-        st.session_state.pop("frozen_for", None)
-        st.rerun()
-
-    # Auto-unfreeze: Execute finished
-    if frozen and exec_done and frozen_for == "execute":
-        client.unfreeze()
-        st.session_state["execute_proc"] = None
-        st.session_state.pop("_execute_exit", None)
-        st.session_state.pop("frozen_for", None)
-        st.rerun()
+    _auto_unfreeze("derive",  "derive_proc")
+    _auto_unfreeze("execute", "execute_proc")
 
     # Capture exit codes the moment each process ends
-    if proc is not None and proc.poll() is not None and "_derive_exit" not in st.session_state:
-        st.session_state["_derive_exit"] = proc.poll()
-    if ohlc_proc is not None and ohlc_proc.poll() is not None and "_ohlc_exit" not in st.session_state:
-        st.session_state["_ohlc_exit"] = ohlc_proc.poll()
-    if exec_proc is not None and exec_proc.poll() is not None and "_execute_exit" not in st.session_state:
-        st.session_state["_execute_exit"] = exec_proc.poll()
+    _capture_exit(proc,      "_derive_exit")
+    _capture_exit(ohlc_proc, "_ohlc_exit")
+    _capture_exit(exec_proc, "_execute_exit")
 
     # ── Imports needed by Generate OHLCs ──────────────────────────────────────
     from src.dashboard.ohlc import (   # noqa: PLC0415  (local import inside fragment)
@@ -1081,8 +686,8 @@ def render_orders() -> None:
         write_symbol_list,
     )
 
-    # ── Action buttons — row 1: generate/fetch/clear ────────────────────────────
-    gen_col, ohlc_col, clr_col, _btn_spacer = st.columns([2, 2, 2, 5])
+    # ── Action buttons — single row: generate/fetch/execute/clear ────────────────
+    gen_col, ohlc_col, exec_col, clr_col, _btn_spacer = st.columns([2, 2, 2, 2, 2])
 
     # ── Generate Orders ────────────────────────────────────────────────────────
     with gen_col:
@@ -1095,17 +700,18 @@ def render_orders() -> None:
         ):
             _DERIVE_LOG.parent.mkdir(parents=True, exist_ok=True)
             log_fh = open(_DERIVE_LOG, "w", encoding="utf-8")  # noqa: SIM115
-            _env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+            _env = _sub_env()
             st.session_state.pop("_derive_exit", None)
             st.session_state["frozen_for"] = "derive"
             client.freeze()          # freeze BEFORE Popen so derive.py can claim CID=10
             new_proc = subprocess.Popen(
-                [sys.executable, str(_here() / "derive.py")],
+                [sys.executable, str(_here() / "src" / "derive.py")],
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
                 env=_env,
             )
             st.session_state["derive_proc"] = new_proc
+            logger.info("derive.py started pid={}", new_proc.pid)
             # No st.rerun() — fragment run_every=3.0 picks up frozen state automatically
         # Last-derive timestamp sits right under the button
         if "_derive_exit" not in st.session_state and not frozen:
@@ -1117,11 +723,11 @@ def render_orders() -> None:
     with ohlc_col:
         if st.button(
             "📊 Generate OHLCs",
-            disabled=frozen,
+            disabled=frozen or _ohlc_running,
             width="stretch",
             help=(
                 "Fetch / update 1.5 yr daily OHLC for S&P500 weekly underlyings + "
-                "portfolio positions. Freezes dashboard while running; reconnects after."
+                "portfolio positions. Runs in background; dashboard stays connected."
             ),
         ):
             # Build combined symbol list: S&P500 weekly underlyings + portfolio extras.
@@ -1143,33 +749,72 @@ def render_orders() -> None:
                     seen.add(_sym)
             write_symbol_list(sp500_specs + port_specs)
 
-            # Freeze BEFORE Popen so fetch_ohlc.py can claim CID=10 for the IBKR fallback.
+            # No freeze needed: primary fetch is yfinance; IBKR fallback uses CID=12
+            # (separate from dashboard CID=10 — no conflict).
             _OHLC_LOG.parent.mkdir(parents=True, exist_ok=True)
             _ohlc_log_fh = open(_OHLC_LOG, "w", encoding="utf-8")   # noqa: SIM115
-            _env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+            _env = _sub_env()
             st.session_state.pop("_ohlc_exit", None)
-            st.session_state["frozen_for"] = "ohlc"
-            client.freeze()   # freeze BEFORE Popen so subprocess can claim CID=10
             _ohlc_new_proc = subprocess.Popen(
-                [sys.executable, str(_here() / "fetch_ohlc.py")],
+                [sys.executable, str(_here() / "src" / "fetch_ohlc.py")],
                 stdout=_ohlc_log_fh,
                 stderr=subprocess.STDOUT,
                 env=_env,
             )
             st.session_state["ohlc_proc"] = _ohlc_new_proc
-            # No st.rerun() — fragment run_every=3.0 picks up frozen state automatically
+            logger.info("fetch_ohlc.py started pid={}", _ohlc_new_proc.pid)
+            # No st.rerun() — fragment run_every=3.0 polls process state automatically
         # Last-OHLC timestamp sits right under the button
-        if "_ohlc_exit" not in st.session_state and not frozen:
-            _ohlc_age = "never"
-            if OHLC_PATH.exists():
-                from datetime import datetime as _dt
-                _secs = (_dt.now() - _dt.fromtimestamp(OHLC_PATH.stat().st_mtime)).total_seconds()
-                _ohlc_age = (
-                    f"{int(_secs)}s ago" if _secs < 120
-                    else f"{int(_secs/60)}m ago" if _secs < 7200
-                    else f"{_secs/3600:.1f}h ago"
-                )
-            st.caption(f"Last: {_ohlc_age}")
+        if not _ohlc_running and "_ohlc_exit" not in st.session_state:
+            st.caption(f"Last: {_pkl_age('', path=OHLC_PATH)}")
+
+    # ── Execute Orders ────────────────────────────────────────────────────────
+    with exec_col:
+        # Execute Orders button with confirmation dialog
+        @st.dialog("⚠️ Confirm Order Execution", width="small")
+        def _confirm_execute():
+            st.markdown(
+                "This will execute all orders from the Suggested Orders section. "
+                "**This action is irreversible.** Are you sure?"
+            )
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Execute", width="stretch", use_container_width=True):
+                    st.session_state["_exec_confirmed"] = True
+                    st.rerun()
+            with col2:
+                if st.button("❌ Cancel", width="stretch", use_container_width=True):
+                    st.session_state.pop("_execute_exit", None)
+                    st.session_state.pop("_exec_confirmed", None)
+                    st.rerun()
+
+        if st.button(
+            "▶️ Execute Orders",
+            disabled=frozen,
+            width="stretch",
+            help="Execute all orders from the Suggested Orders section. "
+                 "Freezes the dashboard, runs execute.py, then reconnects. "
+                 "⚠️ This is IRREVERSIBLE.",
+        ):
+            _confirm_execute()
+
+        # Check if user confirmed and execute
+        if st.session_state.get("_exec_confirmed"):
+            st.session_state.pop("_exec_confirmed", None)
+            _EXECUTE_LOG.parent.mkdir(parents=True, exist_ok=True)
+            log_fh = open(_EXECUTE_LOG, "w", encoding="utf-8")  # noqa: SIM115
+            _env = _sub_env()
+            st.session_state.pop("_execute_exit", None)
+            st.session_state["frozen_for"] = "execute"
+            client.freeze()
+            exec_proc = subprocess.Popen(
+                [sys.executable, str(_here() / "src" / "execute.py")],
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                env=_env,
+            )
+            st.session_state["execute_proc"] = exec_proc
+            logger.info("execute.py started pid={}", exec_proc.pid)
 
     # ── Clear Data ─────────────────────────────────────────────────────────────
     with clr_col:
@@ -1200,56 +845,8 @@ def render_orders() -> None:
             # which can race with the IBKR connection and produce error 326.
         st.caption("Keeps OHLC store.")
 
-    # ── Action buttons — row 2: execute orders ────────────────────────────────
-    exec_col, _exec_spacer = st.columns([2, 9])
-    with exec_col:
-        # Execute Orders button with confirmation dialog
-        @st.dialog("⚠️ Confirm Order Execution", width="small")
-        def _confirm_execute():
-            st.markdown(
-                "This will execute all orders from the Suggested Orders section. "
-                "**This action is irreversible.** Are you sure?"
-            )
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("✅ Execute", width="stretch", use_container_width=True):
-                    st.session_state["_exec_confirmed"] = True
-                    st.rerun()
-            with col2:
-                if st.button("❌ Cancel", width="stretch", use_container_width=True):
-                    st.session_state["_exec_confirmed"] = False
-                    st.rerun()
-
-        if st.button(
-            "▶️ Execute Orders",
-            disabled=frozen,
-            width="stretch",
-            help="Execute all orders from the Suggested Orders section. "
-                 "Freezes the dashboard, runs execute.py, then reconnects. "
-                 "⚠️ This is IRREVERSIBLE.",
-        ):
-            _confirm_execute()
-
-        # Check if user confirmed and execute
-        if st.session_state.get("_exec_confirmed"):
-            st.session_state.pop("_exec_confirmed", None)
-            _EXECUTE_LOG = _here() / "log" / "execute.log"
-            _EXECUTE_LOG.parent.mkdir(parents=True, exist_ok=True)
-            log_fh = open(_EXECUTE_LOG, "w", encoding="utf-8")  # noqa: SIM115
-            _env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
-            st.session_state.pop("_execute_exit", None)
-            st.session_state["frozen_for"] = "execute"
-            client.freeze()
-            exec_proc = subprocess.Popen(
-                [sys.executable, str(_here() / "execute.py")],
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                env=_env,
-            )
-            st.session_state["execute_proc"] = exec_proc
-
     # ── Status row (derive + OHLC + execute) ────────────────────────────────────
-    if frozen or "_derive_exit" in st.session_state or "_ohlc_exit" in st.session_state or "_execute_exit" in st.session_state:
+    if frozen or _ohlc_running or "_derive_exit" in st.session_state or "_ohlc_exit" in st.session_state or "_execute_exit" in st.session_state:
         gen_status_col, ohlc_status_col, exec_status_col, _st_spacer = st.columns([2.5, 2.5, 2.5, 2.5])
         with gen_status_col:
             if frozen and frozen_for == "derive":
@@ -1262,8 +859,9 @@ def render_orders() -> None:
                 else:
                     st.error(f"❌ Generate Orders failed (exit {rc})")
         with ohlc_status_col:
-            if frozen and frozen_for == "ohlc":
-                st.progress(0.5, text="⏳ Fetching OHLCs…")
+            if _ohlc_running:
+                _op, _ol = _ohlc_progress()
+                st.progress(_op, text=f"⏳ {_ol}")
             elif "_ohlc_exit" in st.session_state:
                 rc = st.session_state["_ohlc_exit"]
                 if rc == 0:
@@ -1280,12 +878,12 @@ def render_orders() -> None:
                 else:
                     st.error(f"❌ Order execution failed (exit {rc})")
 
-    # ── Scrollable log (live during freeze; collapsible after) ────────────────
-    if frozen and frozen_for == "ohlc":
+    # ── Scrollable log (live during run; collapsible after) ───────────────────
+    if _ohlc_running:
         _ohlc_live = _ohlc_log_lines(30)
         if _ohlc_live:
-            st.code("\n".join(_ohlc_live), language=None)
-    elif frozen and frozen_for == "execute":
+            st.code("\n".join(_strip_ansi(ln) for ln in _ohlc_live), language=None)
+    if frozen and frozen_for == "execute":
         _exec_log = _here() / "log" / "execute.log"
         if _exec_log.exists():
             try:
@@ -1297,45 +895,20 @@ def render_orders() -> None:
     elif frozen:
         log_lines = _derive_log_lines(35)
         if log_lines:
-            st.code("\n".join(log_lines), language=None)
+            st.code("\n".join(_strip_ansi(ln) for ln in log_lines), language=None)
     elif "_derive_exit" in st.session_state:
         rc = st.session_state["_derive_exit"]
-        with st.expander("📋 derive.py log", expanded=rc != 0):
-            if _DERIVE_LOG.exists():
-                try:
-                    st.code(
-                        _DERIVE_LOG.read_text(encoding="utf-8", errors="replace"),
-                        language=None,
-                    )
-                except Exception as _e:
-                    st.warning(f"Could not read log: {_e}")
+        _render_log_expander("📋 derive.py log", _DERIVE_LOG, expanded=rc != 0)
 
     # Post-run OHLC log — collapsible after freeze ends
     if "_ohlc_exit" in st.session_state:
         rc = st.session_state["_ohlc_exit"]
-        with st.expander("📋 OHLC log", expanded=rc != 0):
-            if _OHLC_LOG.exists():
-                try:
-                    st.code(
-                        _OHLC_LOG.read_text(encoding="utf-8", errors="replace"),
-                        language=None,
-                    )
-                except Exception as _e:
-                    st.warning(f"Could not read OHLC log: {_e}")
+        _render_log_expander("📋 OHLC log", _OHLC_LOG, expanded=rc != 0)
 
     # Post-run Execute log — collapsible after freeze ends
     if "_execute_exit" in st.session_state:
         rc = st.session_state["_execute_exit"]
-        _EXECUTE_LOG = _here() / "log" / "execute.log"
-        with st.expander("📋 execute.py log", expanded=rc != 0):
-            if _EXECUTE_LOG.exists():
-                try:
-                    st.code(
-                        _EXECUTE_LOG.read_text(encoding="utf-8", errors="replace"),
-                        language=None,
-                    )
-                except Exception as _e:
-                    st.warning(f"Could not read execute log: {_e}")
+        _render_log_expander("📋 execute.py log", _EXECUTE_LOG, expanded=rc != 0)
 
     st.divider()
 
@@ -1569,8 +1142,24 @@ def render_config_panel() -> None:
     in render_orders when the user edits config while derive is running.
     """
     _init_cfg_state()
-    st.markdown("#### ⚙️ Config")
+    _cfg_hdr, _cfg_btn = st.columns([3, 1])
+    with _cfg_hdr:
+        st.markdown("#### ⚙️ Config")
+    with _cfg_btn:
+        if st.button("🔄 Get Config", help="Force re-read from snp_config.yml", width="stretch"):
+            _force_reload_cfg()
+            st.rerun()
     st.caption("Changes apply to next derive run. Comments in YAML are not preserved on save.")
+
+    # ── GENERAL (top — most-used risk limits) ───────────────────────────────
+    st.number_input("MINCUSHION", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
+                    key="cfg_mincushion",
+                    help="Minimum excess-liquidity / NLV cushion (triggers alert below this)")
+    st.number_input("MAX_DTE", min_value=1, step=1,
+                    key="cfg_max_dte",
+                    help="Maximum days to expiry for new option entries")
+
+    st.divider()
 
     # ── COVER ──────────────────────────────────────────────────────────────
     st.toggle("COVER_ME", key="cfg_cover_me")
@@ -1635,14 +1224,6 @@ def render_config_panel() -> None:
 
     st.divider()
 
-    # ── GENERAL ────────────────────────────────────────────────────────────
-    st.number_input("MAX_DTE", min_value=1, step=1,
-                    key="cfg_max_dte",
-                    help="Maximum days to expiry for new option entries")
-    st.number_input("MINCUSHION", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
-                    key="cfg_mincushion",
-                    help="Minimum excess-liquidity / NLV cushion (triggers alert below this)")
-
     if st.button("💾 Save Config", type="primary", width="stretch",
                  disabled=not _cfg_dirty()):
         try:
@@ -1684,9 +1265,18 @@ def render_diagnostics() -> None:
     if snap.account_values:
         all_av = snap.account_values
 
+        def _fmt_val(v) -> str:
+            try:
+                f = float(v)
+                if f == round(f, 0):
+                    return f"{int(round(f)):,}"
+                return str(v)
+            except (ValueError, TypeError):
+                return str(v)
+
         def _av_rows(a: str, vals: dict) -> list[dict]:
             return [
-                {"account": a, "tag": k, "value": str(v)}
+                {"account": a, "tag": k, "value": _fmt_val(v)}
                 for k, v in sorted(vals.items())
                 if float(v) not in (0.0, -1.0)
             ]
@@ -1751,16 +1341,197 @@ def render_diagnostics() -> None:
 # Analysis tab
 # ---------------------------------------------------------------------------
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_ohlc() -> dict:
+    """Load the OHLC pickle store, cached for 120 s to avoid re-reading on every 60 s tick."""
+    from src.dashboard.ohlc import load_ohlc  # noqa: PLC0415
+    return load_ohlc()
+
+
+def _sync_analysis_to_pos_filter() -> None:
+    pass  # callback kept for selectbox; Positions tab removed
+
+
 @st.fragment(run_every=60.0)
 def render_analysis() -> None:
-    """OHLC browser, candlestick/BB/RSI/volume chart, and per-symbol position summary."""
-    from src.dashboard.ohlc import load_ohlc  # noqa: PLC0415
-
+    """Cover/Protect gaps + OHLC chart browser."""
     snap = client.snapshot()
     acct = _selected_account()
 
+    # ── Positions table (live — with filters + ITM highlighting) ─────────────
+    if not snap.positions.empty:
+        _pos_data = classify_portfolio(_filter_positions(snap.positions, acct))
+        _pos_data = _join_tickers(_pos_data, snap.tickers)
+        _pos_data["margin_est"] = position_margin_est(_pos_data)
+
+        with st.expander("📋 Positions", expanded=False):
+            _pf_c1, _pf_c2, _pf_c3, _pf_c4, _pf_c5, _pf_c6 = st.columns([2.5, 1, 2, 1, 1, 1])
+            _pf_sym = _pf_c1.text_input(
+                "Symbol", key="pf_sym", placeholder="exact, e.g. A"
+            ).strip().upper()
+            _pf_sectype = _pf_c2.selectbox("secType", ["ALL", "STK", "OPT"], key="pf_sectype")
+            _all_states = ["ALL"] + sorted(
+                _pos_data["pf_state"].dropna().unique().tolist()
+                if "pf_state" in _pos_data.columns else []
+            )
+            _pf_state_sel = _pf_c3.selectbox("State", _all_states, key="pf_f_state")
+            # Build DTE choices from OPT rows in the unfiltered position data
+            _opt_mask = (_pos_data.get("secType", pd.Series("", index=_pos_data.index)) == "OPT")
+            _opt_expiries = (
+                _pos_data.loc[_opt_mask, "expiry"].dropna().astype(str).unique().tolist()
+                if "expiry" in _pos_data.columns else []
+            )
+            _dte_int_set = sorted({
+                int(v) for v in _dte_series(pd.Series(_opt_expiries)).dropna() if not pd.isna(v)
+            })
+            _dte_opts = ["ALL"] + [str(d) for d in _dte_int_set]
+            _pf_dte_sel = _pf_c4.selectbox("Max DTE", _dte_opts, key="pf_dte_sel")
+            _pf_itm_only = _pf_c5.checkbox("ITM only", key="pf_itm_only")
+            if _pf_c6.button("✕ Clear", key="pf_clear_filter", width="stretch"):
+                for _k in ("pf_sym", "pf_sectype", "pf_f_state", "pf_dte_sel", "pf_itm_only"):
+                    st.session_state.pop(_k, None)
+                st.rerun()
+
+            # Apply filters
+            _pv = _pos_data.copy()
+            if _pf_sym:
+                _pv = _pv[_pv["symbol"].astype(str).str.upper() == _pf_sym]
+            if _pf_sectype != "ALL":
+                _pv = _pv[_pv.get("secType", pd.Series("", index=_pv.index)) == _pf_sectype]
+            if _pf_state_sel != "ALL":
+                _pv = _pv[_pv.get("pf_state", pd.Series("", index=_pv.index)) == _pf_state_sel]
+            if _pf_dte_sel != "ALL":
+                _dte_max_val = int(_pf_dte_sel)
+                _dte_col = _dte_series(
+                    _pv.get("expiry", pd.Series("", index=_pv.index)).fillna("").astype(str)
+                )
+                _pv = _pv[_dte_col.isna() | (_dte_col <= _dte_max_val)]
+            if _pf_itm_only:
+                _pv = _pv[pd.Series(_itm_mask_vec(_pv), index=_pv.index)]
+            _pv = _pv.reset_index(drop=True)
+            _itm_arr = _itm_mask_vec(_pv)
+
+            # Build display columns: und_px next to strike; dte inserted next to expiry
+            _pos_show_cols = [
+                "symbol", "secType", "right", "strike", "underlying_px",
+                "expiry", "position", "marketPrice",
+                "delta", "gamma", "theta", "vega", "margin_est", "pf_state",
+            ]
+            _pv_show = _pv[[c for c in _pos_show_cols if c in _pv.columns]].copy()
+            # Insert DTE column immediately after expiry
+            if "expiry" in _pv_show.columns:
+                _pv_show.insert(
+                    _pv_show.columns.get_loc("expiry") + 1, "dte",
+                    _dte_series(_pv_show["expiry"].fillna("").astype(str)).round(0).values,
+                )
+            # For STK rows underlying price equals market price
+            if all(c in _pv_show.columns for c in ("underlying_px", "marketPrice", "secType")):
+                _stk_rows = _pv_show["secType"] == "STK"
+                _pv_show.loc[_stk_rows, "underlying_px"] = _pv_show.loc[_stk_rows, "marketPrice"]
+            if "position" in _pv_show.columns:
+                _pv_show["position"] = _pv_show["position"].fillna(0).astype(int)
+
+            if _pv_show.empty:
+                st.info("No positions match the current filter.")
+            else:
+                st.dataframe(
+                    _banded(_pv_show, itm_mask=_itm_arr),
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "strike":        st.column_config.NumberColumn("Strike",  format="%.1f"),
+                        "underlying_px": st.column_config.NumberColumn("Und Px",  format="$%,.2f"),
+                        "expiry":        st.column_config.TextColumn("Expiry"),
+                        "dte":           st.column_config.NumberColumn("DTE",     format="%.0f"),
+                        "position":      st.column_config.NumberColumn("Qty",     format="%.0f"),
+                        "marketPrice":   st.column_config.NumberColumn("Mkt Px",  format="$%,.2f"),
+                        "delta":         st.column_config.NumberColumn("Δ",       format="%.3f"),
+                        "gamma":         st.column_config.NumberColumn("Γ",       format="%.4f"),
+                        "theta":         st.column_config.NumberColumn("Θ",       format="%.3f"),
+                        "vega":          st.column_config.NumberColumn("ν",       format="%.3f"),
+                        "margin_est":    st.column_config.NumberColumn("Margin",  format="$%,.0f"),
+                        "pf_state":      st.column_config.TextColumn("State"),
+                    },
+                )
+
+        # ── Cover / Protect gaps ─────────────────────────────────────────────
+        # protect_me=True always so Protect Strike / Value Protected columns are present
+        gaps = cover_protect_gaps(
+            _pos_data, snap.tickers,
+            protect_me=True,
+            cover_std_mult=settings.cover_std_mult,
+            max_dte=settings.max_dte,
+        )
+        _gap_header = "🔍 Cover / Protect gaps"
+        if not settings.protect_me:
+            _gap_header += " — cover only (PROTECT_ME=False)"
+        with st.expander(_gap_header, expanded=False):
+            if gaps.empty:
+                st.success("No gaps — all stocks covered and protected.")
+            else:
+                _gaps_show = gaps.copy()
+                if "shares" in _gaps_show.columns:
+                    _gaps_show["shares"] = _gaps_show["shares"].fillna(0).astype(int)
+                # Merge unrealizedPNL from live positions (sum across stock + options)
+                if "unrealizedPNL" in _pos_data.columns:
+                    _pnl_agg = (
+                        _pos_data.groupby("symbol")["unrealizedPNL"]
+                        .sum()
+                        .reset_index()
+                    )
+                    _gaps_show = _gaps_show.merge(_pnl_agg, on="symbol", how="left")
+                # Needs filter
+                _gap_needs_opts = ["ALL"] + sorted(_gaps_show["needs"].dropna().unique().tolist())
+                _gnf_col, _ = st.columns([2, 6])
+                _gap_needs_sel = _gnf_col.selectbox(
+                    "Needs", _gap_needs_opts, key="gap_needs_sel",
+                )
+                if _gap_needs_sel != "ALL":
+                    _gaps_show = _gaps_show[_gaps_show["needs"] == _gap_needs_sel]
+                # Column order: cover_strike | mkt_px | protect_strike either side
+                _gap_cols = [
+                    "symbol", "shares", "avg_cost",
+                    "cover_strike", "mkt_px", "protect_strike",
+                    "gain_if_called", "max_downside", "unrealizedPNL", "needs",
+                ]
+                _gaps_show = _gaps_show[[c for c in _gap_cols if c in _gaps_show.columns]]
+                _gap_col_cfg: dict = {
+                    "shares": st.column_config.NumberColumn("Shares", format="%d"),
+                    "avg_cost": st.column_config.NumberColumn("Avg Cost", format="$%.2f"),
+                    "cover_strike": st.column_config.NumberColumn(
+                        "Cover Strike", format="$%.1f",
+                        help=(
+                            f"Target call strike: max(avgCost, mkt_px + "
+                            f"{settings.cover_std_mult}×IV×√(DTE/252)), DTE={settings.max_dte}. "
+                            "IV sourced from existing option tickers, default 30%."
+                        ),
+                    ),
+                    "mkt_px": st.column_config.NumberColumn("Mkt Px", format="$%.2f"),
+                    "protect_strike": st.column_config.TextColumn(
+                        "Target Protect Strike",
+                        help=(
+                            "~XXX.X = target put strike (mkt_px − cover_std_mult×σ) when no protection. "
+                            "Existing strike(s) shown when long option held."
+                        ),
+                    ),
+                    "gain_if_called": st.column_config.NumberColumn(
+                        "Gain if Called", format="$%,.0f",
+                        help="Capital gain vs avg cost if the stock is called away at the cover strike.",
+                    ),
+                    "max_downside": st.column_config.NumberColumn(
+                        "Value Protected", format="$%,.0f",
+                        help="Total cost basis at risk (avg cost × shares) if the position falls to zero.",
+                    ),
+                    "unrealizedPNL": st.column_config.NumberColumn(
+                        "Unrealized P&L", format="$%,.0f",
+                        help="Sum of unrealized P&L across all positions (stock + options) for this symbol.",
+                    ),
+                }
+                st.dataframe(_banded(_gaps_show), hide_index=True, width="stretch", column_config=_gap_col_cfg)
+        st.divider()
+
     # ── Load OHLC store ───────────────────────────────────────────────────────
-    ohlc_store = load_ohlc()
+    ohlc_store = _cached_ohlc()
     if not ohlc_store:
         st.info(
             "No OHLC data yet. Click **📊 Generate OHLCs** in the Orders tab "
@@ -1816,11 +1587,22 @@ def render_analysis() -> None:
                 st.info("No positions with margin > 0.")
 
     # ── Chart symbol selector ─────────────────────────────────────────────────
-    selected_sym: str | None = st.selectbox(
-        "Select symbol for chart & position summary",
-        all_symbols,
-        key="analysis_chart_sym",
-    )
+    # Guard stale session_state (e.g. symbol removed from OHLC store after a refresh)
+    _cur_sym = st.session_state.get("analysis_chart_sym")
+    if _cur_sym not in all_symbols:
+        st.session_state["analysis_chart_sym"] = all_symbols[0] if all_symbols else None
+
+    _sym_col, _ = st.columns([1, 9])
+    with _sym_col:
+        st.markdown('<div class="sym-sel-narrow">', unsafe_allow_html=True)
+        selected_sym: str | None = st.selectbox(
+            "Symbol",
+            all_symbols,
+            key="analysis_chart_sym",
+            on_change=_sync_analysis_to_pos_filter,
+            label_visibility="collapsed",
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
     if not selected_sym or selected_sym not in ohlc_store:
         return
 
@@ -1903,7 +1685,7 @@ def render_analysis() -> None:
         go.Scatter(
             x=x, y=bb_upper, name=f"BB Upper (SMA20+{bb_mult}σ)",
             line={"color": "rgba(251,191,36,0.7)", "width": 1},
-            hovertemplate="<b>BB Upper</b>: %{y:,.2f}<br>%{x|%b %d}<extra></extra>",
+            hovertemplate="BB Upper: %{y:,.2f}<extra></extra>",
         ),
         row=1, col=1,
     )
@@ -1913,7 +1695,7 @@ def render_analysis() -> None:
             line={"color": "rgba(251,191,36,0.7)", "width": 1},
             fill="tonexty",
             fillcolor="rgba(251,191,36,0.10)",
-            hovertemplate="<b>BB Lower</b>: %{y:,.2f}<br>%{x|%b %d}<extra></extra>",
+            hoverinfo="skip",   # fill area must not obscure candle hover
         ),
         row=1, col=1,
     )
@@ -1921,7 +1703,16 @@ def render_analysis() -> None:
         go.Scatter(
             x=x, y=bb_mid, name="SMA 20",
             line={"color": "rgba(251,191,36,1.0)", "width": 1, "dash": "dot"},
-            hovertemplate="<b>SMA 20</b>: %{y:,.2f}<br>%{x|%b %d}<extra></extra>",
+            hovertemplate="SMA 20: %{y:,.2f}<extra></extra>",
+        ),
+        row=1, col=1,
+    )
+    # Separator line in unified hover between BB/SMA rows and OHLC row
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=[None] * len(x),
+            name="", mode="none", showlegend=False,
+            hovertemplate="──────────────<extra></extra>",
         ),
         row=1, col=1,
     )
@@ -2078,6 +1869,7 @@ def render_analysis() -> None:
     fig.update_layout(
         height=700,
         showlegend=True,
+        hovermode="x unified",
         legend={
             "orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1,
             "bgcolor": "rgba(248, 249, 250, 0.82)",
@@ -2087,14 +1879,16 @@ def render_analysis() -> None:
         xaxis_rangeslider_visible=False,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
-        # Fix white-on-white tooltip: force dark background with light text
         hoverlabel={
             "bgcolor":     "#ffffff",
             "font_color":  "#1e2130",
             "bordercolor": "#cbd5e1",
             "font_size":   11,
         },
+        hoverdistance=50,
     )
+    fig.update_xaxes(showspikes=False)
+    fig.update_yaxes(showspikes=False)
     fig.update_yaxes(range=[0, 100], tickvals=[0, 30, 50, 70, 100], row=2, col=1)
 
     st.plotly_chart(fig, width="stretch")
@@ -2133,6 +1927,10 @@ def render_analysis() -> None:
         if _sym_mcol in sym_pos.columns:
             disp_cols.append(_sym_mcol)
         sym_view = sym_pos[[c for c in disp_cols if c in sym_pos.columns]].reset_index(drop=True)
+        # STK rows: underlying_px is always None — fill with marketPrice (stock IS the underlying)
+        if "secType" in sym_view.columns and "marketPrice" in sym_view.columns and "underlying_px" in sym_view.columns:
+            _stk = sym_view["secType"] == "STK"
+            sym_view.loc[_stk, "underlying_px"] = sym_view.loc[_stk, "marketPrice"]
         st.dataframe(
             _banded(sym_view, _s_itm),
             hide_index=True,
@@ -2158,19 +1956,103 @@ def render_analysis() -> None:
         )
 
 
+_PROVIDER_HINTS: dict[str, tuple[str, str]] = {
+    "DeepSeek": ("platform.deepseek.com",          "https://platform.deepseek.com/"),
+    "Gemini":   ("aistudio.google.com/app/apikey", "https://aistudio.google.com/app/apikey"),
+    "Claude":   ("console.anthropic.com",          "https://console.anthropic.com"),
+}
+
+
+def _build_live_context() -> dict:
+    """Build LLM context from the live dashboard snapshot."""
+    snap = client.snapshot()
+    acct = _selected_account()
+    positions = _filter_positions(snap.positions, acct)
+    context: dict = {}
+    if not positions.empty:
+        cols = [c for c in ("symbol", "secType", "position", "marketPrice",
+                             "marketValue", "delta", "theta", "vega") if c in positions.columns]
+        context["positions"] = positions[cols]
+    g = greek_dollar_sums(positions, snap.tickers) if not positions.empty else {}
+    if g:
+        context["greeks"] = {k: round(v, 2) for k, v in g.items() if isinstance(v, float)}
+    av = _select_account_values(snap, acct)
+    if av:
+        context["metrics"] = {k: str(v) for k, v in av.items()}
+    return context
+
+
+def _render_llm_chat() -> None:
+    """Compact Ask AI dock: always visible, one row of controls + cached response."""
+    p_col, q_col, c_col = st.columns([2, 5, 1])
+
+    provider = p_col.selectbox(
+        "Provider",
+        list(_PROVIDER_HINTS),
+        key="llm_provider",
+        label_visibility="collapsed",
+    )
+
+    _qver = st.session_state.get("llm_q_ver", 0)
+    question: str = q_col.text_input(
+        "Ask",
+        key=f"llm_q_{_qver}",
+        placeholder="Ask about your portfolio…",
+        label_visibility="collapsed",
+    )
+
+    if c_col.button("✕", key="llm_clr", help="Clear", use_container_width=True):
+        st.session_state["llm_q_ver"] = _qver + 1
+        st.session_state.pop("llm_response", None)
+        st.session_state.pop("llm_last_q", None)
+        st.session_state.pop("llm_last_prov", None)
+        st.rerun()
+
+    # Only query when the question or provider actually changes (not on every fragment tick)
+    if question and (
+        question != st.session_state.get("llm_last_q")
+        or provider != st.session_state.get("llm_last_prov")
+    ):
+        with st.spinner(f"{provider}…"):
+            try:
+                context = _build_live_context()
+                if provider == "Claude":
+                    resp = query_data(question, context)
+                elif provider == "Gemini":
+                    resp = query_data_gemini(question, context)
+                else:
+                    resp = query_data_deepseek(question, context)
+                st.session_state["llm_response"] = resp
+            except Exception as e:
+                st.session_state["llm_response"] = f"⚠️ {e}"
+            st.session_state["llm_last_q"] = question
+            st.session_state["llm_last_prov"] = provider
+
+    if cached := st.session_state.get("llm_response"):
+        with st.expander("Answer", expanded=True):
+            with st.container(height=120, border=False):
+                # Escape $ so Streamlit doesn't treat currency/options as LaTeX delimiters
+                safe = cached.replace("$", r"\$")
+                st.markdown(safe)
+
+
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
 
-_nav_c1, _nav_c2, _ = st.columns([4, 1, 6])
+# Nav row: [header | tabs | account selector | spacer] — all fixed at top via CSS :has([stRadio])
+# Account selector placed right after tabs so native Streamlit Deploy/burger stay visible on far right.
+_hdr_c, _nav_c1, _acct_c, _spacer_c = st.columns([2, 3, 1, 2])
+with _hdr_c:
+    header()
 with _nav_c1:
     nav = st.radio(
         "Navigation",
-        ["Positions", "Orders", "Analysis", "Diagnostics"],
+        ["Analysis", "Orders", "Diagnostics"],
         horizontal=True,
         label_visibility="collapsed",
     )
-with _nav_c2:
+with _acct_c:
     if len(_REAL_ACCOUNTS) > 1:
         st.selectbox(
             "Account",
@@ -2180,22 +2062,68 @@ with _nav_c2:
         )
     elif _REAL_ACCOUNTS:
         st.caption(next(iter(_REAL_ACCOUNTS)))
+# _spacer_c intentionally empty — preserves right-side gap for native Streamlit controls
 
-header()
-kpi_strip()
-st.divider()
+# Second fixed band: [KPI table | Ask AI]
+# JS below finds this block via the Ask AI input placeholder and pins it below the nav row.
+_kpi_c, _ai_c = st.columns([3, 7])
+with _kpi_c:
+    kpi_strip()
+with _ai_c:
+    _render_llm_chat()
 
-if nav == "Positions":
-    render_positions()
-    st.divider()
-    render_risk()
+st.markdown(
+    """
+    <script>
+    (function () {
+        const PH = 'Ask about your portfolio…';
+        function applyFix() {
+            const inp = document.querySelector('input[placeholder="' + PH + '"]');
+            if (!inp) return;
+            const bar = inp.closest('[data-testid="stHorizontalBlock"]');
+            if (!bar) return;
+            if (!bar.classList.contains('kpi-bar-fixed')) bar.classList.add('kpi-bar-fixed');
+            const col = inp.closest('[data-testid="stColumn"]');
+            if (col && !col.classList.contains('ask-ai-col')) col.classList.add('ask-ai-col');
+            /* Dynamically set main-content padding to match actual nav+bar heights */
+            const nav = document.querySelector('[data-testid="stHorizontalBlock"]:has([data-testid="stRadio"])');
+            const main = document.querySelector('section[data-testid="stMain"] > div.block-container');
+            if (nav && main) {
+                const navH = nav.getBoundingClientRect().height;
+                bar.style.top = navH + 'px';
+                const h = navH + bar.getBoundingClientRect().height;
+                main.style.paddingTop = Math.max(h + 6, 80) + 'px';
+            }
+        }
+        applyFix();
+        let _t;
+        new MutationObserver(function () { clearTimeout(_t); _t = setTimeout(applyFix, 50); })
+            .observe(document.body, { childList: true, subtree: true });
+    })();
+    </script>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Log tab and account navigation changes (fires once per actual change per session).
+_prev_nav = st.session_state.get("_prev_nav")
+if _prev_nav is not None and _prev_nav != nav:
+    logger.info("Tab navigation: {} → {}", _prev_nav, nav)
+st.session_state["_prev_nav"] = nav
+
+_prev_acct = st.session_state.get("_prev_acct_sel")
+_curr_acct = st.session_state.get("acct_sel")
+if _prev_acct is not None and _prev_acct != _curr_acct:
+    logger.info("Account selector: {} → {}", _prev_acct, _curr_acct)
+st.session_state["_prev_acct_sel"] = _curr_acct
+
+if nav == "Analysis":
+    render_analysis()
 elif nav == "Orders":
     _ord_col, _cfg_col = st.columns([3, 1])
     with _ord_col:
         render_orders()
     with _cfg_col:
         render_config_panel()
-elif nav == "Analysis":
-    render_analysis()
 elif nav == "Diagnostics":
     render_diagnostics()

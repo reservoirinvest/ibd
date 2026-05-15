@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 # pyrefly: ignore [missing-import]
-from build import (
+from src.build import (
     ROOT,
     chains_n_unds,
     do_i_refresh,
@@ -17,7 +17,7 @@ from build import (
 )
 
 # pyrefly: ignore [missing-import]
-from classify import (
+from src.classify import (
     classifed_results,
     classify_open_orders,
     get_financials,

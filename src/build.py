@@ -23,17 +23,14 @@ from dotenv import find_dotenv, load_dotenv
 from ib_async import IB, Contract, Stock
 from loguru import logger
 from pyprojroot import here
-from rich.progress import track
 from scipy.stats import norm
 # pyrefly: ignore [untyped-import]
+from tqdm import tqdm as _tqdm
 from tqdm.asyncio import tqdm as async_tqdm
 
 # Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
 
-# Configure logger to suppress debug messages
-logger.remove()
-logger.add(lambda msg: print(msg, end=''), level="INFO")
 
 #%% 
 # Configuration functions
@@ -489,7 +486,7 @@ def qualify_me(
         num_batches = (total_contracts + batch_size - 1) // batch_size
 
         # Since we use rich track, we don't need the context manager tqdm.
-        for batch_num in track(range(num_batches), description=desc):
+        for batch_num in _tqdm(range(num_batches), desc=desc):
             start_idx = batch_num * batch_size
             end_idx = min(start_idx + batch_size, total_contracts)
             batch_contracts = contracts[start_idx:end_idx]
@@ -611,7 +608,7 @@ def get_prices(
             except (TypeError, ValueError):
                 return False
         
-        for batch_num in track(range(total_batches), description="Fetching prices"):
+        for batch_num in _tqdm(range(total_batches), desc="Fetching prices"):
             start_idx = batch_num * batch_size
             end_idx = min(start_idx + batch_size, len(contracts))
             batch_contracts = contracts[start_idx:end_idx]
@@ -735,7 +732,8 @@ def get_volatilities_snapshot(
     market: str = "SNP",
     batch_size: int = 50,
     max_wait_time: int = 10,  # Note: max_wait_time is used as sleep_time in async call
-    ib: IB = None
+    ib: IB = None,
+    desc: str = "Fetching volatilities",
 ) -> pd.DataFrame:
     """
     Get a one-time snapshot of price, implied volatility (IV), and historical volatility (HV)
@@ -763,7 +761,7 @@ def get_volatilities_snapshot(
         # Process contracts in batches
         total_batches = (len(contracts) + batch_size - 1) // batch_size
 
-        for batch_num in track(range(total_batches), description="Fetching volatilities"):
+        for batch_num in _tqdm(range(total_batches), desc=desc):
             start_idx = batch_num * batch_size
             end_idx = min(start_idx + batch_size, len(contracts))
             batch_contracts = contracts[start_idx:end_idx]
@@ -933,7 +931,7 @@ def get_option_chains(
         # Process contracts in batches
         total_batches = (len(contracts) + batch_size - 1) // batch_size
 
-        for batch_num in track(range(total_batches), description="Fetching option chains"):
+        for batch_num in _tqdm(range(total_batches), desc="Fetching option chains"):
             start_idx = batch_num * batch_size
             end_idx = min(start_idx + batch_size, len(contracts))
             batch_contracts = contracts[start_idx:end_idx]
@@ -1147,9 +1145,7 @@ def chains_n_unds(msg: bool = False):
     else:
         df_unds['margin'] = pd.Series(dtype=float)
 
-    if not df_unds.empty and 'symbol' in df_unds.columns:
-        print(df_unds[['symbol', 'iv', 'hv', 'margin', 'price']].head(10))
-    else:
+    if df_unds.empty or 'symbol' not in df_unds.columns:
         print("Warning: df_unds is empty — no volatility data retrieved")
     pickle_me(df_unds, file_path=ROOT / 'data' / 'df_unds.pkl')
 
@@ -1158,6 +1154,12 @@ def chains_n_unds(msg: bool = False):
 #%% 
 # Test functions - Make symbols
 if __name__ == "__main__":
+    import argparse
+    from src.log_utils import setup_logging
+
+    _p = argparse.ArgumentParser()
+    _p.add_argument("--debug", action="store_true", help="Show DEBUG output in terminal")
+    setup_logging("build", debug=_p.parse_args().debug)
 
     sym_path = ROOT/'data'/'symbols.pkl'
 

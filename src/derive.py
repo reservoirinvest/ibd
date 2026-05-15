@@ -1,15 +1,16 @@
 # %%
 # IMPORTS
+import argparse as _ap
 import os
 import time
 
 import numpy as np
 import pandas as pd
 from ib_async import Option, util
-from loguru import logger
+from src.log_utils import setup_logging as _setup_logging
 
 # pyrefly: ignore [missing-import]
-from build import (
+from src.build import (
     ROOT,
     atm_margin,
     delete_pkl_files,
@@ -23,13 +24,19 @@ from build import (
 )
 
 # pyrefly: ignore [missing-import]
-from classify import (
+from src.classify import (
     classifed_results,
     clean_ib_util_df,
     get_financials,
     get_open_orders,
     classify_open_orders,
 )
+
+_p = _ap.ArgumentParser(add_help=False)
+_p.add_argument("--debug", action="store_true")
+_setup_logging("derive", debug=_p.parse_known_args()[0].debug)
+util.logToFile(ROOT / "log" / "ib_async.log", level=40)
+del _ap, _p, _setup_logging
 
 # Start timing the script execution
 start_time = time.time()
@@ -99,10 +106,6 @@ def filter_closest_strikes(chains, n=-2):
 # %% CONFIG AND SETUP
 ACCOUNT = "US_ACCOUNT"
 ACCOUNT_NO = os.getenv(ACCOUNT, "")
-
-log_file_path = ROOT / "log" / "derive.log"
-logger.add(log_file_path, rotation="2 days", encoding="utf-8")
-util.logToFile(log_file_path, level=40)  # IB ERRORs only logged.
 
 config = load_config("SNP")
 PROTECT_ME = config.get("PROTECT_ME", True)
@@ -240,7 +243,7 @@ if not uncov_long.empty:
         df_ccf = df_ccf.drop(columns=["position"])
 
         print("Getting covered call prices...")
-        df_iv_cc = get_volatilities_snapshot(df_ccf["contract"].tolist(), market="SNP", ib=ib)
+        df_iv_cc = get_volatilities_snapshot(df_ccf["contract"].tolist(), market="SNP", ib=ib, desc="Fetching covered call volatilities")
 
         if not df_iv_cc.empty:
             df_ccf = df_ccf.merge(df_iv_cc[["symbol", "price"]], on="symbol", how="left")
@@ -326,7 +329,7 @@ if not uncov_short.empty:
         df_cpf = df_cpf.drop(columns=["position"])
 
         print("Getting covered put prices...")
-        df_iv_cp = get_volatilities_snapshot(df_cpf["contract"].tolist(), market="SNP", ib=ib)
+        df_iv_cp = get_volatilities_snapshot(df_cpf["contract"].tolist(), market="SNP", ib=ib, desc="Fetching covered put volatilities")
 
         if not df_iv_cp.empty:
             df_cpf = df_cpf.merge(df_iv_cp[["symbol", "price"]], on="symbol", how="left")
@@ -444,7 +447,7 @@ else:
             nakeds.rename(columns={"price": "undPrice", "iv": "vy"}, inplace=True)
 
             print("Getting naked put prices...")
-            df_iv_n = get_volatilities_snapshot(nakeds["contract"].tolist(), market="SNP", ib=ib)
+            df_iv_n = get_volatilities_snapshot(nakeds["contract"].tolist(), market="SNP", ib=ib, desc="Fetching naked put volatilities")
 
             if not df_iv_n.empty:
                 df_nkd = nakeds.merge(
@@ -502,7 +505,7 @@ if not df_reap.empty:
     if valid_contracts:
         print("Calculating reap option prices...")
         reap_prices = {}
-        df_reap_prices = get_volatilities_snapshot(valid_contracts, market="SNP", ib=ib)
+        df_reap_prices = get_volatilities_snapshot(valid_contracts, market="SNP", ib=ib, desc="Fetching reap volatilities")
         df_reap["optPrice"] = df_reap.merge(df_reap_prices, on="symbol")["price"]
 
         df_reap["xPrice"] = df_reap["optPrice"].apply(
@@ -564,20 +567,16 @@ print("\n=== IDENTIFYING UNPROTECTED POSITIONS ===")
 delete_pkl_files(["df_protect.pkl"])
 
 if not PROTECT_ME:
-    print("PROTECT_ME is False. No protection recommendations will be generated.")
-    df_ulong = pd.DataFrame()
-    df_ushort = pd.DataFrame()
+    print("Note: PROTECT_ME=False — generating protection recommendations regardless.")
+df_unprot = df_unds[df_unds.state.isin(["unprotected", "exposed"])].reset_index(drop=True)
+print(f"Found {len(df_unprot)} unprotected/exposed positions")
 
-else:
-    df_unprot = df_unds[df_unds.state.isin(["unprotected", "exposed"])].reset_index(drop=True)
-    print(f"Found {len(df_unprot)} unprotected/exposed positions")
+# Separate long and short positions
+df_ulong = df_unprot[df_unprot.position > 0].copy()
+df_ushort = df_unprot[df_unprot.position < 0].copy()
 
-    # Separate long and short positions
-    df_ulong = df_unprot[df_unprot.position > 0].copy()
-    df_ushort = df_unprot[df_unprot.position < 0].copy()
-
-    print(f"Long unprotected: {len(df_ulong)}")
-    print(f"Short unprotected: {len(df_ushort)}")
+print(f"Long unprotected: {len(df_ulong)}")
+print(f"Short unprotected: {len(df_ushort)}")
 
 # %% BUILD LONG PROTECTION (PUTS FOR LONG STOCK)
 print("\n=== BUILDING LONG PROTECTION RECOMMENDATIONS ===")
@@ -631,7 +630,7 @@ if not df_ulong.empty:
         # Get option market data using built-in connection in get_volatilities_snapshot
         if valid_contracts:
             print("Getting option prices...")
-            df_iv_p = get_volatilities_snapshot(valid_contracts, market="SNP", ib=ib)
+            df_iv_p = get_volatilities_snapshot(valid_contracts, market="SNP", ib=ib, desc="Fetching long protection volatilities")
 
             if not df_iv_p.empty:
                 df_u = clean_ib_util_df(valid_contracts)
@@ -708,7 +707,7 @@ if not df_ushort.empty:
         # Get option market data using built-in connection in get_volatilities_snapshot
         if valid_contracts:
             print("Getting option prices...")
-            df_iv_s = get_volatilities_snapshot(valid_contracts, market="SNP", ib=ib)
+            df_iv_s = get_volatilities_snapshot(valid_contracts, market="SNP", ib=ib, desc="Fetching short protection volatilities")
 
             if not df_iv_s.empty:
                 df_u = clean_ib_util_df(valid_contracts)
@@ -874,7 +873,7 @@ if not p.empty:
         df_purl = df_u.groupby("symbol").first().reset_index()
 
         print("Getting put roll prices...")
-        df_iv_purl = get_volatilities_snapshot(df_purl["contract"].tolist(), market="SNP", ib=ib)
+        df_iv_purl = get_volatilities_snapshot(df_purl["contract"].tolist(), market="SNP", ib=ib, desc="Fetching put roll volatilities")
 
         if not df_iv_purl.empty:
             df_up = df_unds.assign(undPrice=lambda x: x.price)

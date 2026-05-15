@@ -7,6 +7,7 @@ from decimal import Decimal
 
 
 def money(x: float | Decimal | None, *, dp: int = 0) -> str:
+    """Format as currency with comma separator, e.g. '$1,234'. Returns '—' for None/NaN/inf."""
     if x is None:
         return "—"
     f = float(x)
@@ -18,6 +19,7 @@ def money(x: float | Decimal | None, *, dp: int = 0) -> str:
 
 
 def pct(x: float | None, *, dp: int = 1) -> str:
+    """Format a ratio as a percentage, e.g. 0.25 → '25.0%'. Returns '—' for None/NaN/inf."""
     if x is None:
         return "—"
     if math.isnan(x) or math.isinf(x):
@@ -26,12 +28,14 @@ def pct(x: float | None, *, dp: int = 1) -> str:
 
 
 def num(x: float | None, *, dp: int = 2) -> str:
+    """Format a number with thousands separator, e.g. 1234.5 → '1,234.50'. Returns '—' for None/NaN/inf."""
     if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
         return "—"
     return f"{x:,.{dp}f}"
 
 
 def signed_money(x: float | Decimal | None, *, dp: int = 0) -> str:
+    """Format with an explicit +/- prefix, e.g. +$1,234 or -$500. Returns '—' for None/NaN."""
     if x is None:
         return "—"
     f = float(x)

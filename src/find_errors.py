@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import List, Sequence
 
 # pyrefly: ignore [missing-import]
-from build import ROOT, delete_pkl_files, get_option_chains, get_qualified_symbols, pickle_me
+from src.build import ROOT, delete_pkl_files, get_option_chains, get_qualified_symbols, pickle_me
 from rich.progress import Progress
 
 

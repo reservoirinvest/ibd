@@ -12,7 +12,7 @@ from ib_async import Contract, Order, util
 from loguru import logger
 
 # pyrefly: ignore [missing-import]
-from build import (
+from src.build import (
     chains_n_unds,
     do_i_refresh,
     get_dte,
@@ -726,6 +726,13 @@ def classifed_results(account_no: str, max_days: int = 1, msg: bool = False) -> 
 # %%
 # Test Functions
 if __name__ == "__main__":
+    import argparse
+    from src.log_utils import setup_logging
+
+    _p = argparse.ArgumentParser()
+    _p.add_argument("--debug", action="store_true", help="Show DEBUG output in terminal")
+    setup_logging("classify", debug=_p.parse_args().debug)
+
     ACCOUNT = "US_ACCOUNT"
     ACCOUNT_NO = os.getenv(ACCOUNT, "")
 

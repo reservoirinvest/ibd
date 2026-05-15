@@ -1,4 +1,4 @@
-from build import atm_margin
+from src.build import atm_margin
 
 def test_atm_margin():
     margin = atm_margin(100, 100, 30, 0.2)
