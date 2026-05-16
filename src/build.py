@@ -433,13 +433,10 @@ def qualify_stock_contracts(symbols: pd.Series, market: str = "SNP") -> list:
         # Create stock contracts
         contracts = [Stock(symbol, 'SMART', 'USD') for symbol in symbols]
         
-        # Qualify contracts asynchronously with progress bar
         print(f"Qualifying {len(contracts)} contracts asynchronously...")
-        
-        # We pass a None pbar to avoid async_tqdm dependency, or implement a simple tracking.
-        # Since qualify_batch updates it via postfix, we will just omit the pbar for now.
-        # pyrefly: ignore [not-iterable]
-        qualified, failed = ib.run(_qualify_batch(ib, contracts, None))
+        with _tqdm(total=len(contracts), desc="Qualifying symbols", unit="sym") as pbar:
+            # pyrefly: ignore [not-iterable]
+            qualified, failed = ib.run(_qualify_batch(ib, contracts, pbar))
         
         print(f"\n✓ Successfully qualified {len(qualified)}/{len(contracts)} contracts")
         if failed:
@@ -1109,6 +1106,7 @@ def chains_n_unds(msg: bool = False):
 
     # Get qualified contracts
     if do_i_refresh(my_path=sym_path, max_days=1):
+        print("symbols.pkl missing/stale — rebuilding from web + IB (takes ~2-3 min)...")
         qualified_contracts = get_qualified_symbols(weeklies=True, market="SNP", save=True)
         pickle_me(qualified_contracts, file_path=sym_path)
     else:

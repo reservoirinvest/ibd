@@ -14,15 +14,25 @@ Real-time portfolio risk monitor for IBKR accounts. Connects via IB Gateway/TWS 
 
 | Tab | Purpose |
 |---|---|
-| **Positions** | Live portfolio with filter bar, Greek columns, ITM row highlighting, margin estimates |
-| **Orders** | Generate derive orders, fetch OHLCs, execute — each as a subprocess that freezes/unfreezes the IBKR connection |
 | **Analysis** | Symbol OHLC chart (candlestick + Bollinger Bands + RSI + Volume), portfolio treemap, per-symbol position detail |
+| **Orders** | Generate derive orders, fetch OHLCs, execute — each as a subprocess that freezes/unfreezes the IBKR connection |
+| **History** | 5-year trade history from IBKR Flex Queries; per-symbol backtest scoring; Black-Scholes Greeks calculator; strategy P/L simulation |
 | **Diagnostics** | Raw account values, connection health, open orders |
 
 ## Configuration
 
 Edit `config/snp_config.yml` for PORT, CID, MINCUSHION, MAX_DTE, and strategy parameters.
-Set `US_ACCOUNT` and `SG_ACCOUNT` in `.env`.
+Set secrets in `.env`:
+
+```
+US_ACCOUNT=your_us_account_id
+SG_ACCOUNT=your_sg_account_id
+TOKEN=your_flex_web_service_token
+TRADES_FLEXID=your_activity_flex_query_id
+```
+
+`TOKEN` and `TRADES_FLEXID` are required for the History tab → **🔄 Refresh via API** button.
+See `.claude/skills/flex-backtest/SKILL.md` for portal setup and the one-time XML bootstrap process.
 
 ## Batch pipeline (run from project root)
 
@@ -42,7 +52,8 @@ Add `--debug` to any script to show DEBUG output in terminal. DEBUG always goes 
 ```bash
 uv run ruff check .
 uv run pytest tests/ -q
-uv run python -c "from src.dashboard import settings, ib_client, state, risk, ohlc; print('imports ok')"
+uv run python -c "from src.dashboard import settings, ib_client, state, risk, ohlc; print('dashboard ok')"
+uv run python -c "from src.flex import fetch, parse, analyze; from src.backtest import greeks, strategy, score; print('flex/backtest ok')"
 ```
 
 ## Requirements

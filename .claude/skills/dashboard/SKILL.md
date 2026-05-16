@@ -79,6 +79,45 @@ Returns `{"delta_$": float, "theta_$": float, "vega_$": float, "gamma_$": float}
 
 ---
 
+## risk.py — performance patterns
+
+- `greek_dollar_sums(df, pre_joined=True)` — pass when positions have already gone through `_join_tickers()`; skips a redundant merge.
+- `cover_protect_gaps` inner loop — pre-group options once: `{s: g for s, g in opt.groupby("symbol")}` then `opt_by_sym.get(sym, _empty_opt)`. The O(n²) per-stock filter was the 156 ms bottleneck.
+- Schema-preserving empty DataFrame — `df.iloc[0:0]`, not `pd.DataFrame()`. Bare empty frame has no columns; `.position`, `.symbol` etc. crash downstream.
+- `_join_tickers` — numpy arrays via direct dict lookup, then `df.assign(...)`. Avoid list-of-dicts → `pd.DataFrame` → `merge` pattern (allocates an intermediate frame every render tick).
+
+## Dashboard UI conventions
+
+- Money: `format="$%,.0f"` (commas mandatory). Never `"$%.0f"`.
+- `width="stretch"`, not `use_container_width` (deprecated).
+- Expanders: `expanded=False` for heavy tables (Positions, Cover/Protect gaps).
+- `render_analysis()` `run_every=60.0` — OHLC + position tables are expensive. `header()` and `kpi_strip()` stay at 2 s.
+- KPI strip: 8 metrics — NLV, Opt Value, Cushion, Excess Liq, Maint Margin, Σ Δ, Σ Θ, Σ ν.
+- Drop withstand: `ExcessLiquidity / |Σ Δ $| × 100%`. Dual US/US+SG columns only in ALL view.
+- Nav: `st.columns([2, 3, 1, 2])` — header | radio | account selector | spacer.
+- Plotly: `hoverlabel={"bgcolor":"#1e2130","font_color":"#f1f5f9"}`. Option strike lines: `line_dash="dot"`. BB bands + SMA: `hoverinfo="skip"`.
+- IBKR tags: `StockMarketValue` (not `StockValue`), `Leverage-S` (not `GrossLeverage`).
+- Symbol filters: `str.upper() == sym` exact for positions; `str.upper().startswith(...)` for orders.
+- Cover/Protect gaps column order: `cover_strike | mkt_px | protect_strike`.
+- `protect_strike`: shows existing long option strikes when held; `~{target}` (= `mkt_px − cover_std_mult × σ`) when no protection. Always call `cover_protect_gaps(protect_me=True)` from dashboard.
+- Tables below charts: always render with conditional message when no data — never hide the section.
+
+## Testing patterns (IBClient)
+
+- `MagicMock()` base for IBClient test doubles — **never** `AsyncMock()`. AsyncMock base makes every attribute return a coroutine, causing `TypeError: 'coroutine' object is not iterable` on sync calls like `managedAccounts()`. Set async attrs explicitly: `mock_ib.reqPositionsAsync = AsyncMock(...)`.
+- Wire-handler `+=` gotcha — `ib.updatePortfolioEvent += handler` reassigns the attribute to the `__iadd__` return value. Asserting on the original attribute checks the wrong object. Use a custom event class with a `handlers: list` and `__iadd__` that appends in-place.
+- Logger isolation in timing tests — patch `ibc.logger` with `Mock()`. Loguru DEBUG sink writes to stderr (~5 ms/call) and inflates throughput assertions.
+
+## IBClient internals (reference)
+
+- Position store: `_positions_store: dict[tuple[int, str], dict]` — key `(conId, account)`. `_on_portfolio` writes O(1). Zero-position event: `_positions_store.pop(key, None)`.
+- After each write: `self._snap.positions = pd.DataFrame(self._positions_store.values())` — one allocation, never `pd.concat`.
+- `_health_gen` — incremented on each successful connect; each `_health_check_loop` exits when its captured `gen` no longer matches (prevents zombie loops after reconnect).
+- `_UNFREEZE_DELAY_SECS = 5.0` (CID release), `_BOOTSTRAP_SETTLE_SECS = 3.0` (TWS push wait).
+- `logger.add()` guarded by `_log_sink_added` class-level flag inside `_lock` — one file sink per process.
+
+---
+
 ## IBKR subprocess / CID rules
 
 Dashboard owns **CID=10**. No other process may connect without `client.freeze()` first.  

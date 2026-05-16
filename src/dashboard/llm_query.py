@@ -23,10 +23,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 _SYSTEM_PROMPT_TEMPLATE = """\
-You are a quantitative trading assistant analyzing a live portfolio.
-You have access to current positions, Greeks (delta/theta/vega), OHLC data, and risk metrics.
-Answer the user's question concisely with specific numbers and actionable insights.
-Keep responses under 200 words.
+You are a quantitative trading assistant with access to:
+- Live portfolio: current positions, Greeks (delta/theta/vega), and account metrics
+- Trade history: 6 years of closed option trades with per-symbol P&L, win rate, profit factor, \
+and strategy fingerprints (CSP=cash-secured put, CC=covered call, LP=long put, LC=long call). \
+A symbol with both CSP and CC in its strategy column has been traded as a wheel.
+- OHLC price stats: for the top-traded and currently-held symbols — last price, 20/90-day return, \
+position within all-time range (pos52w: 0%=at low, 100%=at high), MA trend (UP/DN/MX), \
+and 20-day annualised historical volatility (hv20).
+
+You can cross-reference all three data sources to answer questions.
+You cannot run code or execute backtests — for backtesting use the History tab's Backtest Scoring.
+Answer concisely with specific numbers. Keep responses under 250 words. \
+When ranking or listing, show the top 5–10 items.
 
 Current data context:
 {context}"""
@@ -146,14 +155,14 @@ def query_data_deepseek(question: str, context: dict) -> str:
 
 
 def _format_context(context: dict) -> str:
-    """Format context dict as readable prompt text. Truncates large DataFrames."""
+    """Format context dict as readable prompt text."""
     lines = []
 
     if "positions" in context:
         lines.append("=== Current Positions ===")
         positions = context["positions"]
         text = positions.to_string() if hasattr(positions, "to_string") else str(positions)
-        lines.append(text[:1000])
+        lines.append(text[:1500])
 
     if "greeks" in context:
         lines.append("\n=== Greeks Summary ===")
@@ -178,5 +187,32 @@ def _format_context(context: dict) -> str:
         ohlc = context["ohlc_sample"]
         text = ohlc.to_string() if hasattr(ohlc, "to_string") else str(ohlc)
         lines.append(text[:500])
+
+    if "global_stats" in context:
+        lines.append("\n=== Trade History — Global Stats ===")
+        for k, v in context["global_stats"].items():
+            lines.append(f"{k}: {v}")
+
+    if "per_symbol" in context:
+        rows: list[dict] = context["per_symbol"]
+        lines.append("\n=== Trade History — Per-Symbol (sym,trades,win%,total_pnl,best_trade,worst_trade,strategies) ===")
+        lines.append("sym,n,wr%,pnl,best,worst,strat")
+        for r in rows:
+            lines.append(
+                f"{r['sym']},{r['n']},{r['wr%']},{r['pnl']},{r['best']},{r['worst']},{r['strat']}"
+            )
+
+    if "ohlc_stats" in context:
+        ohlc_rows: list[dict] = context["ohlc_stats"]
+        lines.append(
+            "\n=== OHLC Price Stats (sym,last_price,20d_ret%,90d_ret%,"
+            "pos_in_range_0to100,ma_trend,hv20_annualised) ==="
+        )
+        lines.append("sym,price,r20d,r90d,pos52w,trend,hv20")
+        for r in ohlc_rows:
+            lines.append(
+                f"{r['sym']},{r['price']},{r['r20d']},{r['r90d']},"
+                f"{r['pos52w']},{r['trend']},{r['hv20']}"
+            )
 
     return "\n".join(lines)

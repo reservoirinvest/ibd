@@ -172,6 +172,7 @@ class IBClient:
         # Tracks conIds with active reqMktData calls (OPT only).
         # Distinct from _subscribed which counts all positions (STK + OPT).
         self._mktdata_subs: set[int] = set()
+        self._retry_fut: concurrent.futures.Future | None = None  # held so GC can't destroy pending task
 
     # ---- public API --------------------------------------------------------
 
@@ -243,14 +244,16 @@ class IBClient:
                 "ib-client event loop did not start in 5 s — daemon thread may have crashed"
             )
             return
-        fut = asyncio.run_coroutine_threadsafe(self._connect_with_retry(), self._loop)
+        self._retry_fut = asyncio.run_coroutine_threadsafe(self._connect_with_retry(), self._loop)
 
         def _on_done(f: concurrent.futures.Future) -> None:
+            if f.cancelled():
+                return
             exc = f.exception()
             if exc is not None:
                 logger.error("_connect_with_retry raised: {!r}", exc)
 
-        fut.add_done_callback(_on_done)
+        self._retry_fut.add_done_callback(_on_done)
 
     def snapshot(self) -> Snapshot:
         """Return a shallow copy that's safe for the UI to read."""
@@ -962,7 +965,7 @@ class IBClient:
         if self._loop is not None:
             self._subscribed.clear()
             if not self._connecting:  # don't spawn a second retry loop
-                asyncio.run_coroutine_threadsafe(self._connect_with_retry(), self._loop)
+                self._retry_fut = asyncio.run_coroutine_threadsafe(self._connect_with_retry(), self._loop)
 
 
 def get_client() -> IBClient:

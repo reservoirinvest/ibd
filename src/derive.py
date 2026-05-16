@@ -67,6 +67,12 @@ def filter_closest_dates(chains, protect_dte, num_dates=2):
     return pd.concat(result, ignore_index=True) if result else pd.DataFrame()
 
 
+def _is_weekly_expiry(expiry: str) -> bool:
+    """True for non-3rd-Friday expiries. 3rd Friday = day 15-21, weekday 4 (Friday)."""
+    dt = pd.Timestamp(expiry)
+    return not (dt.weekday() == 4 and 15 <= dt.day <= 21)
+
+
 def filter_closest_strikes(chains, n=-2):
     """
     Filter rows to get the closest strikes to undPrice for each symbol and expiry.
@@ -392,8 +398,9 @@ elif fin.get("cushion", 0) < MINCUSHION:
 else:
     df_v = df_unds[(df_unds.state == "virgin") | (df_unds.state == "orphaned")].reset_index(drop=True)
 
-    df_virg = chains.loc[
-        chains[chains.symbol.isin(df_v.symbol.to_list())]
+    sow_chains = chains[chains["expiry"].apply(_is_weekly_expiry)]
+    df_virg = sow_chains.loc[
+        sow_chains[sow_chains.symbol.isin(df_v.symbol.to_list())]
         .groupby(["symbol", "strike"])["dte"]
         .apply(lambda x: x.sub(VIRGIN_DTE).abs().idxmin())
     ]

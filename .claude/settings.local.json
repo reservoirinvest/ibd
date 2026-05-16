@@ -19,7 +19,10 @@
       "Bash(grep -n \"except Exception$\\\\|except Exception as\" C:/Users/kashi/python/ibd/app.py)",
       "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\kashi\\\\python\\\\ibd\" | Where-Object {$_.PSIsContainer} | Format-List Name)",
       "Bash(git mv *)",
-      "Bash(Move-Item profile_hotpaths.py scripts/profile_hotpaths.py)"
+      "Bash(Move-Item profile_hotpaths.py scripts/profile_hotpaths.py)",
+      "WebFetch(domain:tradermonty.github.io)",
+      "Bash(uv pip *)",
+      "PowerShell($js = Get-Content \"C:\\\\Users\\\\kashi\\\\python\\\\ibd\\\\.venv\\\\Lib\\\\site-packages\\\\streamlit\\\\static\\\\static\\\\js\\\\MenuButton.BqShlCg_.js\" -Raw; [regex]::Matches\\($js, '\"st[A-Za-z]+\"'\\) | ForEach-Object { $_.Value } | Sort-Object -Unique)"
     ]
   }
 }
