@@ -44,6 +44,8 @@ and 20-day annualised historical volatility (hv20).
 - OHLC monthly price history: split-adjusted monthly close prices for the last 24 months per \
 symbol. Use these to identify stock splits (sudden ≥40% price gap between months), trend context \
 at the time of trades, and price levels relative to option strikes.
+- Live open IBKR orders: orders currently pending execution (symbol, secType, right, strike, \
+expiry, action, qty, remaining, limit price, status).
 - Suggested Orders from the Orders tab: Cover (sell covered calls on assigned stock), \
 Sow (sell naked puts/calls to open new positions), Reap (buy-to-close profitable open options), \
 and Protect (buy puts for downside hedging). Each order row includes symbol, right (C/P), \
@@ -301,6 +303,14 @@ def _format_context(context: dict) -> str:
             for sym, pairs in sorted(ph.items()):
                 month_map = {m: f"{v:.2f}" for m, v in pairs}
                 lines.append(sym + "," + ",".join(month_map.get(m, "") for m in all_months))
+
+    if "open_orders" in context:
+        df_oo = context["open_orders"]
+        lines.append("\n=== Live Open IBKR Orders ===")
+        oo_cols = ["symbol", "secType", "right", "strike", "expiry",
+                   "action", "qty", "remaining", "orderType", "lmtPrice", "status"]
+        cols = [c for c in oo_cols if c in df_oo.columns]
+        lines.append(df_oo[cols].head(50).to_string(index=False))
 
     for key, header, want_cols in _ORDER_SECTIONS:
         if key not in context:

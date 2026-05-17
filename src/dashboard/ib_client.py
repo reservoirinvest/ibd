@@ -173,6 +173,7 @@ class IBClient:
         # Distinct from _subscribed which counts all positions (STK + OPT).
         self._mktdata_subs: set[int] = set()
         self._retry_fut: concurrent.futures.Future | None = None  # held so GC can't destroy pending task
+        self._margin_pending: bool = False  # debounce: True while a _fetch_what_if_margins is queued
 
     # ---- public API --------------------------------------------------------
 
@@ -282,6 +283,7 @@ class IBClient:
         """
         self._frozen = True  # guard must be set first
         self._bootstrapped = False
+        self._margin_pending = False
         if self._loop:
             self._loop.call_soon_threadsafe(self._subscribed.clear)
             self._loop.call_soon_threadsafe(self._mktdata_subs.clear)
@@ -289,6 +291,7 @@ class IBClient:
             asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop)
         with self._snap_lock:
             self._snap.connected = False
+            self._snap.margins_as_of = None
         logger.info(
             "Dashboard frozen — CID {} released for derive.py",
             self._settings.ib_client_id if self._settings else "?",
@@ -487,17 +490,21 @@ class IBClient:
         #    raises "This event loop is already running" when called from a coroutine.)
         for acct in managed:
             try:
-                await self._ib.reqAccountUpdatesAsync(acct)
+                await asyncio.wait_for(self._ib.reqAccountUpdatesAsync(acct), timeout=15.0)
                 logger.info("Account updates subscribed for {}", self._mask(acct))
+            except asyncio.TimeoutError:
+                logger.warning("reqAccountUpdatesAsync({}) timed out — continuing", self._mask(acct))
             except Exception as e:  # noqa: BLE001
                 logger.warning("reqAccountUpdatesAsync({}) failed: {}", self._mask(acct), e)
 
         # 2) Fetch positions via async API — sync reqPositions() calls
         #    loop.run_until_complete() which raises inside a coroutine.
         try:
-            positions = await self._ib.reqPositionsAsync()
+            positions = await asyncio.wait_for(self._ib.reqPositionsAsync(), timeout=10.0)
             for pos in positions:
                 self._on_position(pos)
+        except asyncio.TimeoutError:
+            logger.warning("reqPositionsAsync() timed out — continuing with portfolio data")
         except Exception as e:  # noqa: BLE001
             logger.debug("reqPositionsAsync() skipped: {}", e)
 
@@ -514,10 +521,12 @@ class IBClient:
 
         # 3) Fetch open orders
         try:
-            trades = await self._ib.reqAllOpenOrdersAsync()
+            trades = await asyncio.wait_for(self._ib.reqAllOpenOrdersAsync(), timeout=10.0)
             for trade in trades:
                 self._update_order(trade)
             logger.info("Fetched {} open orders", len(trades))
+        except asyncio.TimeoutError:
+            logger.warning("reqAllOpenOrdersAsync() timed out — continuing without open orders")
         except Exception as e:  # noqa: BLE001
             logger.debug("reqAllOpenOrdersAsync() skipped: {}", e)
 
@@ -557,6 +566,7 @@ class IBClient:
         by that position.  Results are written to `_snap.positions` as
         `margin_init` and `margin_maint` columns.
         """
+        self._margin_pending = False
         assert self._ib is not None
 
         with self._snap_lock:
@@ -816,6 +826,10 @@ class IBClient:
         if self._loop is not None and self._bootstrapped and not self._resubscribe_pending:
             self._resubscribe_pending = True
             asyncio.run_coroutine_threadsafe(self._resubscribe_market_data(), self._loop)
+        if self._loop is not None and self._bootstrapped and not self._margin_pending:
+            if self._snap.margins_as_of is None:
+                self._margin_pending = True
+                asyncio.run_coroutine_threadsafe(self._fetch_what_if_margins(), self._loop)
 
     def _on_position(self, position: Any) -> None:
         """Fallback handler from reqPositions — only adds rows not already seen
@@ -838,6 +852,10 @@ class IBClient:
         if self._loop is not None and self._bootstrapped and not self._resubscribe_pending:
             self._resubscribe_pending = True
             asyncio.run_coroutine_threadsafe(self._resubscribe_market_data(), self._loop)
+        if self._loop is not None and self._bootstrapped and not self._margin_pending:
+            if self._snap.margins_as_of is None:
+                self._margin_pending = True
+                asyncio.run_coroutine_threadsafe(self._fetch_what_if_margins(), self._loop)
 
     def _on_account_value(self, value: Any) -> None:
         try:

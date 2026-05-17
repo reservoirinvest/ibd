@@ -1041,35 +1041,34 @@ def render_orders() -> None:
         orders = orders[orders["account"] == acct].reset_index(drop=True)
     orders = _ord_filt(orders)
     _n_open = len(orders)
-    _open_label = f"##### Open Orders — {_n_open}" if _n_open else "##### Open Orders"
-    st.markdown(_open_label)
-
-    if orders.empty:
-        st.info("No open orders." if not (_sym_filt or _right_filt) else "No open orders match filter.")
-    else:
-        cols_show = [
-            "symbol", "secType", "right", "strike", "expiry",
-            "action", "qty", "filled", "remaining",
-            "orderType", "lmtPrice", "status", "state",
-        ]
-        if len(_ACCOUNT_OPTIONS) > 2 or not acct:
-            cols_show = ["account"] + cols_show
-        view = orders[[c for c in cols_show if c in orders.columns]].copy()
-        st.dataframe(
-            _banded(view),
-            hide_index=True,
-            width="stretch",
-            column_config={
-                "lmtPrice": st.column_config.NumberColumn("Limit Px", format="%.2f"),
-                "qty":       st.column_config.NumberColumn(format="%.0f"),
-                "filled":    st.column_config.NumberColumn(format="%.0f"),
-                "remaining": st.column_config.NumberColumn(format="%.0f"),
-                "strike":    st.column_config.NumberColumn(format="%.1f"),
-                "status":    st.column_config.TextColumn(),
-                "state":     st.column_config.TextColumn("State",
-                    help="Classified role: covering, sowing, protecting, reaping, de-orphaning, straddling"),
-            },
-        )
+    _open_label = f"🗂 Open Orders — {_n_open}" if _n_open else "🗂 Open Orders"
+    with st.expander(_open_label, expanded=False):
+        if orders.empty:
+            st.info("No open orders." if not (_sym_filt or _right_filt) else "No open orders match filter.")
+        else:
+            cols_show = [
+                "symbol", "secType", "right", "strike", "expiry",
+                "action", "qty", "filled", "remaining",
+                "orderType", "lmtPrice", "status", "state",
+            ]
+            if len(_ACCOUNT_OPTIONS) > 2 or not acct:
+                cols_show = ["account"] + cols_show
+            view = orders[[c for c in cols_show if c in orders.columns]].copy()
+            st.dataframe(
+                _banded(view),
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "lmtPrice": st.column_config.NumberColumn("Limit Px", format="%.2f"),
+                    "qty":       st.column_config.NumberColumn(format="%.0f"),
+                    "filled":    st.column_config.NumberColumn(format="%.0f"),
+                    "remaining": st.column_config.NumberColumn(format="%.0f"),
+                    "strike":    st.column_config.NumberColumn(format="%.1f"),
+                    "status":    st.column_config.TextColumn(),
+                    "state":     st.column_config.TextColumn("State",
+                        help="Classified role: covering, sowing, protecting, reaping, de-orphaning, straddling"),
+                },
+            )
 
     # ── Suggested Orders ─────────────────────────────────────────────────────
     st.markdown("##### Suggested Orders")
@@ -1461,7 +1460,7 @@ def _sync_analysis_to_pos_filter() -> None:
     pass  # callback kept for selectbox; Positions tab removed
 
 
-@st.fragment(run_every=60.0)
+@st.fragment(run_every=5.0)
 def render_analysis() -> None:
     """Cover/Protect gaps + OHLC chart browser."""
     snap = client.snapshot()
@@ -1472,6 +1471,21 @@ def render_analysis() -> None:
         _pos_data = classify_portfolio(_filter_positions(snap.positions, acct))
         _pos_data = _join_tickers(_pos_data, snap.tickers)
         _pos_data["margin_est"] = position_margin_est(_pos_data)
+        # Prefer real IBKR what-if margins when available, fall back to Reg-T estimate
+        _m_col = "margin_init" if "margin_init" in _pos_data.columns else "margin_est"
+
+        # Sort: per-symbol CC (short C) → STK → protective put (long P) → others
+        if {"secType", "right", "position", "symbol"} <= set(_pos_data.columns):
+            _cc_key  = (_pos_data["secType"].eq("OPT") & _pos_data["right"].eq("C") & (_pos_data["position"] < 0)).map({True: 0, False: 999})
+            _stk_key = _pos_data["secType"].eq("STK").map({True: 1, False: 999})
+            _pp_key  = (_pos_data["secType"].eq("OPT") & _pos_data["right"].eq("P") & (_pos_data["position"] > 0)).map({True: 2, False: 999})
+            _row_ord = pd.concat([_cc_key, _stk_key, _pp_key], axis=1).min(axis=1)
+            _pos_data = (
+                _pos_data.assign(_row_ord=_row_ord)
+                .sort_values(["symbol", "_row_ord"])
+                .drop(columns="_row_ord")
+                .reset_index(drop=True)
+            )
 
         with st.expander("📋 Positions", expanded=False):
             _pf_c1, _pf_c2, _pf_c3, _pf_c4, _pf_c5, _pf_c6 = st.columns([2.5, 1, 2, 1, 1, 1])
@@ -1525,7 +1539,7 @@ def render_analysis() -> None:
             _pos_show_cols = [
                 "symbol", "secType", "right", "strike", "underlying_px",
                 "expiry", "position", "marketPrice",
-                "delta", "gamma", "theta", "vega", "margin_est", "unrealizedPNL", "pf_state",
+                "delta", "gamma", "theta", "vega", _m_col, "unrealizedPNL", "pf_state",
             ]
             _pv_show = _pv[[c for c in _pos_show_cols if c in _pv.columns]].copy()
             # Insert DTE column immediately after expiry
@@ -1556,21 +1570,153 @@ def render_analysis() -> None:
                     hide_index=True,
                     width="stretch",
                     column_config={
-                        "strike":        st.column_config.NumberColumn("Strike",  format="%.1f"),
-                        "underlying_px": st.column_config.NumberColumn("Und Px",  format="$%,.2f"),
-                        "expiry":        st.column_config.TextColumn("Expiry"),
-                        "dte":           st.column_config.NumberColumn("DTE",     format="%.0f"),
-                        "position":      st.column_config.NumberColumn("Qty",     format="%d"),
-                        "marketPrice":   st.column_config.NumberColumn("Mkt Px",  format="$%,.2f"),
-                        "delta":         st.column_config.NumberColumn("Δ",       format="%.3f"),
-                        "gamma":         st.column_config.NumberColumn("Γ",       format="%.4f"),
-                        "theta":         st.column_config.NumberColumn("Θ",       format="%.3f"),
-                        "vega":          st.column_config.NumberColumn("ν",       format="%.3f"),
-                        "margin_est":    st.column_config.NumberColumn("Margin",  format="$%,.0f"),
-                        "unrealizedPNL": st.column_config.NumberColumn("Unreal P&L", format="$%,.0f"),
-                        "pf_state":      st.column_config.TextColumn("State"),
+                        "symbol":        st.column_config.TextColumn("Symbol",       help="Ticker symbol"),
+                        "secType":       st.column_config.TextColumn("Type",         help="Security type: STK=stock, OPT=option"),
+                        "right":         st.column_config.TextColumn("C/P",          help="Option right: C=Call, P=Put"),
+                        "strike":        st.column_config.NumberColumn("Strike",      format="%.1f",    help="Option strike price"),
+                        "underlying_px": st.column_config.NumberColumn("Und Px",      format="$%,.2f",  help="Current underlying stock price"),
+                        "expiry":        st.column_config.TextColumn("Expiry",        help="Option expiration date"),
+                        "dte":           st.column_config.NumberColumn("DTE",         format="%.0f",    help="Calendar days to expiration"),
+                        "position":      st.column_config.NumberColumn("Qty",         format="%d",      help="Shares (STK) or contracts (OPT); negative = short"),
+                        "marketPrice":   st.column_config.NumberColumn("Mkt Px",      format="$%,.2f",  help="Current market price of the position"),
+                        "delta":         st.column_config.NumberColumn("Δ",           format="%.3f",    help="Price change per $1 move in the underlying"),
+                        "gamma":         st.column_config.NumberColumn("Γ",           format="%.4f",    help="Rate of change of delta per $1 move in underlying"),
+                        "theta":         st.column_config.NumberColumn("Θ",           format="%.3f",    help="Daily time decay in option value (negative = losing value each day)"),
+                        "vega":          st.column_config.NumberColumn("ν",           format="%.3f",    help="Sensitivity to a 1% change in implied volatility"),
+                        _m_col:          st.column_config.NumberColumn("Margin",      format="$%,.0f",  help="IBKR what-if margin (margin_init) when available, else Reg-T estimate"),
+                        "unrealizedPNL": st.column_config.NumberColumn("Unreal P&L",  format="$%,.0f",  help="Unrealized profit/loss at current market price"),
+                        "pf_state":      st.column_config.TextColumn("State",         help="Portfolio state: CC=covered call, PP=protective put, NP=naked put, etc."),
                     },
                 )
+
+        # ── Option Strategy Screener ──────────────────────────────────────────
+        _scr_raw = (
+            pd.read_csv(_DATA_DIR / "screener_weekly.csv")
+            if (_DATA_DIR / "screener_weekly.csv").exists() else pd.DataFrame()
+        )
+        _oo_raw = (
+            pd.read_csv(_DATA_DIR / "option_orders.csv")
+            if (_DATA_DIR / "option_orders.csv").exists() else pd.DataFrame()
+        )
+        # Weeklies only + remove error/no-data rows
+        if not _scr_raw.empty:
+            if "is_weekly" in _scr_raw.columns:
+                _scr_raw = _scr_raw[_scr_raw["is_weekly"].astype(bool)]
+            if "strategy" in _scr_raw.columns:
+                _scr_raw = _scr_raw[~_scr_raw["strategy"].isin(["NO DATA", "ERROR", "SKIP"])]
+        # Remove illiquid / error order legs
+        if not _oo_raw.empty:
+            _illiq = _oo_raw["action"].isna()
+            if "note" in _oo_raw.columns:
+                _illiq = _illiq | _oo_raw["note"].fillna("").str.contains(
+                    "illiquid|no valid|no options|cannot determine", case=False, regex=True
+                )
+            _oo_raw = _oo_raw[~_illiq].reset_index(drop=True)
+
+        _scr_n = f" — {len(_scr_raw)} signals · {len(_oo_raw)} legs" if not _scr_raw.empty else ""
+        with st.expander(f"📡 Option Screener{_scr_n}", expanded=False):
+            if _scr_raw.empty and _oo_raw.empty:
+                st.info(
+                    "No data — run `uv run python scripts/option_strategy_screener.py` "
+                    "then `uv run python scripts/option_orders.py`."
+                )
+            else:
+                # Common symbol + strategy filter
+                _all_syms = sorted(
+                    (set(_scr_raw["symbol"].dropna()) if "symbol" in _scr_raw.columns else set())
+                    | (set(_oo_raw["symbol"].dropna()) if "symbol" in _oo_raw.columns else set())
+                )
+                _all_strats = ["ALL"]
+                if "strategy" in _scr_raw.columns:
+                    _all_strats += sorted(_scr_raw["strategy"].dropna().unique().tolist())
+                _sf1, _sf2, _sf3 = st.columns([2, 2, 1])
+                _scr_sym  = _sf1.text_input("Symbol",   key="scr_sym",   placeholder="e.g. AAPL").strip().upper()
+                _scr_strat = _sf2.selectbox("Strategy", _all_strats, key="scr_strat")
+                if _sf3.button("✕ Clear", key="scr_clear", width="stretch"):
+                    for _k in ("scr_sym", "scr_strat"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
+
+                _scr_df = _scr_raw.copy()
+                _oo_df  = _oo_raw.copy()
+                if _scr_sym:
+                    if "symbol" in _scr_df.columns:
+                        _scr_df = _scr_df[_scr_df["symbol"].astype(str).str.upper() == _scr_sym]
+                    if "symbol" in _oo_df.columns:
+                        _oo_df = _oo_df[_oo_df["symbol"].astype(str).str.upper() == _scr_sym]
+                if _scr_strat != "ALL":
+                    if "strategy" in _scr_df.columns:
+                        _scr_df = _scr_df[_scr_df["strategy"] == _scr_strat]
+                    if "strategy" in _oo_df.columns:
+                        _oo_df = _oo_df[_oo_df["strategy"] == _scr_strat]
+                if "symbol" in _scr_df.columns:
+                    _scr_df = _scr_df.sort_values("symbol").reset_index(drop=True)
+                if "symbol" in _oo_df.columns:
+                    _oo_df = _oo_df.sort_values("symbol").reset_index(drop=True)
+
+                if not _scr_df.empty:
+                    st.caption("Screener signals")
+                    _scr_show_cols = [
+                        "symbol", "strategy", "score", "spot",
+                        "iv_pct", "hv_pct", "iv_hv", "rsi", "dte_earn",
+                        "rationale", "dte_target", "size_note",
+                    ]
+                    st.dataframe(
+                        _banded(_scr_df[[c for c in _scr_show_cols if c in _scr_df.columns]]),
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            "symbol":     st.column_config.TextColumn("Symbol",     help="Ticker symbol"),
+                            "strategy":   st.column_config.TextColumn("Strategy",   help="Suggested option strategy: CSP=cash-secured put, CC=covered call, etc."),
+                            "score":      st.column_config.NumberColumn("Score",     format="%.1f",   help="Composite screener score — higher is a stronger candidate"),
+                            "spot":       st.column_config.NumberColumn("Spot",      format="$%,.2f", help="Current underlying spot price"),
+                            "iv_pct":     st.column_config.NumberColumn("IV%",       format="%.1f",   help="Current implied volatility (annualised %)"),
+                            "hv_pct":     st.column_config.NumberColumn("HV%",       format="%.1f",   help="20-day realised historical volatility (annualised %)"),
+                            "iv_hv":      st.column_config.NumberColumn("IV/HV",     format="%.2f",   help="IV ÷ HV — >1 means options are expensive relative to realised vol"),
+                            "rsi":        st.column_config.NumberColumn("RSI",       format="%.1f",   help="14-day RSI: <30 oversold, >70 overbought"),
+                            "dte_earn":   st.column_config.NumberColumn("Earn DTE",  format="%.0f",   help="Calendar days until the next earnings announcement"),
+                            "rationale":  st.column_config.TextColumn("Rationale",   help="Brief explanation of why this symbol was selected"),
+                            "dte_target": st.column_config.NumberColumn("DTE Tgt",   format="%.0f",   help="Target days-to-expiration for the suggested trade"),
+                            "size_note":  st.column_config.TextColumn("Size",        help="Position sizing guidance"),
+                        },
+                    )
+
+                if not _oo_df.empty:
+                    # Max gain/loss for the filtered selection
+                    _mg = 0.0
+                    _ml = 0.0
+                    if {"cr_dr", "price", "qty"} <= set(_oo_df.columns):
+                        _cr = _oo_df["cr_dr"].astype(str).str.upper() == "CR"
+                        _dr = _oo_df["cr_dr"].astype(str).str.upper() == "DR"
+                        _px = _oo_df["price"].fillna(0).astype(float)
+                        _qt = _oo_df["qty"].fillna(0).astype(float).abs()
+                        _mg = float((_px[_cr] * _qt[_cr]).sum() - (_px[_dr] * _qt[_dr]).sum()) * 100
+                    if "max_loss" in _oo_df.columns:
+                        _ml = float(_oo_df["max_loss"].fillna(0).sum())
+                    st.caption(f"Order legs — max gain \\${_mg:,.0f} · max loss \\${abs(_ml):,.0f}")
+                    _oo_show_cols = [
+                        "symbol", "strategy", "spot", "action", "qty",
+                        "pc", "strike", "expiry", "cr_dr", "price", "max_loss", "note",
+                    ]
+                    st.dataframe(
+                        _banded(_oo_df[[c for c in _oo_show_cols if c in _oo_df.columns]]),
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            "symbol":   st.column_config.TextColumn("Symbol",    help="Ticker symbol"),
+                            "strategy": st.column_config.TextColumn("Strategy",  help="Option strategy this leg belongs to"),
+                            "spot":     st.column_config.NumberColumn("Spot",    format="$%,.2f", help="Current underlying spot price"),
+                            "action":   st.column_config.TextColumn("Action",    help="BUY or SELL"),
+                            "qty":      st.column_config.NumberColumn("Qty",     format="%d",     help="Number of contracts for this leg"),
+                            "pc":       st.column_config.TextColumn("P/C",       help="P=Put, C=Call"),
+                            "strike":   st.column_config.NumberColumn("Strike",  format="%.1f",   help="Option strike price"),
+                            "expiry":   st.column_config.TextColumn("Expiry",    help="Option expiration date"),
+                            "cr_dr":    st.column_config.TextColumn("CR/DR",     help="CR=credit received, DR=debit paid for this leg"),
+                            "price":    st.column_config.NumberColumn("Price",   format="$%.2f",  help="Expected execution price per contract"),
+                            "max_loss": st.column_config.NumberColumn("Max Loss", format="$%,.0f", help="Maximum possible loss for the full strategy (shown on the first leg only; 0 on subsequent legs)"),
+                            "note":     st.column_config.TextColumn("Note",      help="Additional notes from the screener"),
+                        },
+                    )
 
         # ── Cover / Protect gaps ─────────────────────────────────────────────
         # protect_me=True always so Protect Strike / Value Protected columns are present
@@ -1611,8 +1757,9 @@ def render_analysis() -> None:
                 ]
                 _gaps_show = _gaps_show[[c for c in _gap_cols if c in _gaps_show.columns]]
                 _gap_col_cfg: dict = {
-                    "shares": st.column_config.NumberColumn("Shares", format="%d"),
-                    "avg_cost": st.column_config.NumberColumn("Avg Cost", format="$%.2f"),
+                    "symbol":   st.column_config.TextColumn("Symbol",   help="Ticker symbol"),
+                    "shares":   st.column_config.NumberColumn("Shares",  format="%d",      help="Number of shares held"),
+                    "avg_cost": st.column_config.NumberColumn("Avg Cost", format="$%.2f",  help="Average cost basis per share"),
                     "cover_strike": st.column_config.NumberColumn(
                         "Cover Strike", format="$%.1f",
                         help=(
@@ -1621,7 +1768,7 @@ def render_analysis() -> None:
                             "IV sourced from existing option tickers, default 30%."
                         ),
                     ),
-                    "mkt_px": st.column_config.NumberColumn("Mkt Px", format="$%.2f"),
+                    "mkt_px": st.column_config.NumberColumn("Mkt Px", format="$%.2f", help="Current market price of the underlying stock"),
                     "protect_strike": st.column_config.TextColumn(
                         "Target Protect Strike",
                         help=(
@@ -1966,6 +2113,73 @@ def render_analysis() -> None:
                     row=1, col=1,
                 )
 
+        # ── Open order strike lines (yellow) ─────────────────────────────────
+        _all_orders = snap.orders
+        if not _all_orders.empty and "symbol" in _all_orders.columns:
+            _sym_ords = _all_orders[_all_orders["symbol"] == selected_sym]
+            if "secType" in _sym_ords.columns:
+                _sym_ords = _sym_ords[_sym_ords["secType"] == "OPT"]
+
+            # Track strike levels already claimed by position annotations (all "top left")
+            # and by earlier order annotations, to steer new annotations to a free side.
+            _top_strikes: list[float] = []
+            if not sym_pos.empty and "secType" in sym_pos.columns:
+                for _, _r in sym_pos[sym_pos["secType"] == "OPT"].iterrows():
+                    _s = float(_r.get("strike", 0) or 0)
+                    if _s > 0:
+                        _top_strikes.append(_s)
+            _bot_strikes: list[float] = []
+
+            def _strike_near(val: float, others: list[float], pct: float = 0.02) -> bool:
+                return any(abs(val - o) / max(abs(o), 1.0) < pct for o in others)
+
+            for _, _ord in _sym_ords.iterrows():
+                _ord_strike = float(_ord.get("strike", 0) or 0)
+                if _ord_strike <= 0:
+                    continue
+                _ord_action  = str(_ord.get("action", ""))
+                _ord_right   = str(_ord.get("right", ""))
+                _ord_expiry  = str(_ord.get("expiry", ""))
+                _ord_qty     = _ord.get("remaining", _ord.get("qty", ""))
+                _ord_lmt_raw = _ord.get("lmtPrice", None)
+                try:
+                    _ord_lmt = float(_ord_lmt_raw)
+                    _lmt_s = f" @${_ord_lmt:.2f}" if not pd.isna(_ord_lmt) else ""
+                except (TypeError, ValueError):
+                    _lmt_s = ""
+                _right_name = "Put" if _ord_right == "P" else "Call" if _ord_right == "C" else _ord_right
+                _ord_label = (
+                    f"ORDER {_ord_action} {_ord_qty}×{_right_name}"
+                    f" {_ord_strike:,.0f}  {_ord_expiry}{_lmt_s}"
+                )
+                # Use "top left" unless a position or prior order already sits there;
+                # fall back to "bottom left" (and track it too to avoid order-on-order clash).
+                if _strike_near(_ord_strike, _top_strikes):
+                    _ord_annot_pos = "bottom left"
+                    _bot_strikes.append(_ord_strike)
+                else:
+                    _ord_annot_pos = "top left"
+                    _top_strikes.append(_ord_strike)
+                # Place label at horizontal centre of the chart (x=0.5 paper)
+                # so it doesn't clash with the left-edge blue price label.
+                # annotation_position still controls the top/bottom yanchor;
+                # the explicit annotation_x / xanchor override the left-edge x.
+                fig.add_hline(
+                    y=_ord_strike,
+                    line_dash="solid",
+                    line_color="#fbbf24",
+                    line_width=1.5,
+                    annotation_text=_ord_label,
+                    annotation_position=_ord_annot_pos,
+                    annotation_x=0.5,
+                    annotation_xanchor="center",
+                    annotation_font_size=9,
+                    annotation_font_color="#1e2130",
+                    annotation_bgcolor="#fbbf24",
+                    annotation_bordercolor="#fbbf24",
+                    row=1, col=1,
+                )
+
         _hl = {"bgcolor": "#ffffff", "font": {"color": "#1e2130", "size": 11}, "bordercolor": "#cbd5e1"}
         fig.update_traces(hoverlabel=_hl)
 
@@ -2044,23 +2258,25 @@ def render_analysis() -> None:
                 hide_index=True,
                 width="stretch",
                 column_config={
-                    "symbol":        st.column_config.TextColumn("Symbol"),
-                    "underlying_px": st.column_config.NumberColumn("Underlying", format="$%.2f"),
-                    "right":         st.column_config.TextColumn("C/P"),
-                    "position":      st.column_config.NumberColumn("Qty",        format="%d"),
-                    "dte":           st.column_config.NumberColumn("DTE",        format="%.0f"),
-                    "strike":        st.column_config.NumberColumn("Strike",     format="$%,.1f"),
-                    "avgCost":       st.column_config.NumberColumn("Avg Cost",   format="$%,.2f"),
-                    "marketPrice":   st.column_config.NumberColumn("Mkt Px",     format="$%,.2f"),
-                    "marketValue":   st.column_config.NumberColumn("Mkt Val",    format="$%,.0f"),
-                    "unrealizedPNL": st.column_config.NumberColumn("Unreal P&L", format="$%,.0f"),
-                    "delta":         st.column_config.NumberColumn("Δ Delta",    format="%.3f"),
-                    "theta":         st.column_config.NumberColumn("Θ Theta",    format="%.3f"),
-                    "vega":          st.column_config.NumberColumn("ν Vega",     format="%.3f"),
-                    "iv":            st.column_config.NumberColumn("IV",         format="%.3f"),
-                    "delta_$":       st.column_config.NumberColumn("Delta $",    format="$%,.0f"),
-                    _sym_mcol:       st.column_config.NumberColumn(_sym_mlabel,  format="$%,.0f"),
-                    "pf_state":      st.column_config.TextColumn("State"),
+                    "symbol":        st.column_config.TextColumn("Symbol",       help="Ticker symbol"),
+                    "secType":       st.column_config.TextColumn("Type",         help="Security type: STK=stock, OPT=option"),
+                    "underlying_px": st.column_config.NumberColumn("Underlying", format="$%.2f",  help="Current underlying stock price"),
+                    "right":         st.column_config.TextColumn("C/P",          help="C=Call, P=Put"),
+                    "position":      st.column_config.NumberColumn("Qty",        format="%d",     help="Contracts held; negative = short position"),
+                    "dte":           st.column_config.NumberColumn("DTE",        format="%.0f",   help="Calendar days to expiration"),
+                    "strike":        st.column_config.NumberColumn("Strike",     format="$%,.1f", help="Option strike price"),
+                    "expiry":        st.column_config.TextColumn("Expiry",       help="Option expiration date"),
+                    "avgCost":       st.column_config.NumberColumn("Avg Cost",   format="$%,.2f", help="Average cost basis per share/contract (for options: premium collected or paid)"),
+                    "marketPrice":   st.column_config.NumberColumn("Mkt Px",     format="$%,.2f", help="Current market price"),
+                    "marketValue":   st.column_config.NumberColumn("Mkt Val",    format="$%,.0f", help="Total market value = price × qty × multiplier"),
+                    "unrealizedPNL": st.column_config.NumberColumn("Unreal P&L", format="$%,.0f", help="Unrealized profit/loss at current market price"),
+                    "delta":         st.column_config.NumberColumn("Δ Delta",    format="%.3f",   help="Price change per $1 move in the underlying"),
+                    "theta":         st.column_config.NumberColumn("Θ Theta",    format="%.3f",   help="Daily time decay in option value"),
+                    "vega":          st.column_config.NumberColumn("ν Vega",     format="%.3f",   help="Sensitivity to a 1% change in implied volatility"),
+                    "iv":            st.column_config.NumberColumn("IV",         format="%.3f",   help="Implied volatility of the option (decimal, e.g. 0.25 = 25%)"),
+                    "delta_$":       st.column_config.NumberColumn("Delta $",    format="$%,.0f", help="Dollar delta = delta × qty × underlying_px × 100"),
+                    _sym_mcol:       st.column_config.NumberColumn(_sym_mlabel,  format="$%,.0f", help="IBKR what-if margin when available (*=Reg-T estimate)"),
+                    "pf_state":      st.column_config.TextColumn("State",        help="Portfolio state: CC=covered call, PP=protective put, NP=naked put, etc."),
                 },
             )
 
@@ -2347,6 +2563,13 @@ def _build_live_context() -> dict:
         df_ord = _load_pkl(pkl_name)
         if not df_ord.empty:
             context[ctx_key] = df_ord
+
+    # Live open orders (filtered to selected account)
+    live_orders = snap.orders
+    if acct and not live_orders.empty and "account" in live_orders.columns:
+        live_orders = live_orders[live_orders["account"] == acct].reset_index(drop=True)
+    if not live_orders.empty:
+        context["open_orders"] = live_orders
 
     return context
 
