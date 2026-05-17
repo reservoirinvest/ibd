@@ -474,7 +474,7 @@ class IBClient:
         # Discover managed accounts (populated immediately post-connect)
         managed = list(self._ib.managedAccounts())
         self._managed_accounts = managed
-        logger.info("Managed accounts: {}", managed)
+        logger.info("Managed accounts: {}", [self._mask(a) for a in managed])
         with self._snap_lock:
             masked = ", ".join(self._mask(a) for a in managed) if managed else "<default>"
             self._snap.account = masked

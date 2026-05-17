@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 *)",
+      "Bash(python *)",
+      "Read(//c/Users/kashi/.claude/**)",
+      "Read(//c/Users/kashi/.claude/skills\" 2>/dev/**)",
+      "Bash(git checkout *)"
+    ]
+  }
+}

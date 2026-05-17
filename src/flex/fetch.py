@@ -19,6 +19,31 @@ import pandas as pd
 from ib_async.flexreport import FlexReport
 from loguru import logger
 
+# Fallback dedup key when IBKR ID columns are absent (e.g. older Activity XML exports)
+_NAT_KEY = ["accountId", "dateTime", "symbol", "putCall", "strike", "expiry", "quantity", "tradePrice"]
+
+
+def _dedup(df: pd.DataFrame, context: str = "") -> pd.DataFrame:
+    """Deduplicate on IBKR trade ID columns, falling back to composite natural key.
+
+    ID columns are only used when ≥80% of rows have a non-null value. This prevents
+    pandas from treating all NaN rows as identical (which collapses historical data
+    built before tradeID was in the query into a single row when merged with newer data).
+    """
+    key_cols = [
+        c for c in ("tradeID", "ibExecID", "ibOrderID")
+        if c in df.columns and df[c].notna().mean() >= 0.8
+    ]
+    if not key_cols:
+        key_cols = [c for c in _NAT_KEY if c in df.columns]
+    if key_cols:
+        before = len(df)
+        df = df.drop_duplicates(subset=key_cols)
+        dropped = before - len(df)
+        if dropped:
+            logger.info("Removed {} duplicate rows{} (key={})", dropped, f" [{context}]" if context else "", key_cols)
+    return df
+
 
 def _load_one_xml(xml_path: Path) -> pd.DataFrame:
     """Load a single Flex XML file. Tries 'Trade' then 'TradeConfirm'."""
@@ -27,7 +52,10 @@ def _load_one_xml(xml_path: Path) -> pd.DataFrame:
     topics = report.topics()
     topic = next((t for t in ("Trade", "TradeConfirm") if t in topics), None)
     if topic is None:
-        raise ValueError(f"No trade topic in {xml_path.name}. Found: {topics}")
+        raise ValueError(
+            f"No trade data in {xml_path.name} (topics: {topics}). "
+            "Check that the XML was exported from an Activity Flex Query with the Trades section enabled."
+        )
     df = report.df(topic)
     if df is None or df.empty:
         logger.warning("No rows in {} for topic={}", xml_path.name, topic)
@@ -63,14 +91,7 @@ def load_xml(xml_dir: Path) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
 
-    combined = pd.concat(frames, ignore_index=True)
-    key_cols = [c for c in ("tradeID", "ibExecID", "ibOrderID") if c in combined.columns]
-    if key_cols:
-        before = len(combined)
-        combined = combined.drop_duplicates(subset=key_cols)
-        if before > len(combined):
-            logger.info("Removed {} duplicate rows across files", before - len(combined))
-
+    combined = _dedup(pd.concat(frames, ignore_index=True), context="load_xml")
     logger.info("Total rows after merge={}", len(combined))
     return combined
 
@@ -81,7 +102,13 @@ def _download_one(token: str, query_id: str) -> pd.DataFrame:
     topics = report.topics()
     topic = next((t for t in ("Trade", "TradeConfirm") if t in topics), None)
     if topic is None:
-        raise ValueError(f"No trade topic in query {query_id}. Topics: {topics}")
+        raise ValueError(
+            f"No trade data in query {query_id} (topics found: {topics}).\n"
+            "Fix in IBKR portal → Reports → Flex Queries → edit your TradeHistory query:\n"
+            "  1. Under 'Sections' enable 'Trades' and save all required fields.\n"
+            "  2. Under 'General' set Period to 'Last 365 Calendar Days' (not Custom Date Range).\n"
+            "Run scripts/diagnose_flex_api.py to inspect the raw XML returned by the API."
+        )
     df = report.df(topic)
     count = len(df) if df is not None else 0
     logger.info("query_id={} rows={}", query_id, count)
@@ -128,16 +155,7 @@ def download_trades(
             "XML downloads does not apply to API calls."
         )
 
-    combined = pd.concat(frames, ignore_index=True)
-
-    # Deduplicate — same trade can appear in overlapping query periods
-    key_cols = [c for c in ("tradeID", "ibExecID", "ibOrderID") if c in combined.columns]
-    if key_cols:
-        before = len(combined)
-        combined = combined.drop_duplicates(subset=key_cols)
-        if before > len(combined):
-            logger.info("Removed {} duplicate rows", before - len(combined))
-
+    combined = _dedup(pd.concat(frames, ignore_index=True), context="download_trades")
     logger.info("API download total rows={}", len(combined))
     return combined
 
@@ -153,9 +171,7 @@ def merge_into_pickle(new_df: pd.DataFrame, pkl_path: Path) -> pd.DataFrame:
     else:
         combined = new_df.copy()
 
-    key_cols = [c for c in ("tradeID", "ibExecID", "ibOrderID") if c in combined.columns]
-    if key_cols:
-        combined = combined.drop_duplicates(subset=key_cols)
+    combined = _dedup(combined, context="merge_into_pickle")
 
     pkl_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_pickle(pkl_path)

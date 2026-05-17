@@ -22,7 +22,11 @@
       "Bash(Move-Item profile_hotpaths.py scripts/profile_hotpaths.py)",
       "WebFetch(domain:tradermonty.github.io)",
       "Bash(uv pip *)",
-      "PowerShell($js = Get-Content \"C:\\\\Users\\\\kashi\\\\python\\\\ibd\\\\.venv\\\\Lib\\\\site-packages\\\\streamlit\\\\static\\\\static\\\\js\\\\MenuButton.BqShlCg_.js\" -Raw; [regex]::Matches\\($js, '\"st[A-Za-z]+\"'\\) | ForEach-Object { $_.Value } | Sort-Object -Unique)"
+      "PowerShell($js = Get-Content \"C:\\\\Users\\\\kashi\\\\python\\\\ibd\\\\.venv\\\\Lib\\\\site-packages\\\\streamlit\\\\static\\\\static\\\\js\\\\MenuButton.BqShlCg_.js\" -Raw; [regex]::Matches\\($js, '\"st[A-Za-z]+\"'\\) | ForEach-Object { $_.Value } | Sort-Object -Unique)",
+      "Bash(uv run ruff check *)",
+      "Bash(uv run ruff format --check *)",
+      "Bash(uv sync)",
+      "Bash(uv lock *)"
     ]
   }
 }

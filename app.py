@@ -47,6 +47,14 @@ from src.dashboard.settings import get_settings
 from src.dashboard.state import classify_portfolio
 
 
+# Route INFO+ to a rolling log file; keep terminal clean (WARNING+ only).
+# Must run before any module that calls logger.info() at import time.
+_LOG_DIR = _here() / "log"
+_LOG_DIR.mkdir(exist_ok=True)
+logger.remove()
+logger.add(sys.stderr, level="WARNING", colorize=True, format="{time:HH:mm:ss} | {level} | {message}")
+logger.add(str(_LOG_DIR / "app.log"), level="DEBUG", encoding="utf-8", rotation="50 MB", retention=3)
+
 st.set_page_config(
     page_title="IB Monitor",
     page_icon="📈",
@@ -111,8 +119,28 @@ st.markdown(
         padding: 0 0.5rem !important;
         border-bottom: 1px solid rgba(128, 128, 128, 0.15) !important;
     }
+    /* KPI column: clip table to its flex width; min-width:0 lets flex actually shrink it */
+    .kpi-bar-fixed [data-testid="stColumn"]:first-child {
+        overflow: hidden !important;
+        min-width: 0 !important;
+    }
     /* Ask AI column: allow natural height (answer expander drives it) */
-    .ask-ai-col { overflow: visible !important; }
+    .ask-ai-col { overflow: visible !important; min-width: 0 !important; }
+    /* Answer box — text wraps, no horizontal scroll on prose */
+    .ask-ai-col .stMarkdown p,
+    .ask-ai-col .stMarkdown li { overflow-wrap: break-word; word-break: normal; }
+    /* Tables scroll horizontally within their own block; container stays clean */
+    .ask-ai-col .stMarkdown table {
+        display: block; overflow-x: auto; max-width: 100%;
+    }
+    /* Table cells: wrap long text at ~20em, never force horizontal scroll on text */
+    .ask-ai-col .stMarkdown td,
+    .ask-ai-col .stMarkdown th {
+        white-space: normal !important; word-break: break-word; max-width: 20em; min-width: 4em;
+    }
+    /* Provider dropdown: fit to longest name — prevents leftward overlap with KPI table */
+    .ask-ai-col [data-baseweb="select"] { min-width: 0 !important; }
+    .ask-ai-col [data-testid="stSelectbox"] { max-width: fit-content !important; }
     /* Compact status bar inside left column of the fixed band */
     .hdr-bar { font-size: 0.72rem; line-height: 1.5; padding: 3px 0; }
     .hdr-title { font-weight: 700; font-size: 0.86rem; }
@@ -128,8 +156,8 @@ st.markdown(
         width: 10ch !important;
     }
     /* KPI compact banded table */
-    .kpi-tbl { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
-    .kpi-tbl td { padding: 3px 6px; white-space: nowrap; }
+    .kpi-tbl { width: 100%; border-collapse: collapse; font-size: 0.84rem; table-layout: fixed; }
+    .kpi-tbl td { padding: 3px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .kpi-lbl { opacity: 0.6; font-size: 0.74rem; }
     .kpi-val { font-weight: 600; font-size: 0.92rem; text-align: right; }
     .kpi-row-a { background-color: rgba(128,128,128,0.04); }
@@ -138,8 +166,14 @@ st.markdown(
     /* Left padding on the second/third label — visual gap between pairs */
     .kpi-lbl2 { padding-left: 1.2rem !important; }
     .kpi-lbl3 { padding-left: 1.2rem !important; }
-    /* Tooltip trigger (?) inside KPI table — superscript, muted */
-    .kpi-help { cursor: help; opacity: 0.45; font-size: 0.6rem; vertical-align: super; margin-left: 1px; }
+    /* Tooltip trigger (?) inside KPI table — circle badge, hover-friendly */
+    .kpi-help {
+        cursor: help; opacity: 0.65; font-size: 0.72rem; line-height: 1;
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 1.1em; height: 1.1em;
+        border: 1px solid currentColor; border-radius: 50%;
+        margin-left: 3px; vertical-align: middle;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -561,7 +595,13 @@ def kpi_strip() -> None:
     g = greek_dollar_sums(positions, snap.tickers)
     av = _select_account_values(snap, acct)
     from decimal import Decimal as _D
-    opt_val = float(av.get("OptionMarketValue", _D("0")) or 0)
+    opt_val    = float(av.get("OptionMarketValue", _D("0")) or 0)
+    stock_val  = float(av.get("StockMarketValue",  _D("0")) or 0)
+    dividend   = float(av.get("AccruedDividend",   _D("0")) or 0)
+    init_mg    = float(av.get("InitMarginReq",     _D("0")) or 0)
+    avail_fnds = float(av.get("AvailableFunds",    _D("0")) or 0)
+    buy_pow    = float(av.get("BuyingPower",        _D("0")) or 0)
+    leverage_s = float(av.get("Leverage-S",         _D("0")) or 0)
 
     # Drop withstand — goes into row 1 col 3 (in line with NLV)
     if snap.account_values and not snap.positions.empty:
@@ -601,7 +641,9 @@ def kpi_strip() -> None:
     _dr_lbl1 = _lbl(_dr_r1_lbl, _dr_r1_tip) if _dr_r1_lbl else ""
     _dr_lbl4 = _lbl(_dr_r4_lbl, _dr_r4_tip) if _dr_r4_lbl else ""
 
-    # Layout: col1 = NLV/Cushion, col2 = risk metrics, col3 = greeks
+    # col1 = NLV/Cushion/Leverage-S/Dividend/Stock Value/Buying Power
+    # col2 = risk metrics (drop withstand, excess liq, opt value, maint margin, init margin, …)
+    # col3 = greeks (rows 1–4 only)
     rows: list[tuple[str, str, str, str, str, str, str, str, str]] = [
         (
             _lbl("NLV", "Net Liquidation Value: total portfolio value including cash, stocks and options at current market prices."),
@@ -619,18 +661,34 @@ def kpi_strip() -> None:
             signed_money(g["theta_$"]), "",
         ),
         (
-            _dr_lbl4, _dr_r4_val, "",
+            _lbl("Leverage-S", "Short leverage: portfolio exposure ÷ equity. Higher = more leveraged (Leverage-S)."),
+            f"{leverage_s:.2f}×", "",
             _lbl("Opt Value", "Option Market Value: total mark-to-market value of all option positions."),
             money(opt_val), "",
             _lbl("&#x3A3;&#x3B3; ($)", "Portfolio Dollar Gamma: rate of change of dollar delta per 1-point move. Positive gamma means delta grows in your favour as the market moves."),
             signed_money(g["gamma_$"]), "",
         ),
         (
-            "", "", "",
+            _lbl("Dividend", "Accrued dividends not yet received (AccruedDividend)."),
+            money(dividend), "",
             _lbl("Maint Margin", "Maintenance Margin Requirement: minimum equity you must hold to keep current positions open."),
             money(k["maint_margin"]), "",
             _lbl("&#x3A3;&#x3BD; ($)", "Portfolio Dollar Vega: P&amp;L sensitivity to a 1% rise in implied volatility across all options."),
             signed_money(g["vega_$"]), "",
+        ),
+        (
+            _lbl("Stock Value", "Total market value of all stock positions at current prices (StockMarketValue)."),
+            money(stock_val), "",
+            _lbl("Init Margin", "Initial Margin Requirement: equity needed to open current positions (InitMarginReq)."),
+            money(init_mg), "",
+            _lbl("Avail Funds", "Funds available for trading above the maintenance margin (AvailableFunds)."),
+            money(avail_fnds), "",
+        ),
+        (
+            _lbl("Buying Power", "Maximum new position size without adding more funds (BuyingPower)."),
+            money(buy_pow), "",
+            _dr_lbl4, _dr_r4_val, "",
+            "", "", "",
         ),
     ]
 
@@ -1030,6 +1088,7 @@ def render_orders() -> None:
                 _banded(df_cov[[c for c in c_cols if c in df_cov.columns]].copy()),
                 hide_index=True, width="stretch",
                 column_config={
+                    "qty":      st.column_config.NumberColumn("Qty",         format="%d"),
                     "strike":   st.column_config.NumberColumn("Strike",      format="%.1f"),
                     "undPrice": st.column_config.NumberColumn("Und Px",      format="$%,.2f"),
                     "sdev":     st.column_config.NumberColumn("1σ Move",     format="$%,.2f",
@@ -1067,6 +1126,7 @@ def render_orders() -> None:
                 _banded(df_nkd[[c for c in n_cols if c in df_nkd.columns]].copy()),
                 hide_index=True, width="stretch",
                 column_config={
+                    "qty":      st.column_config.NumberColumn("Qty",         format="%d"),
                     "strike":   st.column_config.NumberColumn("Strike",      format="%.1f"),
                     "undPrice": st.column_config.NumberColumn("Und Px",      format="$%,.2f"),
                     "vy":       st.column_config.NumberColumn("IV",          format="%.3f",
@@ -1099,6 +1159,7 @@ def render_orders() -> None:
                 _banded(df_reap_pkl[[c for c in r_cols if c in df_reap_pkl.columns]].copy()),
                 hide_index=True, width="stretch",
                 column_config={
+                    "qty":      st.column_config.NumberColumn("Qty",         format="%d"),
                     "strike":   st.column_config.NumberColumn("Strike",      format="%.1f"),
                     "undPrice": st.column_config.NumberColumn("Und Px",      format="$%,.2f"),
                     "avgCost":  st.column_config.NumberColumn("Avg Cost",    format="$%,.2f"),
@@ -1126,6 +1187,7 @@ def render_orders() -> None:
                 _banded(df_prot[[c for c in p_cols if c in df_prot.columns]].copy()),
                 hide_index=True, width="stretch",
                 column_config={
+                    "qty":        st.column_config.NumberColumn("Qty",         format="%d"),
                     "strike":     st.column_config.NumberColumn("Strike",      format="%.1f"),
                     "undPrice":   st.column_config.NumberColumn("Und Px",      format="$%,.2f"),
                     "xPrice":     st.column_config.NumberColumn("Expected Px", format="$%,.2f"),
@@ -1244,29 +1306,6 @@ def render_diagnostics() -> None:
     snap = client.snapshot()
     acct = _selected_account()
 
-    # ── Key account values (de-duplicated / summed via _select_account_values) ──
-    from decimal import Decimal as _D
-    av = _select_account_values(snap, acct)
-
-    # IBKR tag names: StockMarketValue (not StockValue); Leverage-S (short leverage, ~3)
-    _KEY_TAGS: list[tuple[str, str, bool]] = [
-        # (ibkr_tag,           display_label,   is_ratio)
-        ("OptionMarketValue",  "Opt Value",      False),
-        ("StockMarketValue",   "Stock Value",    False),
-        ("AccruedDividend",    "Dividend",       False),
-        ("InitMarginReq",      "Init Margin",    False),
-        ("AvailableFunds",     "Avail Funds",    False),
-        ("BuyingPower",        "Buying Power",   False),
-        ("Leverage-S",         "Leverage-S",     True),   # ratio e.g. 3.0×
-    ]
-
-    st.markdown("##### Key account values")
-    kav_cols = st.columns(len(_KEY_TAGS))
-    for col, (tag, label, is_ratio) in zip(kav_cols, _KEY_TAGS):
-        raw = float(av.get(tag, _D("0")) or 0)
-        display = f"{raw:.2f}×" if is_ratio else money(raw, dp=0 if abs(raw) >= 1 else 2)
-        col.metric(label, display)
-
     # ── Raw account values in collapsible twistie ─────────────────────────────
     if snap.account_values:
         all_av = snap.account_values
@@ -1280,9 +1319,11 @@ def render_diagnostics() -> None:
             except (ValueError, TypeError):
                 return str(v)
 
+        _acct_labels = {v: lbl for lbl, v in _REAL_ACCOUNTS.items()}
+
         def _av_rows(a: str, vals: dict) -> list[dict]:
             return [
-                {"account": a, "tag": k, "value": _fmt_val(v)}
+                {"account": _acct_labels.get(a, "—"), "tag": k, "value": _fmt_val(v)}
                 for k, v in sorted(vals.items())
                 if float(v) not in (0.0, -1.0)
             ]
@@ -1412,11 +1453,12 @@ def render_analysis() -> None:
                 int(v) for v in _dte_series(pd.Series(_opt_expiries)).dropna() if not pd.isna(v)
             })
             _dte_opts = ["ALL"] + [str(d) for d in _dte_int_set]
-            _pf_dte_sel = _pf_c4.selectbox("Max DTE", _dte_opts, key="pf_dte_sel")
+            _pf_dte_sel = _pf_c4.selectbox("DTE", _dte_opts, key="pf_dte_sel")
             _pf_itm_only = _pf_c5.checkbox("ITM only", key="pf_itm_only")
             if _pf_c6.button("✕ Clear", key="pf_clear_filter", width="stretch"):
-                for _k in ("pf_sym", "pf_sectype", "pf_f_state", "pf_dte_sel", "pf_itm_only"):
+                for _k in ("pf_sym", "pf_sectype", "pf_f_state", "pf_dte_sel"):
                     st.session_state.pop(_k, None)
+                st.session_state["pf_itm_only"] = False
                 st.rerun()
 
             # Apply filters
@@ -1442,7 +1484,7 @@ def render_analysis() -> None:
             _pos_show_cols = [
                 "symbol", "secType", "right", "strike", "underlying_px",
                 "expiry", "position", "marketPrice",
-                "delta", "gamma", "theta", "vega", "margin_est", "pf_state",
+                "delta", "gamma", "theta", "vega", "margin_est", "unrealizedPNL", "pf_state",
             ]
             _pv_show = _pv[[c for c in _pos_show_cols if c in _pv.columns]].copy()
             # Insert DTE column immediately after expiry
@@ -1451,10 +1493,17 @@ def render_analysis() -> None:
                     _pv_show.columns.get_loc("expiry") + 1, "dte",
                     _dte_series(_pv_show["expiry"].fillna("").astype(str)).round(0).values,
                 )
-            # For STK rows underlying price equals market price
-            if all(c in _pv_show.columns for c in ("underlying_px", "marketPrice", "secType")):
+            # For STK rows: underlying price = market price; blank option-specific cols
+            if "secType" in _pv_show.columns:
                 _stk_rows = _pv_show["secType"] == "STK"
-                _pv_show.loc[_stk_rows, "underlying_px"] = _pv_show.loc[_stk_rows, "marketPrice"]
+                if all(c in _pv_show.columns for c in ("underlying_px", "marketPrice")):
+                    _pv_show.loc[_stk_rows, "underlying_px"] = _pv_show.loc[_stk_rows, "marketPrice"]
+                if "right" in _pv_show.columns:
+                    _pv_show.loc[_stk_rows, "right"] = ""   # empty string renders blank; None renders "None"
+                if "strike" in _pv_show.columns:
+                    _pv_show.loc[_stk_rows, "strike"] = None
+                if "dte" in _pv_show.columns:
+                    _pv_show.loc[_stk_rows, "dte"] = None
             if "position" in _pv_show.columns:
                 _pv_show["position"] = _pv_show["position"].fillna(0).astype(int)
 
@@ -1470,13 +1519,14 @@ def render_analysis() -> None:
                         "underlying_px": st.column_config.NumberColumn("Und Px",  format="$%,.2f"),
                         "expiry":        st.column_config.TextColumn("Expiry"),
                         "dte":           st.column_config.NumberColumn("DTE",     format="%.0f"),
-                        "position":      st.column_config.NumberColumn("Qty",     format="%.0f"),
+                        "position":      st.column_config.NumberColumn("Qty",     format="%d"),
                         "marketPrice":   st.column_config.NumberColumn("Mkt Px",  format="$%,.2f"),
                         "delta":         st.column_config.NumberColumn("Δ",       format="%.3f"),
                         "gamma":         st.column_config.NumberColumn("Γ",       format="%.4f"),
                         "theta":         st.column_config.NumberColumn("Θ",       format="%.3f"),
                         "vega":          st.column_config.NumberColumn("ν",       format="%.3f"),
                         "margin_est":    st.column_config.NumberColumn("Margin",  format="$%,.0f"),
+                        "unrealizedPNL": st.column_config.NumberColumn("Unreal P&L", format="$%,.0f"),
                         "pf_state":      st.column_config.TextColumn("State"),
                     },
                 )
@@ -1489,10 +1539,7 @@ def render_analysis() -> None:
             cover_std_mult=settings.cover_std_mult,
             max_dte=settings.max_dte,
         )
-        _gap_header = "🔍 Cover / Protect gaps"
-        if not settings.protect_me:
-            _gap_header += " — cover only (PROTECT_ME=False)"
-        with st.expander(_gap_header, expanded=False):
+        with st.expander(f"🔍 Cover/Protect gaps (PROTECT_ME={settings.protect_me})", expanded=False):
             if gaps.empty:
                 st.success("No gaps — all stocks covered and protected.")
             else:
@@ -1939,9 +1986,18 @@ def render_analysis() -> None:
             if _sym_mcol in sym_pos.columns:
                 disp_cols.append(_sym_mcol)
             sym_view = sym_pos[[c for c in disp_cols if c in sym_pos.columns]].reset_index(drop=True)
-            if "secType" in sym_view.columns and "marketPrice" in sym_view.columns and "underlying_px" in sym_view.columns:
+            if "secType" in sym_view.columns:
                 _stk = sym_view["secType"] == "STK"
-                sym_view.loc[_stk, "underlying_px"] = sym_view.loc[_stk, "marketPrice"]
+                if all(c in sym_view.columns for c in ("underlying_px", "marketPrice")):
+                    sym_view.loc[_stk, "underlying_px"] = sym_view.loc[_stk, "marketPrice"]
+                if "right" in sym_view.columns:
+                    sym_view.loc[_stk, "right"] = ""
+                if "strike" in sym_view.columns:
+                    sym_view.loc[_stk, "strike"] = None
+                if "dte" in sym_view.columns:
+                    sym_view.loc[_stk, "dte"] = None
+            if "position" in sym_view.columns:
+                sym_view["position"] = sym_view["position"].fillna(0).astype(int)
             st.dataframe(
                 _banded(sym_view, _s_itm),
                 hide_index=True,
@@ -1950,6 +2006,7 @@ def render_analysis() -> None:
                     "symbol":        st.column_config.TextColumn("Symbol"),
                     "underlying_px": st.column_config.NumberColumn("Underlying", format="$%.2f"),
                     "right":         st.column_config.TextColumn("C/P"),
+                    "position":      st.column_config.NumberColumn("Qty",        format="%d"),
                     "dte":           st.column_config.NumberColumn("DTE",        format="%.0f"),
                     "strike":        st.column_config.NumberColumn("Strike",     format="$%,.1f"),
                     "avgCost":       st.column_config.NumberColumn("Avg Cost",   format="$%,.2f"),
@@ -1972,6 +2029,14 @@ _PROVIDER_HINTS: dict[str, tuple[str, str]] = {
     "Gemini":   ("aistudio.google.com/app/apikey", "https://aistudio.google.com/app/apikey"),
     "Claude":   ("console.anthropic.com",          "https://console.anthropic.com"),
 }
+_LLM_MAX_HISTORY = 5  # rolling window: oldest turn dropped when full; 5 turns ≈ 3 000 extra tokens
+
+
+def _fmt_date_col(s: pd.Series, fallback: str = "?") -> pd.Series:
+    """Format a date/datetime Series to 'YYYY-MM-DD' strings."""
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s.dt.strftime("%Y-%m-%d").fillna(fallback)
+    return s.astype(str).str[:10].fillna(fallback)
 
 
 def _build_history_context() -> dict:
@@ -1985,9 +2050,11 @@ def _build_history_context() -> dict:
         return {}
 
     _CACHE, _TS = "llm_hist_cache", "llm_hist_ts"
+    _pkl_mtime = pkl.stat().st_mtime
     if (
         _CACHE in st.session_state
         and time.time() - st.session_state.get(_TS, 0) < 300
+        and st.session_state.get("llm_hist_pkl_mtime") == _pkl_mtime
     ):
         return st.session_state[_CACHE]
 
@@ -2030,11 +2097,20 @@ def _build_history_context() -> dict:
         "worst_trade": _trade_label(worst_row) if worst_row is not None else "N/A",
     }
 
-    # Per-symbol: performance + strategy fingerprint from opening trades
+    # All closed OPT trades, including pnl=0 (assignments and worthless expirations where IBKR
+    # books the premium to the stock cost basis at assignment time, not the option close row).
+    # Used for both per_symbol (n count) and trade_log so the two sources are always consistent.
+    # STK assignment trades are excluded (assetCategory == "OPT") — their inclusion would halve
+    # the apparent win rate for wheel symbols.
+    _all_closed_opt = (
+        df[(df["openCloseIndicator"] == "C") & (df["assetCategory"] == "OPT")]
+        if all(c in df.columns for c in ("openCloseIndicator", "assetCategory"))
+        else closed
+    )
     opens = df[df["openCloseIndicator"] == "O"] if "openCloseIndicator" in df.columns else df
 
     per_symbol: list[dict] = []
-    for sym, grp in closed.groupby(sym_col):
+    for sym, grp in _all_closed_opt.groupby(sym_col):
         if not sym or pd.isna(sym):
             continue
         t = len(grp)
@@ -2068,9 +2144,37 @@ def _build_history_context() -> dict:
 
     per_symbol.sort(key=lambda r: r["pnl"], reverse=True)
 
-    result = {"global_stats": global_stats, "per_symbol": per_symbol}
+    # Trade log — same _all_closed_opt source, newest-first for context-window priority.
+    # Prefer dateTime (always populated) over tradeDate (often NaT in Activity query XMLs).
+    _date_col = next(
+        (c for c in ("dateTime", "tradeDate") if c in _all_closed_opt.columns and _all_closed_opt[c].notna().any()),
+        None,
+    )
+    trade_log: list[dict] = []
+    if _date_col:
+        _tlog = _all_closed_opt.sort_values(_date_col, ascending=False, na_position="last")
+        _date_strs = _fmt_date_col(_tlog[_date_col], "?")
+        _exp_strs = (
+            _fmt_date_col(_tlog["expiry"], "") if "expiry" in _tlog.columns
+            else pd.Series("", index=_tlog.index)
+        )
+        for (_, row), date_s, exp_s in zip(_tlog.iterrows(), _date_strs, _exp_strs):
+            _pc = str(row.get("putCall", ""))
+            _sk = row.get("strike")
+            _pnl = row.get("pnl")
+            trade_log.append({
+                "date":   date_s,
+                "sym":    str(row.get(sym_col, row.get("symbol", "?"))),
+                "strike": (_pc + str(round(float(_sk), 1))) if pd.notna(_sk) else _pc,
+                "expiry": exp_s,
+                "qty":    int(row["quantity"]) if pd.notna(row.get("quantity")) else "",
+                "pnl":    int(_pnl) if pd.notna(_pnl) else 0,
+            })
+
+    result = {"global_stats": global_stats, "per_symbol": per_symbol, "trade_log": trade_log}
     st.session_state[_CACHE] = result
     st.session_state[_TS] = time.time()
+    st.session_state["llm_hist_pkl_mtime"] = _pkl_mtime
     return result
 
 
@@ -2139,7 +2243,24 @@ def _build_ohlc_context(focus_symbols: set[str]) -> dict:
             "hv20": hv20 if hv20 is not None else "?",
         })
 
-    result = {"ohlc_stats": rows}
+    cutoff = pd.Timestamp.now() - pd.DateOffset(months=24)
+    monthly: dict[str, list[tuple[str, float]]] = {}
+    for sym in sorted(focus_symbols):
+        df = ohlc.get(sym)
+        if df is None or df.empty or "Close" not in df.columns:
+            continue
+        closes = df["Close"].dropna()
+        try:
+            mo = closes[closes.index >= cutoff].resample("ME").last().dropna()
+        except Exception:
+            continue
+        if mo.empty:
+            continue
+        monthly[sym] = [(str(dt)[:7], round(float(v), 2)) for dt, v in mo.items()]
+
+    result: dict = {"ohlc_stats": rows}
+    if monthly:
+        result["ohlc_price_history"] = monthly
     st.session_state[_CACHE] = result
     st.session_state[_TS] = time.time()
     return result
@@ -2175,12 +2296,24 @@ def _build_live_context() -> dict:
         hist_syms = {r["sym"] for r in by_trades[:50]}
     context.update(_build_ohlc_context(pos_syms | hist_syms))
 
+    # Suggested Orders — load pickles so the LLM can reason about them
+    for ctx_key, pkl_name in (
+        ("orders_cover",   "df_cov.pkl"),
+        ("orders_sow",     "df_nkd.pkl"),
+        ("orders_reap",    "df_reap.pkl"),
+        ("orders_protect", "df_protect.pkl"),
+    ):
+        df_ord = _load_pkl(pkl_name)
+        if not df_ord.empty:
+            context[ctx_key] = df_ord
+
     return context
 
 
 def _render_llm_chat() -> None:
     """Compact Ask AI dock: always visible, one row of controls + cached response."""
-    p_col, q_col, c_col = st.columns([2, 5.5, 0.5])
+    _prov_w = max(len(p) for p in _PROVIDER_HINTS)  # chars in longest provider name
+    p_col, q_col, c_col = st.columns([_prov_w * 0.13, 8 - _prov_w * 0.13 - 0.5, 0.5])
 
     provider = p_col.selectbox(
         "Provider",
@@ -2209,16 +2342,18 @@ def _render_llm_chat() -> None:
         question != st.session_state.get("llm_last_q")
         or provider != st.session_state.get("llm_last_prov")
     ):
+        _prev_hist: list[dict] = st.session_state.get("llm_history", [])
         with st.spinner(f"{provider}…"):
             try:
                 context = _build_live_context()
                 if provider == "Claude":
-                    resp = query_data(question, context)
+                    resp = query_data(question, context, history=_prev_hist)
                 elif provider == "Gemini":
-                    resp = query_data_gemini(question, context)
+                    resp = query_data_gemini(question, context, history=_prev_hist)
                 else:
-                    resp = query_data_deepseek(question, context)
+                    resp = query_data_deepseek(question, context, history=_prev_hist)
                 st.session_state["llm_response"] = resp
+                st.session_state["llm_history"] = (_prev_hist + [{"q": question, "a": resp}])[-_LLM_MAX_HISTORY:]
             except Exception as e:
                 st.session_state["llm_response"] = f"⚠️ {e}"
             st.session_state["llm_last_q"] = question
@@ -2227,7 +2362,7 @@ def _render_llm_chat() -> None:
     if cached := st.session_state.get("llm_response"):
         _last_q = st.session_state.get("llm_last_q", "")
         with st.expander("Answer", expanded=True):
-            with st.container(height=120, border=False):
+            with st.container(height=250, border=False):
                 # Escape $ so Streamlit doesn't treat currency/options as LaTeX delimiters
                 safe = cached.replace("$", r"\$")
                 # Downgrade headers (H1→H4, H2→H5, H3→H6) so they fit the compact container
@@ -2238,10 +2373,29 @@ def _render_llm_chat() -> None:
                     flags=re.MULTILINE,
                 )
                 st.markdown(safe)
-            if st.button("📋", key="llm_copy_btn", help="Show plain text for copying"):
+            _btn_copy, _btn_hist = st.columns(2)
+            if _btn_copy.button("📋", key="llm_copy_btn", help="Show plain text for copying"):
                 st.session_state["llm_copy_open"] = not st.session_state.get("llm_copy_open", False)
+            _hist_len = len(st.session_state.get("llm_history", []))
+            _turns_left = _LLM_MAX_HISTORY - _hist_len
+            if _btn_hist.button(
+                f"💬 {_turns_left}",
+                key="llm_hist_clr_btn",
+                help=(
+                    f"{_hist_len}/{_LLM_MAX_HISTORY} turns stored — "
+                    f"{_turns_left} slot{'s' if _turns_left != 1 else ''} remaining. "
+                    "Click to clear conversation history."
+                ),
+            ):
+                st.session_state["llm_history"] = []
+                st.rerun()
         if st.session_state.get("llm_copy_open", False):
-            st.code(f"Q: {_last_q}\n\nA: {cached}", language=None)
+            _hist = st.session_state.get("llm_history", [])
+            if _hist:
+                _parts = [f"Q: {h['q']}\n\nA: {h['a']}" for h in _hist]
+                st.code("\n\n---\n\n".join(_parts), language=None)
+            else:
+                st.code(f"Q: {_last_q}\n\nA: {cached}", language=None)
 
 
 # ---------------------------------------------------------------------------
@@ -2251,9 +2405,7 @@ def _render_llm_chat() -> None:
 @st.fragment
 def render_history() -> None:
     """5-year trade history, per-symbol backtest scoring, and live Greeks calculator."""
-    from src.backtest.greeks import black_scholes
     from src.backtest.score import score_from_trades
-    from src.backtest.strategy import cash_secured_put, covered_call
     from src.flex.analyze import dte_distribution, strategy_recommendation, symbol_performance
     from src.flex.fetch import download_trades, merge_into_pickle
     from src.flex.parse import mask_accounts, normalize
@@ -2271,38 +2423,108 @@ def render_history() -> None:
     flex_path = _MASTER_DIR / "flex_trades.pkl"
 
     # ── Controls ──────────────────────────────────────────────────────────────
-    cc1, cc2 = st.columns([3, 5])
-    with cc1:
-        _api_ready = bool(token and qid)
-        if st.button(
-            "🔄 Refresh via API",
-            key="btn_flex_api",
-            help="Downloads last 365 days via Flex Web Service and merges into existing data. "
-                 "Requires TOKEN + TRADES_FLEXID in .env.",
-            disabled=not _api_ready,
-        ):
-            with st.spinner("Downloading last 365 days…"):
+    _api_ready = bool(token and qid)
+    if st.button(
+        "🔄 Update Trades",
+        key="btn_flex_update",
+        help=(
+            "Merges all available sources into flex_trades.pkl — never erases history.\n\n"
+            "Sources tried in order:\n"
+            "1. API — IBKR Flex Web Service (requires TOKEN + TRADES_FLEXID in .env and portal "
+            "query period set to 'Last 365 Calendar Days').\n"
+            "2. XML — any flex_*.xml files in data/master/ (manual portal download).\n\n"
+            "API response is trimmed to 3 days before the pkl's most-recent entry so only "
+            "recent rows are reprocessed; XML files are always merged in full. "
+            "Both sources are deduplicated before saving."
+        ),
+        width="stretch",
+    ):
+        with st.spinner("Updating flex_trades.pkl…"):
+            from src.flex.fetch import load_xml
+            _sources: list[pd.DataFrame] = []
+            _log: list[str] = []
+
+            # Reference date: most-recent dateTime in the existing pkl.
+            # API response will be trimmed to (ref - 3 days) so we only reprocess recent rows.
+            _pkl_max_dt: pd.Timestamp | None = None
+            if flex_path.exists():
                 try:
-                    df_new = mask_accounts(normalize(download_trades(token, qid)), _acct_map)
-                    df_merged = merge_into_pickle(df_new, flex_path)
-                    # re-mask the full merged file — existing rows may still have raw IDs
-                    if _acct_map:
-                        df_merged = mask_accounts(df_merged, _acct_map)
-                        df_merged.to_pickle(flex_path)
-                    st.success(f"Merged {len(df_new):,} new rows → {len(df_merged):,} total.")
+                    _df_ex = pd.read_pickle(flex_path)
+                    if not _df_ex.empty and "dateTime" in _df_ex.columns:
+                        _t = _df_ex["dateTime"].max()
+                        _pkl_max_dt = _t if pd.notna(_t) else None
+                except Exception:
+                    pass
+
+            # Source 1: API
+            if _api_ready:
+                try:
+                    df_api = mask_accounts(normalize(download_trades(token, qid)), _acct_map)
+                    if df_api.empty:
+                        _log.append(
+                            "— API: 0 rows returned. In IBKR portal edit your Flex Query → "
+                            "set Period to **Last 365 Calendar Days** (not Custom Date Range)."
+                        )
+                    else:
+                        # Trim to 3 days before the pkl's latest date to skip old already-merged rows
+                        if _pkl_max_dt is not None and "dateTime" in df_api.columns:
+                            _cutoff = _pkl_max_dt - pd.Timedelta(days=3)
+                            df_api = df_api[df_api["dateTime"] >= _cutoff]
+                        _sources.append(df_api)
+                        _log.append(f"✓ API: {len(df_api):,} rows")
                 except Exception as _e:
-                    st.error(f"API refresh failed: {_e}")
-    with cc2:
-        _warn = []
-        if not _api_ready:
-            _warn.append("⚠ TOKEN / TRADES_FLEXID not set in .env")
-        st.caption("  ".join(_warn) if _warn else f"flex_trades.pkl — {_pkl_age('', path=flex_path)}")
+                    _log.append(f"✗ API: {_e}")
+            else:
+                _log.append("— API: skipped (TOKEN / TRADES_FLEXID not in .env)")
+
+            # Source 2: XML files
+            try:
+                raw = load_xml(_MASTER_DIR)
+                df_xml = mask_accounts(normalize(raw), _acct_map)
+                if not df_xml.empty:
+                    _n_xml = len(sorted(_MASTER_DIR.glob("flex_*.xml")))
+                    _sources.append(df_xml)
+                    _log.append(f"✓ XML: {len(df_xml):,} rows from {_n_xml} file(s)")
+            except FileNotFoundError:
+                _log.append("— XML: no flex_*.xml files in data/master/")
+            except Exception as _e:
+                _log.append(f"✗ XML: {_e}")
+
+            if _sources:
+                _before = len(pd.read_pickle(flex_path)) if flex_path.exists() else 0
+                df_combined = pd.concat(_sources, ignore_index=True)
+                df_merged = merge_into_pickle(df_combined, flex_path)
+                if _acct_map:
+                    df_merged = mask_accounts(df_merged, _acct_map)
+                    df_merged.to_pickle(flex_path)
+                _added = len(df_merged) - _before
+                st.success(
+                    f"Updated — **{len(df_merged):,}** rows total (**{_added:+,}** new).\n\n"
+                    + "  \n".join(_log)
+                )
+                st.session_state.pop("llm_hist_cache", None)
+            else:
+                st.warning("No data found from any source.")
+                for _msg in _log:
+                    st.caption(_msg)
+                st.info(
+                    "**Option A — API (routine updates, no file download):**\n"
+                    "1. IBKR Portal → Reports → Flex Queries → find `TradeHistory`\n"
+                    "2. Edit → set **Period** to `Last 365 Calendar Days` → Save\n"
+                    "3. Add TOKEN + TRADES_FLEXID to `.env`\n\n"
+                    "**Option B — Manual XML (one-time or gap fills):**\n"
+                    "1. Portal → run query, Period = Custom Date Range, Format = XML\n"
+                    "2. Save as `data/master/flex_1.xml` (multiple files for multi-year range)\n"
+                    "3. Click **🔄 Update Trades** again"
+                )
+
+    _warn = []
+    if not _api_ready:
+        _warn.append("⚠ TOKEN / TRADES_FLEXID not set — API disabled")
+    st.caption("  ".join(_warn) if _warn else f"flex_trades.pkl — {_pkl_age('', path=flex_path)}")
 
     if not flex_path.exists():
-        st.info(
-            "No trade data yet. See `.claude/skills/flex-backtest/SKILL.md` "
-            "for one-time XML bootstrap instructions, then re-run **Refresh via API** quarterly."
-        )
+        st.info("No trade data yet — click **🔄 Update Trades** above.")
         return
 
     df_all = pd.read_pickle(flex_path)
@@ -2446,82 +2668,6 @@ def render_history() -> None:
                        help="Gross profit ÷ gross loss. <1.0 = losing edge, 1.5+ = strong edge.")
             _s5.metric("Years Tested", f"{_score.years_tested:.1f}",
                        help="Date span of trade history used. <3 years = insufficient for robust scoring.")
-            for _flag in _score.red_flags:
-                (st.error if "CRITICAL" in _flag else st.warning)(_flag)
-
-    # ── Twistie 3 — Greeks Calculator & Strategy P/L ─────────────────────────
-    with st.expander("📐 Greeks Calculator & Strategy P/L", expanded=False):
-        _g1, _g2, _g3, _g4, _g5 = st.columns(5)
-        _gS = _g1.number_input("Stock Price $", value=100.0, step=1.0, format="%.2f", key="hist_S")
-        _gK = _g2.number_input("Strike $", value=100.0, step=0.5, format="%.2f", key="hist_K")
-        _gD = _g3.number_input("DTE (days)", value=30, min_value=1, max_value=365, key="hist_dte")
-        _gIV = _g4.number_input("IV %", value=25.0, step=0.5, format="%.1f", key="hist_iv") / 100.0
-        _gT = _g5.selectbox("Type", ["C", "P"], key="hist_type",
-                            help="C = Call option, P = Put option")
-
-        _gr = black_scholes(_gS, _gK, _gD / 365.0, 0.053, _gIV, _gT)
-        _gc1, _gc2, _gc3, _gc4, _gc5, _gc6 = st.columns(6)
-        _gc1.metric("Price", f"${_gr['price']:.2f}",
-                    help="Black-Scholes theoretical option price per share.")
-        _gc2.metric("Delta", f"{_gr['delta']:.4f}",
-                    help="Rate of change of option price per $1 move in the stock. Range –1 to +1.")
-        _gc3.metric("Gamma", f"{_gr['gamma']:.5f}",
-                    help="Rate of change of Delta per $1 move in the stock.")
-        _gc4.metric("Theta/day", f"${_gr['theta']*100:.2f}",
-                    help="Time decay per calendar day in dollar terms (per contract = ×100).")
-        _gc5.metric("Vega/1%", f"${_gr['vega']:.2f}",
-                    help="Change in option price per 1% move in implied volatility (per contract = ×100).")
-        _gc6.metric("Rho/1%", f"${_gr['rho']:.2f}",
-                    help="Change in option price per 1% move in the risk-free rate (per contract = ×100).")
-
-        st.markdown("#### Strategy P/L at Expiry")
-        _pl1, _pl2, _pl3 = st.columns([2, 2, 2])
-        with _pl1:
-            _strat = st.selectbox(
-                "Strategy",
-                ["Covered Call", "Cash-Secured Put"],
-                key="hist_strat",
-                help="Covered Call: long 100 shares + short call.  Cash-Secured Put: short put.",
-            )
-        with _pl2:
-            _prem = st.number_input(
-                "Premium $/share",
-                value=float(f"{_gr['price']:.2f}"),
-                step=0.01,
-                format="%.2f",
-                key="hist_prem",
-                help="Option premium received per share. Defaults to the Black-Scholes price above.",
-            )
-
-        _result = (
-            covered_call(_gS, _gK, _prem) if _strat == "Covered Call"
-            else cash_secured_put(_gS, _gK, _prem)
-        )
-
-        _prices = _result.pnl_at_expiry.index.to_numpy()
-        _pnl_vals = _result.pnl_at_expiry.to_numpy()
-        _pnl_color = "#22c55e" if _pnl_vals[-1] >= 0 else "#ef4444"
-
-        _fig = go.Figure()
-        _fig.add_trace(go.Scatter(
-            x=_prices, y=_pnl_vals, mode="lines", name="P&L",
-            line=dict(color=_pnl_color, width=2),
-        ))
-        _fig.add_hline(y=0.0, line_dash="dot", line_color="gray", line_width=1)
-        _fig.add_vline(x=_gS, line_dash="dash", line_color="#60a5fa", line_width=1,
-                       annotation_text="Current", annotation_position="top")
-        for _be in _result.breakevens:
-            _fig.add_vline(x=_be, line_dash="dot", line_color="#f59e0b", line_width=1,
-                           annotation_text=f"BE ${_be:.0f}", annotation_position="bottom")
-        _fig.update_layout(
-            title=(f"{_result.name} — Max Profit ${_result.max_profit:,.0f} | "
-                   f"Max Loss ${_result.max_loss:,.0f}"),
-            xaxis_title="Stock Price at Expiry ($)",
-            yaxis_title="P&L ($)",
-            height=360,
-            margin=dict(t=45, b=30, l=60, r=20),
-        )
-        st.plotly_chart(_fig, width="stretch")
 
 
 # ---------------------------------------------------------------------------

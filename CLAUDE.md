@@ -11,7 +11,7 @@ The weekly filter lives in `derive.py` at the sow stage (`sow_chains`). `df_chai
 ## CRITICAL — IBKR Connection
 
 > Any edit to `src/dashboard/ib_client.py` or `app.py` startup: run dashboard, confirm 🟢 LIVE within 15 s.
-> `uv run python -c "from src.dashboard import settings, ib_client; print('ok')"`
+> `uv run ibd`  (or `uv run python -c "from src.dashboard import settings, ib_client; print('ok')"` for a quick import check)
 > Silent failure shows as permanent 🔴 DISCONNECTED with no Python exception.
 
 Full IBClient patterns, pitfalls, and UI conventions → `.claude/skills/dashboard/SKILL.md`
@@ -29,11 +29,13 @@ Full IBClient patterns, pitfalls, and UI conventions → `.claude/skills/dashboa
 | `data/master/` | Protected — never deleted by Clear Data or `src/clear.py`. |
 | `src/flex/` | `fetch`, `parse`, `analyze` — IBKR Flex Query download + trade history analysis. |
 | `src/backtest/` | `greeks` (Black-Scholes), `strategy` (P/L sim), `score` (Backtest Expert). |
+| `scripts/update_trades.py` | Standalone trade refresh: API + XML → `flex_trades.pkl`. |
+| `scripts/diagnose_flex_api.py` | Diagnose Flex API connectivity and query config issues. |
 
 ## Run
 
 ```bash
-uv run streamlit run app.py --server.address=127.0.0.1
+uv run ibd
 uv run ruff check .
 uv run python -c "from src.dashboard import settings, ib_client, state, risk, ohlc; print('imports ok')"
 ```
@@ -74,6 +76,16 @@ uv run python -c "from src.dashboard import settings, ib_client, state, risk, oh
 - `_CFG_KEYS` in `app.py` is the sole registry for all YAML ↔ session_state mappings. One entry there covers `_init_cfg_state`, `_save_cfg`, `_cfg_dirty`.
 - `st.radio(horizontal=True)` inside `st.columns()` matches the nav CSS selector `[data-testid="stHorizontalBlock"]:has([data-testid="stRadio"])` — floats to top of page. Use `st.selectbox` instead.
 
+## Restart vs. Rerun
+
+| Changed | Action |
+|---|---|
+| `app.py` only | Click **Rerun** (or "Always rerun") in the browser |
+| Any file in `src/` | **Full terminal restart** — Python caches imported modules; Streamlit rerun uses the stale import |
+| `src/dashboard/ib_client.py` | Full restart — `@st.cache_resource` holds IBClient until process dies |
+
+After restart, confirm 🟢 LIVE within 15 s.
+
 ## Conventions
 
 - Python 3.12, `from __future__ import annotations`, type hints. `ruff` line-length 100.
@@ -82,6 +94,22 @@ uv run python -c "from src.dashboard import settings, ib_client, state, risk, oh
 - `width="stretch"`, not `use_container_width` (deprecated in Streamlit).
 - Never print, log, or commit `.env` contents. Dashboard binds to `127.0.0.1` only.
 
-## Talk-to-Data
+## Talk-to-Data (Ask AI)
 
-- Data files pickled in `./data/`. LLM: DeepSeek (default). Load only relevant subsets to minimize tokens.
+Fixed dock visible on every tab. Implementation: `src/dashboard/llm_query.py` (backends + prompt + formatter) + `_build_live_context()` / `_render_llm_chat()` in `app.py`.
+
+**Context sent on every query** (built in `_build_live_context`):
+
+| Key | Source |
+|---|---|
+| `positions`, `greeks`, `metrics` | Live snapshot |
+| `global_stats`, `per_symbol` | `data/master/flex_trades.pkl` — OPT-only closes (matches Symbol Deep-Dive win rates) |
+| `trade_log` | Same pickle — chronological per-trade rows with exact date, symbol, PC, strike, expiry, qty, pnl |
+| `ohlc_stats` | `data/master/ohlc.pkl` |
+| `orders_cover/sow/reap/protect` | `data/df_cov.pkl`, `df_nkd.pkl`, `df_reap.pkl`, `df_protect.pkl` |
+
+**Win rate consistency**: `per_symbol` uses all closed OPT trades (including pnl=0 assignments) so trade count matches `trade_log`. `wr%` = pnl>0 / n. STK assignment trades excluded — their inclusion halves the apparent rate for wheel symbols.
+
+**Conversation history**: rolling 5-turn window stored in `st.session_state["llm_history"]`. The `💬 N` button (next to `📋`) counts down from 5 and clears history on click. History is only appended on successful responses; errors don't corrupt the conversation.
+
+**Adding new data sources**: load pickle in `_build_live_context()`, add a context key, add a formatter block in `_format_context()`, update `_SYSTEM_PROMPT_TEMPLATE`.

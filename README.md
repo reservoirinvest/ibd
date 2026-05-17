@@ -3,7 +3,7 @@
 ## Start
 
 ```bash
-uv run streamlit run app.py --server.address=127.0.0.1
+uv run ibd
 ```
 
 ## What it does
@@ -15,9 +15,11 @@ Real-time portfolio risk monitor for IBKR accounts. Connects via IB Gateway/TWS 
 | Tab | Purpose |
 |---|---|
 | **Analysis** | Symbol OHLC chart (candlestick + Bollinger Bands + RSI + Volume), portfolio treemap, per-symbol position detail |
-| **Orders** | Generate derive orders, fetch OHLCs, execute — each as a subprocess that freezes/unfreezes the IBKR connection |
-| **History** | 5-year trade history from IBKR Flex Queries; per-symbol backtest scoring; Black-Scholes Greeks calculator; strategy P/L simulation |
+| **Orders** | Suggested orders (Cover / Sow / Reap / Protect), open orders, Generate Orders, Execute |
+| **History** | 6-year trade history from IBKR Flex Queries; per-symbol backtest scoring; Black-Scholes Greeks calculator; strategy P/L simulation |
 | **Diagnostics** | Raw account values, connection health, open orders |
+
+**Ask AI** — fixed dock visible on all tabs. Queries live positions, Greeks, 6-year trade history, OHLC stats, and all suggested orders. Supports multi-turn conversation (5-turn rolling window; `💬 N` button to clear). Providers: DeepSeek (default), Gemini, Claude.
 
 ## Configuration
 

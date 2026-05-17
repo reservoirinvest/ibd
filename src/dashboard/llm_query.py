@@ -25,29 +25,59 @@ load_dotenv()
 _SYSTEM_PROMPT_TEMPLATE = """\
 You are a quantitative trading assistant with access to:
 - Live portfolio: current positions, Greeks (delta/theta/vega), and account metrics
-- Trade history: 6 years of closed option trades with per-symbol P&L, win rate, profit factor, \
-and strategy fingerprints (CSP=cash-secured put, CC=covered call, LP=long put, LC=long call). \
-A symbol with both CSP and CC in its strategy column has been traded as a wheel.
+- Trade history: 6 years of closed option trades (OPT asset category only — stock assignment \
+trades excluded) with per-symbol trade count (n), win rate, P&L, and strategy fingerprints \
+(CSP=cash-secured put, CC=covered call, LP=long put, LC=long call). \
+A symbol with both CSP and CC in its strategy column has been traded as a wheel. \
+n counts ALL closed OPT trades including assignments (pnl=0); wr% = pnl>0 trades / n. \
+An assignment shows pnl=0 because IBKR credits the premium to the stock cost basis at exercise, \
+not the option close row — it is neither a win nor a loss in the options ledger.
+- Chronological trade log: every individual closed option trade with its exact trade date, \
+symbol, strike (formatted as put/call+price, e.g. C4140.0 or P3960.0), expiry, \
+quantity (negative=sold/short), and realised P&L in dollars. \
+Sorted newest-to-oldest so the most recent trades always appear first. \
+Assignment closes show pnl=0 — the premium collected at open was transferred into the stock \
+cost basis by IBKR rather than credited to the option close row.
 - OHLC price stats: for the top-traded and currently-held symbols — last price, 20/90-day return, \
 position within all-time range (pos52w: 0%=at low, 100%=at high), MA trend (UP/DN/MX), \
 and 20-day annualised historical volatility (hv20).
+- OHLC monthly price history: split-adjusted monthly close prices for the last 24 months per \
+symbol. Use these to identify stock splits (sudden ≥40% price gap between months), trend context \
+at the time of trades, and price levels relative to option strikes.
+- Suggested Orders from the Orders tab: Cover (sell covered calls on assigned stock), \
+Sow (sell naked puts/calls to open new positions), Reap (buy-to-close profitable open options), \
+and Protect (buy puts for downside hedging). Each order row includes symbol, right (C/P), \
+strike, expiry, dte, qty (contracts), undPrice, xPrice (expected execution price), and a \
+pre-computed total. xPrice × qty × 100 = dollar value per row.
 
-You can cross-reference all three data sources to answer questions.
+You can cross-reference all data sources to answer questions, including max-earning scenarios \
+from suggested orders.
 You cannot run code or execute backtests — for backtesting use the History tab's Backtest Scoring.
-Answer concisely with specific numbers. Keep responses under 250 words. \
+Answer concisely with specific numbers. Never truncate a list, table, or sentence mid-way — \
+always complete the final item. Keep responses under 500 words. \
 When ranking or listing, show the top 5–10 items.
 
 Current data context:
 {context}"""
 
 
-def query_data(question: str, context: dict) -> str:
+def _to_messages(history: list[dict]) -> list[dict]:
+    """Convert [{q, a}, ...] history pairs to provider message-list format."""
+    msgs: list[dict] = []
+    for h in history:
+        msgs.append({"role": "user",      "content": h["q"]})
+        msgs.append({"role": "assistant", "content": h["a"]})
+    return msgs
+
+
+def query_data(question: str, context: dict, history: list[dict] | None = None) -> str:
     """Query portfolio data using Claude Haiku.
 
     Args:
         question: User question about the portfolio/data.
         context: Dict with keys like 'positions', 'greeks', 'metrics', 'ohlc_sample'.
                  Values can be DataFrames, dicts, or strings.
+        history: Prior Q&A pairs as [{q, a}, ...] for multi-turn conversation.
 
     Returns:
         Claude's response string.
@@ -61,23 +91,25 @@ def query_data(question: str, context: dict) -> str:
 
     client = Anthropic(api_key=api_key)
     system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(context=_format_context(context))
+    messages = _to_messages(history or []) + [{"role": "user", "content": question}]
 
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=500,
+        max_tokens=2000,
         system=system_prompt,
-        messages=[{"role": "user", "content": question}],
+        messages=messages,
     )
 
     return message.content[0].text
 
 
-def query_data_gemini(question: str, context: dict) -> str:
+def query_data_gemini(question: str, context: dict, history: list[dict] | None = None) -> str:
     """Query portfolio data using Gemini Flash.
 
     Args:
         question: User question about the portfolio/data.
         context: Dict with keys like 'positions', 'greeks', 'metrics', 'ohlc_sample'.
+        history: Prior Q&A pairs as [{q, a}, ...] for multi-turn conversation.
 
     Returns:
         Gemini's response string.
@@ -94,10 +126,15 @@ def query_data_gemini(question: str, context: dict) -> str:
 
     client = genai.Client(api_key=api_key)
     system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(context=_format_context(context))
+    contents = []
+    for h in (history or []):
+        contents.append(types.Content(role="user",  parts=[types.Part(text=h["q"])]))
+        contents.append(types.Content(role="model", parts=[types.Part(text=h["a"])]))
+    contents.append(types.Content(role="user", parts=[types.Part(text=question)]))
     response = client.models.generate_content(
         model="gemini-flash-latest",
-        contents=question,
-        config=types.GenerateContentConfig(system_instruction=system_prompt, max_output_tokens=500),
+        contents=contents,
+        config=types.GenerateContentConfig(system_instruction=system_prompt, max_output_tokens=2000),
     )
     # SDK returns None text when the response is empty or safety-blocked
     text = response.text
@@ -116,12 +153,13 @@ def query_data_gemini(question: str, context: dict) -> str:
     return text
 
 
-def query_data_deepseek(question: str, context: dict) -> str:
+def query_data_deepseek(question: str, context: dict, history: list[dict] | None = None) -> str:
     """Query portfolio data using DeepSeek-V3 (OpenAI-compatible REST API).
 
     Args:
         question: User question about the portfolio/data.
         context: Dict with keys like 'positions', 'greeks', 'metrics', 'ohlc_sample'.
+        history: Prior Q&A pairs as [{q, a}, ...] for multi-turn conversation.
 
     Returns:
         DeepSeek's response string.
@@ -144,14 +182,40 @@ def query_data_deepseek(question: str, context: dict) -> str:
             "model": "deepseek-chat",
             "messages": [
                 {"role": "system", "content": system_prompt},
+                *_to_messages(history or []),
                 {"role": "user", "content": question},
             ],
-            "max_tokens": 500,
+            "max_tokens": 2000,
         },
         timeout=30,
     )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
+
+
+# (key, section_header, columns_to_show) — defined once at module level, not per call.
+_ORDER_SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "orders_cover",
+        "Suggested Orders — Cover (sell covered calls; reward = premium + capital gain if called)",
+        ("symbol", "right", "strike", "expiry", "dte", "qty", "undPrice", "avgCost", "xPrice"),
+    ),
+    (
+        "orders_sow",
+        "Suggested Orders — Sow (sell naked puts/calls; reward = premium collected)",
+        ("symbol", "right", "strike", "expiry", "dte", "qty", "undPrice", "xPrice"),
+    ),
+    (
+        "orders_reap",
+        "Suggested Orders — Reap (buy-to-close; negative = cost to close)",
+        ("symbol", "right", "strike", "expiry", "dte", "qty", "avgCost", "xPrice"),
+    ),
+    (
+        "orders_protect",
+        "Suggested Orders — Protect (buy puts for downside hedge; negative = cost)",
+        ("symbol", "right", "strike", "expiry", "dte", "qty", "xPrice", "cost", "protection", "puc"),
+    ),
+)
 
 
 def _format_context(context: dict) -> str:
@@ -202,6 +266,17 @@ def _format_context(context: dict) -> str:
                 f"{r['sym']},{r['n']},{r['wr%']},{r['pnl']},{r['best']},{r['worst']},{r['strat']}"
             )
 
+    if "trade_log" in context:
+        tlog: list[dict] = context["trade_log"]
+        lines.append(
+            "\n=== Chronological Trade Log (closed OPT only, sorted oldest→newest) ==="
+        )
+        lines.append("date,sym,strike,expiry,qty,pnl")
+        for t in tlog:
+            lines.append(
+                f"{t['date']},{t['sym']},{t['strike']},{t['expiry']},{t['qty']},{t['pnl']}"
+            )
+
     if "ohlc_stats" in context:
         ohlc_rows: list[dict] = context["ohlc_stats"]
         lines.append(
@@ -214,5 +289,43 @@ def _format_context(context: dict) -> str:
                 f"{r['sym']},{r['price']},{r['r20d']},{r['r90d']},"
                 f"{r['pos52w']},{r['trend']},{r['hv20']}"
             )
+
+    if "ohlc_price_history" in context:
+        ph: dict[str, list] = context["ohlc_price_history"]
+        if ph:
+            all_months: list[str] = sorted({m for pairs in ph.values() for m, _ in pairs})
+            lines.append(
+                "\n=== OHLC Monthly Close Prices (split-adjusted, last 24 months) ==="
+            )
+            lines.append("sym," + ",".join(all_months))
+            for sym, pairs in sorted(ph.items()):
+                month_map = {m: f"{v:.2f}" for m, v in pairs}
+                lines.append(sym + "," + ",".join(month_map.get(m, "") for m in all_months))
+
+    for key, header, want_cols in _ORDER_SECTIONS:
+        if key not in context:
+            continue
+        df = context[key]
+        if not hasattr(df, "columns") or df.empty:
+            continue
+        col_set = set(df.columns)
+        cols = [c for c in want_cols if c in col_set]
+        lines.append(f"\n=== {header} ===")
+        lines.append("xPrice=expected execution price per contract (×qty×100 = $ value per row).")
+        lines.append(df[cols].head(100).to_string(index=False))
+        if {"xPrice", "qty"} <= col_set:
+            prem = float((df["xPrice"] * df["qty"] * 100).sum())
+            if key == "orders_cover" and {"strike", "avgCost"} <= col_set:
+                cap_gain = float(((df["strike"] - df["avgCost"]) * df["qty"] * 100).sum())
+                lines.append(
+                    f"Total if all called: ${prem + cap_gain:,.0f}  "
+                    f"(premium ${prem:,.0f} + capital gain ${cap_gain:,.0f})"
+                )
+            elif key == "orders_reap":
+                lines.append(f"Total cost to close all: ${prem:,.0f}")
+            elif key == "orders_protect" and "cost" in col_set:
+                lines.append(f"Total protection cost: ${float(df['cost'].sum()):,.0f}")
+            else:
+                lines.append(f"Total expected premium: ${prem:,.0f}")
 
     return "\n".join(lines)
