@@ -6,6 +6,7 @@ Hands-on quant Director repo. Optimize for clarity, speed, minimal token spend.
 
 **Sow ONLY weekly S&P 500 options** (non-3rd-Friday expiries). Monthly-only symbols must never be sow candidates.
 The weekly filter lives in `derive.py` at the sow stage (`sow_chains`). `df_chains.pkl` keeps all expiries — cover/protect need the full chain for monthly-assigned stock (e.g. AZO).
+**Monthly-only symbol list**: `data/master/symbol_categories.pkl` — built by `scripts/update_symbol_categories.py` (chain gap <20 days = weekly). ~257 of 502 S&P 500 symbols are monthly-only. derive.py loads this at startup to exclude monthly-only from sow and to generate breakeven monthly CCs (saved as `df_monthly_cov.pkl`). Regenerate via History tab → **Identify Weeklies** after each build.
 **SG account**: LSE stocks only, no option strategy — skip sow/cover/protect entirely for SG positions.
 
 ## CRITICAL — IBKR Connection
@@ -31,6 +32,7 @@ Full IBClient patterns, pitfalls, and UI conventions → `.claude/skills/dashboa
 | `src/backtest/` | `greeks` (Black-Scholes), `strategy` (P/L sim), `score` (Backtest Expert). |
 | `scripts/update_trades.py` | Standalone trade refresh: API + XML → `flex_trades.pkl`. |
 | `scripts/diagnose_flex_api.py` | Diagnose Flex API connectivity and query config issues. |
+| `scripts/update_symbol_categories.py` | Classify symbols as weekly/monthly from chain gap analysis → `data/master/symbol_categories.pkl`. Run after each build (or via History tab → Identify Weeklies). |
 
 ## Run
 
@@ -107,6 +109,7 @@ Fixed dock visible on every tab. Implementation: `src/dashboard/llm_query.py` (b
 | `trade_log` | Same pickle — chronological per-trade rows with exact date, symbol, PC, strike, expiry, qty, pnl |
 | `ohlc_stats` | `data/master/ohlc.pkl` |
 | `orders_cover/sow/reap/protect` | `data/df_cov.pkl`, `df_nkd.pkl`, `df_reap.pkl`, `df_protect.pkl` |
+| `orders_monthly_cc` | `data/df_monthly_cov.pkl` — breakeven CCs for monthly-only held stocks |
 
 **Win rate consistency**: `per_symbol` uses all closed OPT trades (including pnl=0 assignments) so trade count matches `trade_log`. `wr%` = pnl>0 / n. STK assignment trades excluded — their inclusion halves the apparent rate for wheel symbols.
 

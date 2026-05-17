@@ -154,9 +154,41 @@ print(f"Loaded {len(df_unds)} underlyings")
 print(f"Loaded {len(df_pf)} portfolio positions")
 print(f"Loaded {len(chains)} chain entries")
 
-# Prefetch open orders before opening our own connection — get_open_orders opens CID=10 itself.
-df_openords = get_open_orders(account_no=ACCOUNT_NO)
+# Load weekly/monthly classification (built by scripts/update_symbol_categories.py)
+_sym_cat_path = ROOT / "data" / "master" / "symbol_categories.pkl"
+if _sym_cat_path.exists():
+    _sym_cat = pd.read_pickle(_sym_cat_path)
+    _monthly_syms = set(_sym_cat.loc[~_sym_cat.is_weekly, "symbol"])
+    print(f"Loaded symbol categories: {len(_monthly_syms)} monthly-only symbols")
+else:
+    _monthly_syms = set()
+    print("Warning: symbol_categories.pkl missing — run 'Identify Weeklies' in History tab; monthly sow exclusion skipped")
+
+# Prefetch active open orders before opening our own connection — get_open_orders opens CID=10 itself.
+# is_active=True excludes cancelled/expired orders so they don't block new suggestion generation.
+df_openords = get_open_orders(account_no=ACCOUNT_NO, is_active=True)
 df_openords = classify_open_orders(df_openords, df_pf)
+
+# Symbols already covered by an active open order — skip suggestion generation for these.
+# This prevents duplicate orders when the user has manually entered orders in IBKR.
+_oo_covering   = set(df_openords.loc[df_openords.state == "covering",   "symbol"])
+_oo_sowing     = set(df_openords.loc[df_openords.state == "sowing",     "symbol"])
+_oo_protecting = set(df_openords.loc[df_openords.state == "protecting", "symbol"])
+# Reap exclusion is contract-level (symbol+right+strike) — multiple short options on the same
+# symbol at different strikes must each be checked independently.
+_oo_reaping = set(
+    df_openords.loc[df_openords.state == "reaping", ["symbol", "right", "strike"]]
+    .itertuples(index=False, name=None)
+)
+
+if _oo_covering:
+    print(f"Skipping cover generation for {sorted(_oo_covering)} — active covering order exists")
+if _oo_sowing:
+    print(f"Skipping sow generation for {sorted(_oo_sowing)} — active sowing order exists")
+if _oo_protecting:
+    print(f"Skipping protect generation for {sorted(_oo_protecting)} — active protecting order exists")
+if _oo_reaping:
+    print(f"Skipping reap generation for {sorted(_oo_reaping)} — active reaping order exists")
 
 print("Connecting to IB...")
 ib = get_ib_connection("SNP", account_no=ACCOUNT_NO)
@@ -169,7 +201,9 @@ delete_pkl_files(["df_cov.pkl"])
 df_cov = pd.DataFrame()
 
 uncov = df_unds.state.isin(["exposed", "uncovered"])
-uncov_long = df_unds[uncov & (df_unds.position > 0)].reset_index(drop=True)
+uncov_long = df_unds[
+    uncov & (df_unds.position > 0) & ~df_unds.symbol.isin(_oo_covering)
+].reset_index(drop=True)
 
 if not uncov_long.empty:
     print(f"Processing {len(uncov_long)} long uncovered/exposed positions...")
@@ -266,7 +300,9 @@ else:
     df_ccf = pd.DataFrame()
     print("No long uncovered/exposed positions")
 
-uncov_short = df_unds[uncov & (df_unds.position < 0)].reset_index(drop=True)
+uncov_short = df_unds[
+    uncov & (df_unds.position < 0) & ~df_unds.symbol.isin(_oo_covering)
+].reset_index(drop=True)
 
 if not uncov_short.empty:
     print(f"Processing {len(uncov_short)} short uncovered/exposed positions...")
@@ -386,6 +422,110 @@ if not df_cov.empty:
 else:
     print("No covers available!\n")
 
+# %% MAKE MONTHLY COVERED CALLS FOR MONTHLY-ONLY HELD STOCKS
+print("\n=== MAKE MONTHLY COVERED CALLS FOR MONTHLY-ONLY HELD STOCKS ===")
+
+delete_pkl_files(["df_monthly_cov.pkl"])
+df_monthly_cov = pd.DataFrame()
+
+if not _monthly_syms:
+    print("No symbol_categories data — skipping monthly CC generation")
+else:
+    _monthly_uncov = df_unds[
+        df_unds.state.isin(["exposed", "uncovered"])
+        & (df_unds.position > 0)
+        & df_unds.symbol.isin(_monthly_syms)
+        & ~df_unds.symbol.isin(_oo_covering)
+    ].reset_index(drop=True)
+
+    if _monthly_uncov.empty:
+        print("No monthly-only uncovered positions")
+    else:
+        print(f"Processing {len(_monthly_uncov)} monthly-only uncovered positions...")
+
+        _df_mc = chains[chains.symbol.isin(_monthly_uncov.symbol.unique())].copy()
+        _df_mc = _df_mc.merge(df_unds[["symbol", "price", "iv", "avgCost"]], on="symbol", how="left")
+        _df_mc.rename(columns={"price": "undPrice", "iv": "vy"}, inplace=True)
+        _df_mc["sdev"] = _df_mc.undPrice * _df_mc.vy * (_df_mc.dte / 365) ** 0.5
+
+        # For each symbol, pick the nearest expiry that has a call at/above avgCost
+        _mc_best: list[pd.Series] = []
+        for _sym, _grp in _df_mc.groupby("symbol"):
+            _avg = _grp["avgCost"].iloc[0]
+            for _exp in sorted(_grp["expiry"].unique()):
+                _viable = _grp[(_grp.expiry == _exp) & (_grp.strike >= _avg)].sort_values("strike")
+                if not _viable.empty:
+                    _mc_best.append(_viable.iloc[0])
+                    break
+
+        if not _mc_best:
+            print("No viable monthly CC strikes at/above avgCost")
+        else:
+            _mc_calls_df = pd.DataFrame(_mc_best).reset_index(drop=True)
+            _monthly_opts = [
+                Option(s, e, k, "C", "SMART")
+                for s, e, k in zip(_mc_calls_df.symbol, _mc_calls_df.expiry, _mc_calls_df.strike)
+            ]
+
+            print("Qualifying monthly CC contracts...")
+            _valid_mc = qualify_me(ib, _monthly_opts, desc="Qualifying monthly CC contracts")
+            _valid_mc = [v for v in _valid_mc if v is not None]
+
+            if not _valid_mc:
+                print("No valid monthly CC contracts after qualification")
+            else:
+                _df_mc1 = clean_ib_util_df(_valid_mc)
+                _df_mcf = _df_mc1.loc[_df_mc1.groupby("symbol")["strike"].idxmin()].reset_index(drop=True)
+
+                _df_mcf = _df_mcf.merge(df_unds[["symbol", "price", "iv"]], on="symbol", how="left")
+                _df_mcf.rename(columns={"price": "undPrice", "iv": "vy"}, inplace=True)
+
+                _df_mcf = _df_mcf.merge(
+                    df_pf[df_pf.state.isin(["uncovered", "exposed"]) & (df_pf.secType == "STK")][
+                        ["symbol", "position", "avgCost"]
+                    ],
+                    on="symbol",
+                    how="left",
+                )
+
+                _df_mcf["action"] = "SELL"
+                _df_mcf["qty"] = _df_mcf["position"] / 100
+                _df_mcf = _df_mcf.drop(columns=["position"])
+
+                print("Getting monthly CC prices...")
+                _df_iv_mc = get_volatilities_snapshot(
+                    _df_mcf["contract"].tolist(), market="SNP", ib=ib,
+                    desc="Fetching monthly CC volatilities",
+                )
+
+                if _df_iv_mc.empty:
+                    print("No price data for monthly CCs")
+                else:
+                    _df_mcf = _df_mcf.merge(_df_iv_mc[["symbol", "price"]], on="symbol", how="left")
+                    _df_mcf["dte"] = _df_mcf.expiry.apply(get_dte)
+                    _df_mcf = _df_mcf.merge(
+                        _mc_calls_df[["symbol", "sdev"]], on="symbol", how="left"
+                    )
+                    _df_mcf["margin"] = _df_mcf.apply(
+                        lambda x: atm_margin(x.strike, x.undPrice, get_dte(x.expiry), x.vy), axis=1
+                    )
+                    _df_mcf["xPrice"] = _df_mcf.apply(
+                        lambda x: max(get_prec(x.price * COVXPMULT, 0.01), 0.05)
+                        if x.qty != 0 else 0,
+                        axis=1,
+                    )
+
+                    df_monthly_cov = _df_mcf.dropna(subset=["price"]).reset_index(drop=True)
+                    pickle_me(df_monthly_cov, ROOT / "data" / "df_monthly_cov.pkl")
+
+                    _mc_prem = (df_monthly_cov.xPrice * 100 * df_monthly_cov.qty).sum()
+                    _mc_profit = (
+                        (df_monthly_cov.strike - df_monthly_cov.avgCost + df_monthly_cov.xPrice)
+                        * 100 * df_monthly_cov.qty
+                    ).sum()
+                    print(f"Monthly CC Premium: $ {_mc_prem:,.2f}")
+                    print(f"Monthly CC Profit if Called: $ {_mc_profit:,.2f}\n")
+
 # %% MAKE SOWING CONTRACTS FOR VIRGIN AND ORPHANED SYMBOLS
 print("\n=== MAKE SOWING CONTRACTS FOR VIRGIN AND ORPHANED SYMBOLS ===")
 
@@ -396,7 +536,20 @@ if not SOW_NAKEDS:
 elif fin.get("cushion", 0) < MINCUSHION:
     print(f"Skipping sow: cushion {fin.get('cushion', 0):.1%} < MINCUSHION {MINCUSHION:.1%}")
 else:
-    df_v = df_unds[(df_unds.state == "virgin") | (df_unds.state == "orphaned")].reset_index(drop=True)
+    df_v = df_unds[
+        ((df_unds.state == "virgin") | (df_unds.state == "orphaned"))
+        & ~df_unds.symbol.isin(_oo_sowing)
+        & ~df_unds.symbol.isin(_monthly_syms)
+    ].reset_index(drop=True)
+    if _monthly_syms:
+        _skipped_monthly = set(
+            df_unds.loc[
+                df_unds.state.isin(["virgin", "orphaned"]) & df_unds.symbol.isin(_monthly_syms),
+                "symbol",
+            ]
+        )
+        if _skipped_monthly:
+            print(f"Skipping sow for monthly-only symbols: {sorted(_skipped_monthly)}")
 
     sow_chains = chains[chains["expiry"].apply(_is_weekly_expiry)]
     df_virg = sow_chains.loc[
@@ -497,6 +650,11 @@ df_reap = df_pf[df_pf.symbol.isin(df_sowed.symbol) & (df_pf.secType == "OPT")].r
     drop=True
 )
 
+# Exclude contracts that already have an active BUY order (reaping order already submitted).
+if _oo_reaping and not df_reap.empty:
+    _reap_key = list(zip(df_reap["symbol"], df_reap["right"], df_reap["strike"]))
+    df_reap = df_reap[[k not in _oo_reaping for k in _reap_key]].reset_index(drop=True)
+
 df_reap = df_reap[df_reap.expiry.apply(get_dte) > MINREAPDTE].reset_index(drop=True)
 
 df_reap = df_reap.merge(df_unds[["symbol", "iv", "price"]], on="symbol", how="left")
@@ -575,7 +733,9 @@ delete_pkl_files(["df_protect.pkl"])
 
 if not PROTECT_ME:
     print("Note: PROTECT_ME=False — generating protection recommendations regardless.")
-df_unprot = df_unds[df_unds.state.isin(["unprotected", "exposed"])].reset_index(drop=True)
+df_unprot = df_unds[
+    df_unds.state.isin(["unprotected", "exposed"]) & ~df_unds.symbol.isin(_oo_protecting)
+].reset_index(drop=True)
 print(f"Found {len(df_unprot)} unprotected/exposed positions")
 
 # Separate long and short positions

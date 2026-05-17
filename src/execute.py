@@ -39,11 +39,12 @@ PROTECT_ME = config.get("PROTECT_ME")
 REAP_ME = config.get("REAP_ME")
 SOW_NAKEDS = config.get("SOW_NAKEDS")
 
-cov_path = ROOT / "data" / "df_cov.pkl"  # covered call and put path
-nkd_path = ROOT / "data" / "df_nkd.pkl"
-reap_path = ROOT / "data" / "df_reap.pkl"
-protect_path = ROOT / "data" / "df_protect.pkl"
-deorph_path = ROOT / "data" / "df_deorph.pkl"
+cov_path         = ROOT / "data" / "df_cov.pkl"
+monthly_cov_path = ROOT / "data" / "df_monthly_cov.pkl"
+nkd_path         = ROOT / "data" / "df_nkd.pkl"
+reap_path        = ROOT / "data" / "df_reap.pkl"
+protect_path     = ROOT / "data" / "df_protect.pkl"
+deorph_path      = ROOT / "data" / "df_deorph.pkl"
 
 
 def make_ib_orders(df: pd.DataFrame, action: str, account_no: str) -> tuple:
@@ -83,18 +84,28 @@ def place_orders(cos: tuple, account_no: str = "", blk_size: int = 25) -> List:
 
 
 # %%
-# ORDER COVER OPTIONS
+# ORDER COVER OPTIONS (weekly + monthly — both honour COVER_ME, COVXPMULT; monthly ignores COVER_MIN_DTE)
 
 if COVER_ME:
-    if (df_cov_path := cov_path).exists():
-        df_cov = get_pickle(df_cov_path)
+    if cov_path.exists():
+        df_cov = get_pickle(cov_path)
         cos = make_ib_orders(df_cov, action="SELL", account_no=ACCOUNT_NO)
         cov_trades = place_orders(cos, account_no=ACCOUNT_NO)
         pickle_me(cov_trades, ROOT / "data" / "traded_covers.pkl")
-        print(f"\nPlaced {len(df_cov)} cover orders")
+        print(f"\nPlaced {len(df_cov)} weekly cover orders")
         delete_pkl_files(["df_cov.pkl"])
     else:
-        print("\nThere are no covers\n")
+        print("\nThere are no weekly covers\n")
+
+    if monthly_cov_path.exists():
+        df_monthly_cov = get_pickle(monthly_cov_path)
+        monthly_cos = make_ib_orders(df_monthly_cov, action="SELL", account_no=ACCOUNT_NO)
+        monthly_trades = place_orders(monthly_cos, account_no=ACCOUNT_NO)
+        pickle_me(monthly_trades, ROOT / "data" / "traded_monthly_covers.pkl")
+        print(f"\nPlaced {len(df_monthly_cov)} monthly cover orders")
+        delete_pkl_files(["df_monthly_cov.pkl"])
+    else:
+        print("\nThere are no monthly covers\n")
 else:
     print("\nCOVER_ME is disabled (false) in configuration\n")
 

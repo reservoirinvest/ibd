@@ -990,9 +990,10 @@ def render_orders() -> None:
             base = base + (df["strike"] - df["avgCost"]) * df["qty"] * 100
         return float(base.sum())
 
-    _raw_cov  = _load_pkl("df_cov.pkl")
-    _raw_nkd  = _load_pkl("df_nkd.pkl")
-    _raw_reap = _load_pkl("df_reap.pkl")
+    _raw_cov          = _load_pkl("df_cov.pkl")
+    _raw_monthly_cov  = _load_pkl("df_monthly_cov.pkl")
+    _raw_nkd          = _load_pkl("df_nkd.pkl")
+    _raw_reap         = _load_pkl("df_reap.pkl")
     try:
         _yml_protect = (yaml.safe_load(_CFG_PATH.read_text(encoding="utf-8")) or {}).get(
             "PROTECT_ME", False
@@ -1028,17 +1029,20 @@ def render_orders() -> None:
             df = df[df["right"].isin(_right_filt)]
         return df.reset_index(drop=True)
 
-    df_cov      = _ord_filt(_raw_cov)
-    df_nkd      = _ord_filt(_raw_nkd)
-    df_reap_pkl = _ord_filt(_raw_reap)
-    df_prot     = _ord_filt(_raw_prot)
+    df_cov         = _ord_filt(_raw_cov)
+    df_monthly_cov = _ord_filt(_raw_monthly_cov)
+    df_nkd         = _ord_filt(_raw_nkd)
+    df_reap_pkl    = _ord_filt(_raw_reap)
+    df_prot        = _ord_filt(_raw_prot)
 
     # ── Open Orders ─────────────────────────────────────────────────────────
-    st.markdown("##### Open Orders")
     orders = snap.orders
     if acct and not orders.empty and "account" in orders.columns:
         orders = orders[orders["account"] == acct].reset_index(drop=True)
     orders = _ord_filt(orders)
+    _n_open = len(orders)
+    _open_label = f"##### Open Orders — {_n_open}" if _n_open else "##### Open Orders"
+    st.markdown(_open_label)
 
     if orders.empty:
         st.info("No open orders." if not (_sym_filt or _right_filt) else "No open orders match filter.")
@@ -1046,7 +1050,7 @@ def render_orders() -> None:
         cols_show = [
             "symbol", "secType", "right", "strike", "expiry",
             "action", "qty", "filled", "remaining",
-            "orderType", "lmtPrice", "status",
+            "orderType", "lmtPrice", "status", "state",
         ]
         if len(_ACCOUNT_OPTIONS) > 2 or not acct:
             cols_show = ["account"] + cols_show
@@ -1062,6 +1066,8 @@ def render_orders() -> None:
                 "remaining": st.column_config.NumberColumn(format="%.0f"),
                 "strike":    st.column_config.NumberColumn(format="%.1f"),
                 "status":    st.column_config.TextColumn(),
+                "state":     st.column_config.TextColumn("State",
+                    help="Classified role: covering, sowing, protecting, reaping, de-orphaning, straddling"),
             },
         )
 
@@ -1099,6 +1105,41 @@ def render_orders() -> None:
                         help="Target execution price = max(avgCost+putCost, mkt + COVER_STD_MULT×σ) × COVXPMULT"),
                     "margin":   st.column_config.NumberColumn("Margin",      format="$%,.0f",
                         help="Estimated margin per contract from atm_margin()"),
+                },
+            )
+
+    # Monthly Covered Calls
+    n_mc = len(df_monthly_cov)
+    mc_reward = _exp_cover_reward(df_monthly_cov)
+    mc_label = (
+        f"📅 Monthly CC — {n_mc} orders · ${mc_reward:,.0f} profit if called"
+        if n_mc else "📅 Monthly CC — 0 orders"
+    )
+    with st.expander(mc_label, expanded=True):
+        if _raw_monthly_cov.empty:
+            st.info(
+                "No monthly CC suggestions — run Generate Orders, or no monthly-only "
+                "uncovered positions, or symbol_categories.pkl missing (run Identify Weeklies)."
+            )
+        elif df_monthly_cov.empty:
+            st.info("No monthly CC orders match the current filter.")
+        else:
+            mc_cols = ["symbol", "right", "strike", "expiry", "dte", "qty",
+                       "undPrice", "sdev", "avgCost", "price", "xPrice", "margin"]
+            st.dataframe(
+                _banded(df_monthly_cov[[c for c in mc_cols if c in df_monthly_cov.columns]].copy()),
+                hide_index=True, width="stretch",
+                column_config={
+                    "qty":      st.column_config.NumberColumn("Qty",         format="%d"),
+                    "strike":   st.column_config.NumberColumn("Strike",      format="%.1f"),
+                    "undPrice": st.column_config.NumberColumn("Und Px",      format="$%,.2f"),
+                    "sdev":     st.column_config.NumberColumn("1σ Move",     format="$%,.2f",
+                        help="1-sigma expected underlying move = undPrice × IV × √(DTE/365)"),
+                    "avgCost":  st.column_config.NumberColumn("Avg Cost",    format="$%,.2f"),
+                    "price":    st.column_config.NumberColumn("Mkt Px",      format="$%,.2f"),
+                    "xPrice":   st.column_config.NumberColumn("Expected Px", format="$%,.2f",
+                        help="Target execution price = mkt px × COVXPMULT. Strike ≥ avgCost → breakeven or better if called."),
+                    "margin":   st.column_config.NumberColumn("Margin",      format="$%,.0f"),
                 },
             )
 
@@ -2424,7 +2465,39 @@ def render_history() -> None:
 
     # ── Controls ──────────────────────────────────────────────────────────────
     _api_ready = bool(token and qid)
-    if st.button(
+    _ctrl_trade, _ctrl_weekly = st.columns(2)
+
+    if _ctrl_weekly.button(
+        "🗓 Identify Weeklies",
+        key="btn_identify_weeklies",
+        help=(
+            "Classifies all S&P 500 symbols as weekly or monthly based on the option chain data "
+            "from the last build. Saves data/master/symbol_categories.pkl.\n\n"
+            "Run weekly (or after each build) to keep the monthly-only list current. "
+            "derive.py uses this to exclude monthly-only symbols from sow candidates and to "
+            "generate breakeven covered calls for monthly-only held stocks."
+        ),
+        width="stretch",
+    ):
+        with st.spinner("Classifying weekly/monthly symbols…"):
+            from scripts.update_symbol_categories import classify_weeklies
+            _cat_chains = _MASTER_DIR.parent.parent / "data" / "df_chains.pkl"
+            if not _cat_chains.exists():
+                st.error("df_chains.pkl not found — run Generate Orders (build) first.")
+            else:
+                _cat_df = pd.read_pickle(_cat_chains)
+                _sym_cat = classify_weeklies(_cat_df)
+                _sym_cat.to_pickle(_MASTER_DIR / "symbol_categories.pkl")
+                _n_weekly  = int(_sym_cat["is_weekly"].sum())
+                _n_monthly = int((~_sym_cat["is_weekly"]).sum())
+                _monthly_list = sorted(_sym_cat.loc[~_sym_cat["is_weekly"], "symbol"].tolist())
+                st.success(
+                    f"Saved symbol_categories.pkl — {_n_weekly} weekly, {_n_monthly} monthly-only."
+                )
+                if _monthly_list:
+                    st.caption(f"Monthly-only: {', '.join(_monthly_list)}")
+
+    if _ctrl_trade.button(
         "🔄 Update Trades",
         key="btn_flex_update",
         help=(
