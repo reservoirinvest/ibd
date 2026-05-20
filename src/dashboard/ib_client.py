@@ -545,6 +545,7 @@ class IBClient:
         await self._resubscribe_market_data()
         self._bootstrapped = True
         logger.info("Bootstrap complete — live resubscription enabled")
+        self._margin_pending = True
         await self._fetch_what_if_margins()
 
         # Start health check for this connection generation. Each successful connect
@@ -566,97 +567,98 @@ class IBClient:
         by that position.  Results are written to `_snap.positions` as
         `margin_init` and `margin_maint` columns.
         """
-        self._margin_pending = False
         assert self._ib is not None
+        try:
+            with self._snap_lock:
+                pos_df = self._snap.positions.copy()
 
-        with self._snap_lock:
-            pos_df = self._snap.positions.copy()
-
-        if pos_df.empty:
-            return
-
-        n = len(pos_df)
-        logger.info("Fetching what-if margin for {} positions …", n)
-
-        sem = asyncio.Semaphore(10)  # max 10 concurrent requests
-
-        async def _query_one(row: pd.Series) -> tuple[int, str, float, float]:
-            """Return (conId, account, init_margin, maint_margin)."""
-            contract = row.get("_contract")
-            qty = int(abs(row.get("position", 0)))
-            if contract is None or qty == 0:
-                return int(row["conId"]), str(row.get("account", "")), float("nan"), float("nan")
-            # Contracts from portfolioEvent often have a blank exchange field.
-            # SMART routes correctly for all US equities and options.
-            if not getattr(contract, "exchange", None):
-                contract.exchange = "SMART"
-            action = "BUY" if row["position"] < 0 else "SELL"
-            order = MarketOrder(action, qty)
-            # tif="DAY" must be set explicitly — without it TWS sends error 10349
-            # ("Order TIF was set to DAY based on order preset") which ib-async
-            # treats as a fatal error and resolves the future with [] before the
-            # openOrder callback (with margin data) arrives.
-            order.tif = "DAY"
-            # account routes the what-if to the correct account in a multi-account setup
-            order.account = str(row.get("account", ""))
-            async with sem:
-                try:
-                    state = await self._ib.whatIfOrderAsync(contract, order)
-
-                    def _parse(v: object) -> float:
-                        try:
-                            return abs(float(str(v)))  # type: ignore[arg-type]
-                        except (TypeError, ValueError):
-                            return float("nan")
-
-                    return (
-                        int(row["conId"]),
-                        str(row.get("account", "")),
-                        _parse(state.initMarginChange),
-                        _parse(state.maintMarginChange),
-                    )
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("whatIfOrder {} {}: {}", row.get("symbol", "?"), action, e)
-                    return (
-                        int(row["conId"]),
-                        str(row.get("account", "")),
-                        float("nan"),
-                        float("nan"),
-                    )
-
-        results = await asyncio.gather(*[_query_one(row) for _, row in pos_df.iterrows()])
-
-        # Build (conId, account) → (init, maint)
-        margin_map: dict[tuple[int, str], tuple[float, float]] = {
-            (con_id, acct): (init_m, maint_m) for con_id, acct, init_m, maint_m in results
-        }
-
-        margin_rows = [
-            {"conId": con_id, "account": acct, "margin_init": im, "margin_maint": mm}
-            for (con_id, acct), (im, mm) in margin_map.items()
-        ]
-        margin_df = (
-            pd.DataFrame(margin_rows)
-            if margin_rows
-            else pd.DataFrame(columns=["conId", "account", "margin_init", "margin_maint"])
-        )
-
-        with self._snap_lock:
-            df = self._snap.positions
-            if df.empty:
+            if pos_df.empty:
                 return
-            df = df.drop(columns=["margin_init", "margin_maint"], errors="ignore")
-            df = df.merge(margin_df, on=["conId", "account"], how="left")
-            self._snap.positions = df.reset_index(drop=True)
-            self._snap.margins_as_of = datetime.now(timezone.utc)
 
-        valid = [(im, mm) for _, _, im, mm in results if im == im]  # NaN check
-        total_init = sum(im for im, _ in valid)
-        logger.info(
-            "What-if margins done: {} positions, sum init margin ${:,.0f}",
-            len(valid),
-            total_init,
-        )
+            n = len(pos_df)
+            logger.info("Fetching what-if margin for {} positions …", n)
+
+            sem = asyncio.Semaphore(10)  # max 10 concurrent requests
+
+            async def _query_one(row: pd.Series) -> tuple[int, str, float, float]:
+                """Return (conId, account, init_margin, maint_margin)."""
+                contract = row.get("_contract")
+                qty = int(abs(row.get("position", 0)))
+                if contract is None or qty == 0:
+                    return int(row["conId"]), str(row.get("account", "")), float("nan"), float("nan")
+                # Contracts from portfolioEvent often have a blank exchange field.
+                # SMART routes correctly for all US equities and options.
+                if not getattr(contract, "exchange", None):
+                    contract.exchange = "SMART"
+                action = "BUY" if row["position"] < 0 else "SELL"
+                order = MarketOrder(action, qty)
+                # tif="DAY" must be set explicitly — without it TWS sends error 10349
+                # ("Order TIF was set to DAY based on order preset") which ib-async
+                # treats as a fatal error and resolves the future with [] before the
+                # openOrder callback (with margin data) arrives.
+                order.tif = "DAY"
+                # account routes the what-if to the correct account in a multi-account setup
+                order.account = str(row.get("account", ""))
+                async with sem:
+                    try:
+                        state = await self._ib.whatIfOrderAsync(contract, order)
+
+                        def _parse(v: object) -> float:
+                            try:
+                                return abs(float(str(v)))  # type: ignore[arg-type]
+                            except (TypeError, ValueError):
+                                return float("nan")
+
+                        return (
+                            int(row["conId"]),
+                            str(row.get("account", "")),
+                            _parse(state.initMarginChange),
+                            _parse(state.maintMarginChange),
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("whatIfOrder {} {}: {}", row.get("symbol", "?"), action, e)
+                        return (
+                            int(row["conId"]),
+                            str(row.get("account", "")),
+                            float("nan"),
+                            float("nan"),
+                        )
+
+            results = await asyncio.gather(*[_query_one(row) for _, row in pos_df.iterrows()])
+
+            # Build (conId, account) → (init, maint)
+            margin_map: dict[tuple[int, str], tuple[float, float]] = {
+                (con_id, acct): (init_m, maint_m) for con_id, acct, init_m, maint_m in results
+            }
+
+            margin_rows = [
+                {"conId": con_id, "account": acct, "margin_init": im, "margin_maint": mm}
+                for (con_id, acct), (im, mm) in margin_map.items()
+            ]
+            margin_df = (
+                pd.DataFrame(margin_rows)
+                if margin_rows
+                else pd.DataFrame(columns=["conId", "account", "margin_init", "margin_maint"])
+            )
+
+            with self._snap_lock:
+                df = self._snap.positions
+                if df.empty:
+                    return
+                df = df.drop(columns=["margin_init", "margin_maint"], errors="ignore")
+                df = df.merge(margin_df, on=["conId", "account"], how="left")
+                self._snap.positions = df.reset_index(drop=True)
+                self._snap.margins_as_of = datetime.now(timezone.utc)
+
+            valid = [(im, mm) for _, _, im, mm in results if im == im]  # NaN check
+            total_init = sum(im for im, _ in valid)
+            logger.info(
+                "What-if margins done: {} positions, sum init margin ${:,.0f}",
+                len(valid),
+                total_init,
+            )
+        finally:
+            self._margin_pending = False
 
     async def _resubscribe_market_data(self) -> None:
         """Subscribe to market data for currently held option contracts only."""

@@ -99,7 +99,7 @@ def run(api: bool = True, xml: bool = True) -> None:
         try:
             raw    = load_xml(_MASTER)
             df_xml = mask_accounts(normalize(raw), amap)
-            n_xml  = len(sorted(_MASTER.glob("flex_*.xml")))
+            n_xml  = len(sorted(_MASTER.glob("*.xml")))
             sources.append(df_xml)
             logger.info("XML: {} rows from {} file(s)", len(df_xml), n_xml)
         except FileNotFoundError:

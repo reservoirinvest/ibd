@@ -44,6 +44,15 @@ and 20-day annualised historical volatility (hv20).
 - OHLC monthly price history: split-adjusted monthly close prices for the last 24 months per \
 symbol. Use these to identify stock splits (sudden ≥40% price gap between months), trend context \
 at the time of trades, and price levels relative to option strikes.
+- Backtest scores: per-symbol Backtest Expert composite score 0–100 computed from historical \
+closed OPT trades (same source as Symbol Deep-Dive). Verdict: DEPLOY ≥70, REFINE 40–69, \
+ABANDON <40 or if any CRITICAL flag. Four sub-scores each 0–25: \
+sample (trade count/density — CRITICAL if <30 trades), \
+expectancy (profit factor — CRITICAL if PF<1.0), \
+risk (max drawdown — CRITICAL if >40%), \
+robustness (years tested — CRITICAL if <3 yrs, WARNING if <5 yrs). \
+Win rate = pnl>0 trades / total closed OPT trades (assignments with pnl=0 count in denominator). \
+Profit factor = gross profit / gross loss across all closed OPT trades for that symbol.
 - Live open IBKR orders: orders currently pending execution (symbol, secType, right, strike, \
 expiry, action, qty, remaining, limit price, status).
 - Suggested Orders from the Orders tab: Cover (sell covered calls on assigned stock), \
@@ -51,6 +60,13 @@ Sow (sell naked puts/calls to open new positions), Reap (buy-to-close profitable
 and Protect (buy puts for downside hedging). Each order row includes symbol, right (C/P), \
 strike, expiry, dte, qty (contracts), undPrice, xPrice (expected execution price), and a \
 pre-computed total. xPrice × qty × 100 = dollar value per row.
+- Consolidated NAV: daily total portfolio value (US + SG accounts combined), sourced from IBKR \
+Flex EquitySummaryByReportDateInBase. Reflects full MTM including unrealized P&L, dividends, \
+interest, and FX. Provided as month-end values for the last 13 months plus YTD and since-Jan-2025 \
+returns. Confirmed: Jan 1 2025 = $632,507; May 18 2026 = $954,938.
+- Cash transactions: deposits and withdrawals for the last 2 years (SGD amounts = SG account; \
+USD = US account; no FX conversion applied), plus dividends and broker interest aggregated by \
+year. Use these to understand capital injections, income, and to cross-check NAV changes.
 
 You can cross-reference all data sources to answer questions, including max-earning scenarios \
 from suggested orders.
@@ -303,6 +319,48 @@ def _format_context(context: dict) -> str:
             for sym, pairs in sorted(ph.items()):
                 month_map = {m: f"{v:.2f}" for m, v in pairs}
                 lines.append(sym + "," + ",".join(month_map.get(m, "") for m in all_months))
+
+    if "backtest_scores" in context:
+        bts: list[dict] = context["backtest_scores"]
+        lines.append(
+            "\n=== Backtest Scores per Symbol "
+            "(composite 0-100; sub-scores each 0-25: sample=trade density, "
+            "expect=profit factor, risk=drawdown, robust=years tested) ==="
+        )
+        lines.append("sym,score,verdict,n,wr%,pf,yrs,sample,expect,risk,robust,flags")
+        for r in bts:
+            lines.append(
+                f"{r['sym']},{r['score']},{r['verdict']},{r['n']},{r['wr%']}%,"
+                f"{r['pf']},{r['yrs']},{r['sample']},{r['expect']},{r['risk']},{r['robust']},"
+                f"{r['flags']}"
+            )
+
+    if "nav_summary" in context:
+        nav = context["nav_summary"]
+        lines.append("\n=== Consolidated NAV (US + SG accounts combined, from IBKR Flex) ===")
+        lines.append(f"Latest: ${nav['current']:,.0f} as of {nav['current_date']}")
+        if nav.get("ytd_return_pct") is not None:
+            lines.append(f"YTD return: {nav['ytd_return_pct']:+.2f}%")
+        if nav.get("since_jan2025_pct") is not None:
+            lines.append(f"Since 2025-01-01: {nav['since_jan2025_pct']:+.2f}%")
+        if nav.get("monthly"):
+            lines.append("Month-end NAV (last 13 months):")
+            for d, v in nav["monthly"]:
+                lines.append(f"  {d}: ${v:,}")
+
+    if "cash_summary" in context:
+        cash = context["cash_summary"]
+        lines.append("\n=== Cash Transactions ===")
+        if cash.get("recent_dw"):
+            lines.append("Deposits/Withdrawals last 2 years (SGD amounts = SG account; USD = US account):")
+            for r in cash["recent_dw"]:
+                lines.append(f"  {r['date']}  {r['currency']} {r['amount']:+,.2f}")
+        if cash.get("dividends_by_year"):
+            div_str = "  ".join(f"{y}: ${v:,}" for y, v in sorted(cash["dividends_by_year"].items()))
+            lines.append(f"Dividends by year (USD equivalent): {div_str}")
+        if cash.get("interest_by_year"):
+            int_str = "  ".join(f"{y}: ${v:,}" for y, v in sorted(cash["interest_by_year"].items()))
+            lines.append(f"Broker interest by year (USD equivalent): {int_str}")
 
     if "open_orders" in context:
         df_oo = context["open_orders"]

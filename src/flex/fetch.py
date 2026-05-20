@@ -65,17 +65,17 @@ def _load_one_xml(xml_path: Path) -> pd.DataFrame:
 
 
 def load_xml(xml_dir: Path) -> pd.DataFrame:
-    """Load all flex_*.xml files from a directory and return a merged DataFrame.
+    """Load all *.xml files from a directory and return a merged DataFrame.
 
-    IBKR caps each query run at 365 days, so split a 5-year history into
-    5 files: flex_1.xml … flex_5.xml (or any flex_*.xml names) in xml_dir.
+    IBKR caps each query run at 365 days, so download one file per year
+    (e.g. 2021.xml, 2022.xml … 2026.xml) and place them all in xml_dir.
     Files are merged and deduplicated on trade ID.
     """
-    xml_files = sorted(xml_dir.glob("flex_*.xml"))
+    xml_files = sorted(xml_dir.glob("*.xml"))
     if not xml_files:
         raise FileNotFoundError(
-            f"No flex_*.xml files found in {xml_dir}. "
-            "Download from portal and save as flex_1.xml, flex_2.xml, etc."
+            f"No *.xml files found in {xml_dir}. "
+            "Download from portal (one file per year) and save as 2021.xml, 2022.xml, etc."
         )
     logger.info("Found {} XML files to load", len(xml_files))
 
@@ -157,6 +157,144 @@ def download_trades(
 
     combined = _dedup(pd.concat(frames, ignore_index=True), context="download_trades")
     logger.info("API download total rows={}", len(combined))
+    return combined
+
+
+def _load_cash_from_report(report: FlexReport) -> pd.DataFrame:
+    """Extract CashTransaction topic from a FlexReport. Returns empty DataFrame if absent."""
+    if "CashTransaction" not in report.topics():
+        return pd.DataFrame()
+    df = report.df("CashTransaction")
+    return df if (df is not None and not df.empty) else pd.DataFrame()
+
+
+def load_cash_xml(xml_dir: Path) -> pd.DataFrame:
+    """Load CashTransaction rows from all *.xml files in xml_dir."""
+    frames: list[pd.DataFrame] = []
+    for f in sorted(xml_dir.glob("*.xml")):
+        try:
+            df = _load_cash_from_report(FlexReport(path=str(f)))
+            if not df.empty:
+                frames.append(df)
+        except Exception as e:
+            logger.warning("Cash XML {}: {}", f.name, e)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def download_cash_transactions(
+    token: str,
+    query_ids: str,
+    inter_query_delay: float = 2.0,
+) -> pd.DataFrame:
+    """Download CashTransaction rows via Flex Web Service API (same query IDs as trades).
+
+    Returns empty DataFrame if the Flex Query has no CashTransaction section.
+    """
+    ids = [q.strip() for q in query_ids.split(",") if q.strip()]
+    frames: list[pd.DataFrame] = []
+    for i, qid in enumerate(ids):
+        if i > 0:
+            time.sleep(inter_query_delay)
+        try:
+            df = _load_cash_from_report(FlexReport(token=token, queryId=qid))
+            if not df.empty:
+                frames.append(df)
+            else:
+                logger.info("query_id={} has no CashTransaction section or returned 0 rows", qid)
+        except Exception as e:
+            logger.warning("Cash API query_id={} failed: {}", qid, e)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def merge_cash_into_pickle(new_df: pd.DataFrame, pkl_path: Path) -> pd.DataFrame:
+    """Merge new cash transactions into pkl, deduplicating on natural key."""
+    if pkl_path.exists():
+        existing = pd.read_pickle(pkl_path)
+        combined = pd.concat([existing, new_df], ignore_index=True)
+    else:
+        combined = new_df.copy()
+
+    _key = [c for c in ("accountId", "date", "amount", "currency", "description") if c in combined.columns]
+    if _key:
+        before = len(combined)
+        combined = combined.drop_duplicates(subset=_key)
+        if (dropped := before - len(combined)):
+            logger.info("Cash dedup removed {} duplicate rows", dropped)
+
+    pkl_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_pickle(pkl_path)
+    logger.info("Saved cash transactions rows={} path={}", len(combined), pkl_path)
+    return combined
+
+
+def _load_nav_from_report(report: FlexReport) -> pd.DataFrame:
+    """Extract EquitySummaryByReportDateInBase from a FlexReport. Returns empty DataFrame if absent."""
+    if "EquitySummaryByReportDateInBase" not in report.topics():
+        return pd.DataFrame()
+    df = report.df("EquitySummaryByReportDateInBase")
+    return df if (df is not None and not df.empty) else pd.DataFrame()
+
+
+def load_nav_xml(xml_dir: Path) -> pd.DataFrame:
+    """Load daily consolidated NAV from all *.xml files in xml_dir.
+
+    Two-step aggregation:
+      1. Within each file: sum per-account rows → single daily total per file.
+      2. Across files: dedup by date (keep last) — adjacent year XMLs share boundary
+         dates with identical values; summing across files would double-count them.
+
+    Returns DataFrame with columns [reportDate (Timestamp), total (float)].
+    """
+    file_navs: list[pd.DataFrame] = []
+    for f in sorted(xml_dir.glob("*.xml")):
+        try:
+            df = _load_nav_from_report(FlexReport(path=str(f)))
+            if df.empty:
+                continue
+            df = df[["reportDate", "total"]].copy()
+            df["reportDate"] = pd.to_datetime(
+                df["reportDate"].astype(str), format="%Y%m%d", errors="coerce"
+            )
+            df["total"] = pd.to_numeric(df["total"], errors="coerce")
+            df = df[df["total"].notna() & (df["total"] != 0)]
+            if df.empty:
+                continue
+            # Step 1 — sum per-account rows within this file
+            daily = df.groupby("reportDate")["total"].sum().reset_index()
+            file_navs.append(daily)
+        except Exception as e:
+            logger.warning("NAV XML {}: {}", f.name, e)
+
+    if not file_navs:
+        return pd.DataFrame()
+
+    # Step 2 — dedup across files by date (overlap boundary dates contain identical values)
+    nav_daily = (
+        pd.concat(file_navs, ignore_index=True)
+        .sort_values("reportDate")
+        .drop_duplicates(subset=["reportDate"], keep="last")
+        .reset_index(drop=True)
+    )
+    logger.info("NAV: {} daily rows from {} file(s)", len(nav_daily), len(file_navs))
+    return nav_daily
+
+
+def merge_nav_into_pickle(new_df: pd.DataFrame, pkl_path: Path) -> pd.DataFrame:
+    """Merge new daily NAV rows into pkl, deduplicating by reportDate (keep last)."""
+    if pkl_path.exists():
+        existing = pd.read_pickle(pkl_path)
+        combined = pd.concat([existing, new_df], ignore_index=True)
+    else:
+        combined = new_df.copy()
+    if "reportDate" in combined.columns:
+        combined = (
+            combined.sort_values("reportDate")
+            .drop_duplicates(subset=["reportDate"], keep="last")
+            .reset_index(drop=True)
+        )
+    pkl_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_pickle(pkl_path)
+    logger.info("Saved NAV rows={} path={}", len(combined), pkl_path)
     return combined
 
 

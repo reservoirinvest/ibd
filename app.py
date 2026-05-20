@@ -119,11 +119,6 @@ st.markdown(
         padding: 0 0.5rem !important;
         border-bottom: 1px solid rgba(128, 128, 128, 0.15) !important;
     }
-    /* KPI column: clip table to its flex width; min-width:0 lets flex actually shrink it */
-    .kpi-bar-fixed [data-testid="stColumn"]:first-child {
-        overflow: hidden !important;
-        min-width: 0 !important;
-    }
     /* Ask AI column: allow natural height (answer expander drives it) */
     .ask-ai-col { overflow: visible !important; min-width: 0 !important; }
     /* Answer box — text wraps, no horizontal scroll on prose */
@@ -163,9 +158,8 @@ st.markdown(
     .kpi-row-a { background-color: rgba(128,128,128,0.04); }
     .kpi-row-b { background-color: rgba(128,128,128,0.1); }
     .kpi-breach { color: #ef4444 !important; }
-    /* Left padding on the second/third label — visual gap between pairs */
+    /* Left padding on non-first labels — visual gap between pairs */
     .kpi-lbl2 { padding-left: 1.2rem !important; }
-    .kpi-lbl3 { padding-left: 1.2rem !important; }
     /* Tooltip trigger (?) inside KPI table — circle badge, hover-friendly */
     .kpi-help {
         cursor: help; opacity: 0.65; font-size: 0.72rem; line-height: 1;
@@ -641,65 +635,68 @@ def kpi_strip() -> None:
     _dr_lbl1 = _lbl(_dr_r1_lbl, _dr_r1_tip) if _dr_r1_lbl else ""
     _dr_lbl4 = _lbl(_dr_r4_lbl, _dr_r4_tip) if _dr_r4_lbl else ""
 
-    # col1 = NLV/Cushion/Leverage-S/Dividend/Stock Value/Buying Power
-    # col2 = risk metrics (drop withstand, excess liq, opt value, maint margin, init margin, …)
-    # col3 = greeks (rows 1–4 only)
-    rows: list[tuple[str, str, str, str, str, str, str, str, str]] = [
+    # 10-column table: 5 label-value pairs per row → 4 rows total (thinner than 6-row 3-pair layout)
+    rows: list[tuple] = [
+        # Row 1: NLV | Drop withstand | ΣΔ($) | Cushion | Excess Liq
         (
             _lbl("NLV", "Net Liquidation Value: total portfolio value including cash, stocks and options at current market prices."),
             money(k["nlv"]), "",
             _dr_lbl1, _dr_r1_val, "",
-            _lbl("&#x3A3;&#x394; ($)", "Portfolio Dollar Delta: P&amp;L change for a 1-point broad market move. Sum of position × delta × 100 × underlying price across all positions."),
+            _lbl("&#x3A3;&#x394; ($)", "Portfolio Dollar Delta: P&amp;L change for a 1-point broad market move."),
             signed_money(g["delta_$"]), "",
-        ),
-        (
             _lbl(f"Cushion (min {min_c_pct})", f"Margin cushion = Excess Liquidity ÷ NLV. Alert threshold: {min_c_pct}. Breach turns red."),
             pct(k["cushion"]), c_cls,
-            _lbl("Excess Liq", "Excess Liquidity: funds available above the maintenance margin requirement. Reaching zero triggers a margin call."),
+            _lbl("Excess Liq", "Excess Liquidity: funds available above the maintenance margin requirement."),
             money(k["excess_liquidity"]), "",
-            _lbl("&#x3A3;&#x398; ($/d)", "Portfolio Dollar Theta: daily time decay across all options in dollars. Positive = net premium seller collecting theta."),
-            signed_money(g["theta_$"]), "",
         ),
+        # Row 2: Leverage-S | Opt Value | ΣΘ($/d) | Dividend | Maint Margin
         (
             _lbl("Leverage-S", "Short leverage: portfolio exposure ÷ equity. Higher = more leveraged (Leverage-S)."),
             f"{leverage_s:.2f}×", "",
             _lbl("Opt Value", "Option Market Value: total mark-to-market value of all option positions."),
             money(opt_val), "",
-            _lbl("&#x3A3;&#x3B3; ($)", "Portfolio Dollar Gamma: rate of change of dollar delta per 1-point move. Positive gamma means delta grows in your favour as the market moves."),
-            signed_money(g["gamma_$"]), "",
-        ),
-        (
+            _lbl("&#x3A3;&#x398; ($/d)", "Portfolio Dollar Theta: daily time decay across all options in dollars. Positive = net premium seller collecting theta."),
+            signed_money(g["theta_$"]), "",
             _lbl("Dividend", "Accrued dividends not yet received (AccruedDividend)."),
             money(dividend), "",
             _lbl("Maint Margin", "Maintenance Margin Requirement: minimum equity you must hold to keep current positions open."),
             money(k["maint_margin"]), "",
-            _lbl("&#x3A3;&#x3BD; ($)", "Portfolio Dollar Vega: P&amp;L sensitivity to a 1% rise in implied volatility across all options."),
-            signed_money(g["vega_$"]), "",
         ),
+        # Row 3: Stock Value | Init Margin | ΣΓ($) | Buying Power | Avail Funds
         (
             _lbl("Stock Value", "Total market value of all stock positions at current prices (StockMarketValue)."),
             money(stock_val), "",
             _lbl("Init Margin", "Initial Margin Requirement: equity needed to open current positions (InitMarginReq)."),
             money(init_mg), "",
+            _lbl("&#x3A3;&#x3B3; ($)", "Portfolio Dollar Gamma: rate of change of dollar delta per 1-point move."),
+            signed_money(g["gamma_$"]), "",
+            _lbl("Buying Power", "Maximum new position size without adding more funds (BuyingPower)."),
+            money(buy_pow), "",
             _lbl("Avail Funds", "Funds available for trading above the maintenance margin (AvailableFunds)."),
             money(avail_fnds), "",
         ),
+        # Row 4: ΣΝ($) | dr_r4 | (empty × 3)
         (
-            _lbl("Buying Power", "Maximum new position size without adding more funds (BuyingPower)."),
-            money(buy_pow), "",
+            _lbl("&#x3A3;&#x3BD; ($)", "Portfolio Dollar Vega: P&amp;L sensitivity to a 1% rise in implied volatility across all options."),
+            signed_money(g["vega_$"]), "",
             _dr_lbl4, _dr_r4_val, "",
+            "", "", "",
+            "", "", "",
             "", "", "",
         ),
     ]
 
     html_parts = ['<table class="kpi-tbl">']
-    for i, (l1, v1, cls1, l2, v2, cls2, l3, v3, cls3) in enumerate(rows):
+    for i, row in enumerate(rows):
+        l1,v1,cls1, l2,v2,cls2, l3,v3,cls3, l4,v4,cls4, l5,v5,cls5 = row
         rc = "kpi-row-a" if i % 2 == 0 else "kpi-row-b"
         html_parts.append(
             f'<tr class="{rc}">'
             f'<td class="kpi-lbl">{l1}</td><td class="kpi-val"{cls1}>{v1}</td>'
             f'<td class="kpi-lbl kpi-lbl2">{l2}</td><td class="kpi-val"{cls2}>{v2}</td>'
-            f'<td class="kpi-lbl kpi-lbl3">{l3}</td><td class="kpi-val"{cls3}>{v3}</td>'
+            f'<td class="kpi-lbl kpi-lbl2">{l3}</td><td class="kpi-val"{cls3}>{v3}</td>'
+            f'<td class="kpi-lbl kpi-lbl2">{l4}</td><td class="kpi-val"{cls4}>{v4}</td>'
+            f'<td class="kpi-lbl kpi-lbl2">{l5}</td><td class="kpi-val"{cls5}>{v5}</td>'
             f'</tr>'
         )
     html_parts.append('</table>')
@@ -882,12 +879,38 @@ def render_orders() -> None:
 
     # ── Clear Data ─────────────────────────────────────────────────────────────
     with clr_col:
+        @st.dialog("⚠️ Confirm Clear Data", width="small")
+        def _confirm_clear(files: list[str]):
+            st.markdown(
+                "The following files in `data/` will be **permanently deleted** "
+                "(`data/master/` is kept):"
+            )
+            st.markdown("\n".join(f"- `{f}`" for f in files))
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🗑️ Delete", width="stretch"):
+                    st.session_state["_clear_confirmed"] = True
+                    st.rerun()
+            with col2:
+                if st.button("❌ Cancel", width="stretch"):
+                    st.rerun()
+
         if st.button(
             "🗑️ Clear Data",
             width="stretch",
             help="Delete all top-level files in data/ (pickles, JSONs). "
                  "data/master/ (OHLC store) is never deleted.",
         ):
+            _files_to_clear = sorted(
+                p.name for p in _DATA_DIR.iterdir() if p.is_file()
+            )
+            if _files_to_clear:
+                _confirm_clear(_files_to_clear)
+            else:
+                st.toast("No files to clear.")
+
+        if st.session_state.get("_clear_confirmed"):
+            st.session_state.pop("_clear_confirmed", None)
             _cleared, _locked = [], []
             for _p in sorted(_DATA_DIR.iterdir()):
                 if not _p.is_file():
@@ -1513,7 +1536,7 @@ def render_analysis() -> None:
             if _pf_c6.button("✕ Clear", key="pf_clear_filter", width="stretch"):
                 for _k in ("pf_sym", "pf_sectype", "pf_f_state", "pf_dte_sel"):
                     st.session_state.pop(_k, None)
-                st.session_state["pf_itm_only"] = False
+                st.session_state.pop("pf_itm_only", None)
                 st.rerun()
 
             # Apply filters
@@ -2296,6 +2319,451 @@ def _fmt_date_col(s: pd.Series, fallback: str = "?") -> pd.Series:
     return s.astype(str).str[:10].fillna(fallback)
 
 
+_PERF_CHART_DEFAULT_NAV = 632_507
+_DEFAULT_PERF_START     = pd.Timestamp("2025-08-08")   # default display window start
+_PERF_CHART_REF_DATE    = pd.Timestamp("2025-08-08")   # fixed anchor for reference NAV cards
+
+
+def _render_perf_chart(
+    flex_path: Path, ohlc_path: Path, cash_path: Path, nav_path: Path
+) -> None:
+    """Cumulative performance vs. SPY/QQQ benchmark — shown above Trade History & Backtest."""
+    import math
+
+    with st.expander("📈 Cumulative Performance vs. Benchmark", expanded=True):
+
+        # ── Guards ────────────────────────────────────────────────────────
+        if not flex_path.exists() or not ohlc_path.exists():
+            st.info(
+                "Requires flex_trades.pkl and ohlc.pkl — "
+                "update trades (🔄 Update Trades) and run OHLC update first."
+            )
+            return
+        try:
+            df_flex: pd.DataFrame = pd.read_pickle(flex_path)
+            ohlc: dict = pd.read_pickle(ohlc_path)
+        except Exception:
+            st.warning("Could not load performance data — pickle read error.")
+            return
+
+        _required = {"dateTime", "pnl", "assetCategory", "openCloseIndicator"}
+        if df_flex.empty or not _required.issubset(df_flex.columns):
+            st.info("No trade data yet — click 🔄 Update Trades.")
+            return
+
+        spy_df = ohlc.get("SPY")
+        if spy_df is None or spy_df.empty or "Close" not in spy_df.columns:
+            st.warning("SPY OHLC data missing — run OHLC Update to enable this chart.")
+            return
+
+        # ── Load consolidated NAV (full history, unclipped) ───────────────
+        _nav_series_full = pd.Series(dtype=float)
+        if nav_path.exists():
+            try:
+                _df_nav = pd.read_pickle(nav_path)
+                if not _df_nav.empty and {"reportDate", "total"}.issubset(_df_nav.columns):
+                    _nav_series_full = _df_nav.set_index("reportDate")["total"].sort_index()
+            except Exception:
+                pass
+        _have_nav = len(_nav_series_full) >= 2
+
+        # ── Load USD cash flows for TWR adjustment ─────────────────────────
+        _cf_daily = pd.Series(dtype=float)
+        if cash_path.exists():
+            try:
+                _df_cash_raw = pd.read_pickle(cash_path)
+                if not _df_cash_raw.empty and {"type", "amount", "date", "currency"}.issubset(
+                    _df_cash_raw.columns
+                ):
+                    _usd_dw = _df_cash_raw[
+                        _df_cash_raw["type"].str.contains("Deposit|Withdraw", case=False, na=False)
+                        & (_df_cash_raw["currency"] == "USD")
+                        & (_df_cash_raw["amount"].abs() >= 500.0)
+                    ].copy()
+                    _usd_dw["date"] = pd.to_datetime(_usd_dw["date"])
+                    _cf_daily = _usd_dw.groupby("date")["amount"].sum()
+            except Exception:
+                pass
+
+        # ── OPT P&L series (full history) ─────────────────────────────────
+        closed_opt = df_flex[
+            (df_flex["openCloseIndicator"] == "C") &
+            (df_flex["assetCategory"] == "OPT")
+        ].copy()
+        if closed_opt.empty:
+            st.info("No closed option trades found in flex_trades.pkl.")
+            return
+        closed_opt["_date"] = pd.to_datetime(closed_opt["dateTime"]).dt.normalize()
+        daily_pnl: pd.Series = closed_opt.groupby("_date")["pnl"].sum().sort_index()
+
+        # ── t0 = earliest data (trades or NAV) — no floor applied ─────────
+        t0_trades = daily_pnl.index.min()
+        t0_nav    = _nav_series_full.index.min() if _have_nav else t0_trades
+        t0        = min(t0_trades, t0_nav)
+        _today    = pd.Timestamp.today().normalize()
+
+        # ── Controls: date pickers first so values feed metric cards ─────────
+        _c1, _c2, _c3, _c4, _c5 = st.columns([2, 2, 2, 1, 1])
+        _default_start = max(_DEFAULT_PERF_START.date(), t0.date())
+        _d_start = _c4.date_input(
+            "From",
+            value=_default_start,
+            min_value=t0.date(),
+            max_value=_today.date(),
+            key="perf_date_start",
+        )
+        _d_end = _c5.date_input(
+            "To",
+            value=_today.date(),
+            min_value=t0.date(),
+            max_value=_today.date(),
+            key="perf_date_end",
+        )
+        if _d_start >= _d_end:
+            st.warning("'From' date must be earlier than 'To' date.")
+            return
+        _d_start_ts = pd.Timestamp(_d_start)
+        _d_end_ts   = pd.Timestamp(_d_end)
+
+        _d_start_lbl = _d_start.strftime("%d-%b-%Y")
+        _d_end_lbl   = _d_end.strftime("%d-%b-%Y")
+
+        if _have_nav:
+            _avail_before = _nav_series_full[_nav_series_full.index <= _d_start_ts]
+            starting_capital = (
+                float(_avail_before.iloc[-1]) if not _avail_before.empty
+                else float(_nav_series_full.iloc[0])
+            )
+            _avail_at_end = _nav_series_full[_nav_series_full.index <= _d_end_ts]
+            _ending_nav   = float(_avail_at_end.iloc[-1]) if not _avail_at_end.empty else None
+            _period_gain  = (_ending_nav - starting_capital) if _ending_nav is not None else None
+            _period_ret   = (
+                ((_ending_nav / starting_capital - 1) * 100)
+                if (_ending_nav is not None and starting_capital > 0) else None
+            )
+            _c1.metric(
+                f"Consolidated NAV ({_d_start_lbl})",
+                f"${starting_capital:,.0f}",
+                help="Flex consolidated NAV (US + SG) at the 'From' date.",
+            )
+            if _ending_nav is not None:
+                _c2.metric(
+                    f"Consolidated NAV ({_d_end_lbl})",
+                    f"${_ending_nav:,.0f}",
+                    delta=f"{_period_ret:+.1f}% vs {_d_start_lbl}" if _period_ret is not None else None,
+                )
+            if _period_gain is not None:
+                _c3.metric(
+                    "Period Gain / Loss",
+                    f"${_period_gain:+,.0f}",
+                    help=f"Consolidated NAV change from {_d_start_lbl} to {_d_end_lbl}.",
+                )
+        else:
+            starting_capital = _c1.number_input(
+                "NAV at Period Start ($)",
+                min_value=10_000, max_value=100_000_000,
+                value=st.session_state.get("perf_start_capital", _PERF_CHART_DEFAULT_NAV),
+                step=1_000, format="%d", key="perf_start_capital",
+                help="Consolidated NAV at the display start date — base for OPT P&L % chart.",
+            )
+
+        # ── Full-period bdays for OPT P&L proxy ───────────────────────────
+        bdays = pd.bdate_range(start=t0, end=_today)
+        cum_pnl = daily_pnl.reindex(bdays, fill_value=0.0).cumsum()
+        _cum_before_start = cum_pnl[cum_pnl.index <= _d_start_ts]
+        _cum_at_start    = float(_cum_before_start.iloc[-1]) if not _cum_before_start.empty else 0.0
+        options_nav_full = starting_capital + (cum_pnl - _cum_at_start)
+
+        # NAV reindexed to bdays for bar chart
+        _nav_bdays_full = (
+            _nav_series_full.reindex(bdays, method="ffill")
+            if _have_nav else pd.Series(dtype=float)
+        )
+
+        # ── Raw benchmark closes (reindex to bdays) ────────────────────────
+        def _raw_closes(df_ohlc: pd.DataFrame) -> pd.Series:
+            closes = df_ohlc["Close"].sort_index()
+            return closes[closes.index >= t0].reindex(bdays, method="ffill").dropna()
+
+        spy_closes  = _raw_closes(spy_df)
+        qqq_df      = ohlc.get("QQQ")
+        qqq_closes  = (
+            _raw_closes(qqq_df)
+            if qqq_df is not None and "Close" in qqq_df.columns
+            else pd.Series(dtype=float)
+        )
+
+        # ── Cash markers (all events from t0 onwards) ─────────────────────
+        _dep_events: pd.DataFrame = pd.DataFrame()
+        if cash_path.exists():
+            try:
+                _df_cash = pd.read_pickle(cash_path)
+                if not _df_cash.empty and {"type", "amount", "date"}.issubset(_df_cash.columns):
+                    _dw = _df_cash[
+                        _df_cash["type"].str.contains("Deposit|Withdraw", case=False, na=False)
+                        & (_df_cash["amount"].abs() >= 1.0)
+                        & (_df_cash["date"] >= t0)
+                    ].copy()
+                    if not _dw.empty:
+                        _dep_events = _dw[["date", "amount", "currency"]].copy()
+            except Exception:
+                pass
+
+        # ── TWR: strips out USD deposit effects from the Consolidated % line ─
+        # Consecutive NAV changes adjusted for any USD cash flows in the interval.
+        # SGD deposits are not converted (no FX rates) and remain in the raw NAV.
+        def _compute_twr(nav_s: pd.Series, cf: pd.Series, start_ts, end_ts) -> pd.Series:
+            nav = nav_s[(nav_s.index >= start_ts) & (nav_s.index <= end_ts)]
+            if len(nav) < 2:
+                return pd.Series(dtype=float)
+            cumulative = 1.0
+            prev_val  = float(nav.iloc[0])
+            prev_date = nav.index[0]
+            result: dict = {prev_date: 0.0}
+            for date in nav.index[1:]:
+                # Sum any USD flows that settled between prev_date and this NAV date
+                cf_in_period = float(
+                    cf[(cf.index > prev_date) & (cf.index <= date)].sum()
+                    if not cf.empty else 0.0
+                )
+                curr_val = float(nav.loc[date])
+                denom = prev_val + cf_in_period
+                cumulative *= curr_val / denom if denom > 0 else 1.0
+                result[date] = (cumulative - 1.0) * 100.0
+                prev_val  = curr_val
+                prev_date = date
+            s = pd.Series(result)
+            return s.reindex(pd.bdate_range(start_ts, end_ts), method="ffill").dropna()
+
+        # ── Clip & rebase (for OPT P&L, SPY, QQQ — no deposit adjustment) ─
+        def _clip_rebase(series: pd.Series) -> pd.Series:
+            s = series[(series.index >= _d_start_ts) & (series.index <= _d_end_ts)]
+            if len(s) < 2:
+                return pd.Series(dtype=float)
+            return (s / s.iloc[0] - 1.0) * 100.0
+
+        nav_index = (
+            _compute_twr(_nav_series_full, _cf_daily, _d_start_ts, _d_end_ts)
+            if _have_nav else pd.Series(dtype=float)
+        )
+        opt_index = _clip_rebase(options_nav_full)
+        spy_index = _clip_rebase(spy_closes)
+        qqq_index = _clip_rebase(qqq_closes) if not qqq_closes.empty else pd.Series(dtype=float)
+
+        if opt_index.empty and nav_index.empty:
+            st.info("No data in the selected date range.")
+            return
+
+        # Display-range dollar series (for bar chart and hover customdata)
+        _nav_display = (
+            _nav_bdays_full[
+                (_nav_bdays_full.index >= _d_start_ts) & (_nav_bdays_full.index <= _d_end_ts)
+            ] if _have_nav else pd.Series(dtype=float)
+        )
+        _opt_display = options_nav_full[
+            (options_nav_full.index >= _d_start_ts) & (options_nav_full.index <= _d_end_ts)
+        ]
+
+        # ── Metrics ───────────────────────────────────────────────────────
+        _primary_pct = nav_index if not nav_index.empty else opt_index
+        _primary_nav = _nav_display if (_have_nav and not _nav_display.empty) else _opt_display
+
+        display_pnl = (
+            float(_opt_display.iloc[-1] - _opt_display.iloc[0])
+            if len(_opt_display) >= 2 else 0.0
+        )
+        _consolidated_ret = float(_primary_pct.iloc[-1]) if not _primary_pct.empty else 0.0
+        spy_ret_pct = float(spy_index.iloc[-1]) if not spy_index.empty else None
+        alpha_pp    = (_consolidated_ret - spy_ret_pct) if spy_ret_pct is not None else None
+
+        # Max drawdown with peak→trough dates (on the % series)
+        max_dd, _dd_period = 0.0, ""
+        if not _primary_pct.empty:
+            _pct1    = 1.0 + _primary_pct / 100.0
+            _peak_tw = _pct1.cummax()
+            _dd_tw   = (_pct1 / _peak_tw - 1.0) * 100.0
+            max_dd   = float(_dd_tw.min())
+            _dd_trough = _dd_tw.idxmin()
+            _to_trough = _pct1[:_dd_trough]
+            _dd_peak   = _to_trough.idxmax() if len(_to_trough) > 0 else _dd_trough
+            _dd_period = f"{_dd_peak.strftime('%b %d, %Y')} → {_dd_trough.strftime('%b %d, %Y')}"
+
+        _daily_ret = (
+            _primary_nav.pct_change()
+            .replace([float("inf"), float("-inf")], float("nan"))
+            .dropna()
+        )
+        sharpe = (
+            float(_daily_ret.mean() / _daily_ret.std() * math.sqrt(252))
+            if len(_daily_ret) >= 2 and _daily_ret.std() > 0
+            else 0.0
+        )
+
+        _m1, _m2, _m3, _m4, _m5 = st.columns(5)
+        _m1.metric(
+            "Realized OPT P&L", f"${display_pnl:,.0f}",
+            help=f"Closed OPT trade P&L for {_d_start} → {_d_end}.",
+        )
+        _m2.metric(
+            "Consolidated TWR" if _have_nav else "Portfolio Return",
+            f"{_consolidated_ret:+.1f}%",
+            help=(
+                f"Time-weighted return of consolidated NAV (USD deposits stripped). "
+                f"SGD deposits are not FX-adjusted. Zeroed at {_d_start}."
+                if _have_nav
+                else f"Closed OPT P&L % return zeroed at {_d_start}. Update Trades to load Flex NAV."
+            ),
+        )
+        _m3.metric(
+            "Alpha vs SPY",
+            f"{alpha_pp:+.1f} pp" if alpha_pp is not None else "N/A",
+            help="Consolidated TWR minus SPY price return over the displayed period.",
+        )
+        _m4.metric(
+            "Max Drawdown", f"{max_dd:.1f}%",
+            delta=_dd_period if _dd_period else None,
+            delta_color="off",
+            help="Worst peak-to-trough drawdown in the primary return series. Delta shows the drawdown window.",
+        )
+        _m5.metric(
+            "Sharpe Ratio", f"{sharpe:.2f}",
+            help="Annualised Sharpe ratio (daily NAV returns × √252, no risk-free rate).",
+        )
+
+        # ── Chart ─────────────────────────────────────────────────────────
+        # Y-axes: Consolidated NAV ($) on LEFT (primary), % return on RIGHT (secondary).
+        fig = go.Figure()
+
+        # NAV $ bars on PRIMARY (left) axis
+        _bar_y     = _nav_display if (_have_nav and not _nav_display.empty) else _opt_display
+        _bar_label = "Consolidated NAV ($)" if _have_nav else "OPT NAV ($)"
+        if not _bar_y.empty:
+            fig.add_trace(go.Bar(
+                x=_bar_y.index, y=_bar_y.values,
+                name=_bar_label,
+                marker_color="rgba(148,163,184,0.22)",
+                yaxis="y",
+                hovertemplate=f"$%{{y:,.0f}}<extra>{_bar_label}</extra>",
+            ))
+
+        # All % lines on SECONDARY (right) axis
+        if _have_nav and not nav_index.empty:
+            _nav_text  = [f"{v:+.2f}%" for v in nav_index.values]
+            _nav_equiv = _nav_display.reindex(nav_index.index, method="ffill").values
+            fig.add_trace(go.Scatter(
+                x=nav_index.index, y=nav_index.values,
+                customdata=_nav_equiv, text=_nav_text,
+                name="Consolidated", yaxis="y2",
+                line=dict(color="#a78bfa", width=2.5),
+                hovertemplate="%{text}  $%{customdata:,.0f}<extra>Consolidated</extra>",
+            ))
+
+        if not opt_index.empty:
+            _opt_text  = [f"{v:+.2f}%" for v in opt_index.values]
+            _opt_equiv = _opt_display.reindex(opt_index.index, method="ffill").values
+            fig.add_trace(go.Scatter(
+                x=opt_index.index, y=opt_index.values,
+                customdata=_opt_equiv, text=_opt_text,
+                name="OPT P&L", yaxis="y2",
+                line=dict(color="#60a5fa", width=1.5, dash="dash" if _have_nav else "solid"),
+                hovertemplate="%{text}  $%{customdata:,.0f}<extra>OPT P&L</extra>",
+            ))
+
+        if not spy_index.empty:
+            _spy_text  = [f"{v:+.2f}%" for v in spy_index.values]
+            spy_equiv  = ((spy_index / 100.0 + 1.0) * starting_capital).values
+            fig.add_trace(go.Scatter(
+                x=spy_index.index, y=spy_index.values,
+                customdata=spy_equiv, text=_spy_text,
+                name="SPY", yaxis="y2",
+                line=dict(color="#34d399", width=1.5),
+                hovertemplate="%{text}  $%{customdata:,.0f}<extra>SPY</extra>",
+            ))
+        if not qqq_index.empty:
+            _qqq_text  = [f"{v:+.2f}%" for v in qqq_index.values]
+            qqq_equiv  = ((qqq_index / 100.0 + 1.0) * starting_capital).values
+            fig.add_trace(go.Scatter(
+                x=qqq_index.index, y=qqq_index.values,
+                customdata=qqq_equiv, text=_qqq_text,
+                name="QQQ", yaxis="y2",
+                line=dict(color="#fbbf24", width=1.5, dash="dot"),
+                hovertemplate="%{text}  $%{customdata:,.0f}<extra>QQQ</extra>",
+            ))
+
+        # Cash markers on secondary % axis (at 0%)
+        if not _dep_events.empty:
+            _dve  = _dep_events[
+                (_dep_events["date"] >= _d_start_ts) & (_dep_events["date"] <= _d_end_ts)
+            ]
+            _deps = _dve[_dve["amount"] > 0]
+            _wits = _dve[_dve["amount"] < 0]
+            if not _deps.empty:
+                _dep_cur  = _deps.get("currency", pd.Series([""] * len(_deps))).values
+                _dep_text = [f"{c} {abs(a):,.0f}" for a, c in zip(_deps["amount"].values, _dep_cur)]
+                fig.add_trace(go.Scatter(
+                    x=_deps["date"], y=[0.0] * len(_deps), mode="markers",
+                    marker=dict(symbol="triangle-up", size=11,
+                                color="#22c55e", line=dict(width=1, color="#166534")),
+                    name="Deposit", text=_dep_text, yaxis="y2",
+                    hovertemplate="%{text}<extra>Deposit</extra>",
+                ))
+            if not _wits.empty:
+                _wit_cur  = _wits.get("currency", pd.Series([""] * len(_wits))).values
+                _wit_text = [f"{c} {abs(a):,.0f}" for a, c in zip(_wits["amount"].values, _wit_cur)]
+                fig.add_trace(go.Scatter(
+                    x=_wits["date"], y=[0.0] * len(_wits), mode="markers",
+                    marker=dict(symbol="triangle-down", size=11,
+                                color="#ef4444", line=dict(width=1, color="#991b1b")),
+                    name="Withdrawal", text=_wit_text, yaxis="y2",
+                    hovertemplate="%{text}<extra>Withdrawal</extra>",
+                ))
+
+        _y1_title = "Consolidated NAV ($)" if _have_nav else "OPT NAV ($)"
+        fig.update_layout(
+            height=400,
+            hovermode="x unified",
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            hoverlabel={"bgcolor": "#ffffff", "font_color": "#1e2130",
+                        "bordercolor": "#cbd5e1", "font_size": 11},
+            legend={"orientation": "h", "yanchor": "bottom", "y": 1.02,
+                    "xanchor": "center", "x": 0.5,
+                    "bgcolor": "rgba(248,249,250,0.82)", "font": {"color": "#1e2130"}},
+            margin={"l": 10, "r": 60, "t": 40, "b": 10},
+            yaxis=dict(
+                title=dict(text=_y1_title, font=dict(color="rgba(148,163,184,0.6)")),
+                tickformat="$,.0f",
+                tickfont=dict(color="rgba(148,163,184,0.6)"),
+                showgrid=False,
+            ),
+            yaxis2=dict(
+                overlaying="y", side="right",
+                ticksuffix="%", tickformat=".1f",
+                zeroline=True, zerolinecolor="rgba(148,163,184,0.5)", zerolinewidth=1,
+                showgrid=True,
+            ),
+        )
+        fig.update_xaxes(
+            rangeselector=dict(buttons=[
+                dict(count=1, label="MTD", step="month", stepmode="todate"),
+                dict(count=1, label="1M",  step="month", stepmode="backward"),
+                dict(count=3, label="3M",  step="month", stepmode="backward"),
+                dict(count=1, label="YTD", step="year",  stepmode="todate"),
+                dict(count=1, label="1Y",  step="year",  stepmode="backward"),
+                dict(count=3, label="3Y",  step="year",  stepmode="backward"),
+                dict(label="Focus", step="all"),
+            ]),
+            rangeslider=dict(visible=False),
+            hoverformat="%b %d, %Y",
+        )
+        st.plotly_chart(fig, width="stretch")
+        st.caption(
+            "Consolidated: time-weighted return — USD deposits stripped; SGD deposits not FX-adjusted. "
+            "SPY/QQQ: price return (their TWR is unaffected by personal deposits). "
+            "Markers: ▲ deposit  ▼ withdrawal."
+        )
+
+
 def _build_history_context() -> dict:
     """Summarise flex_trades.pkl into compact LLM-friendly tables.
 
@@ -2401,6 +2869,27 @@ def _build_history_context() -> dict:
 
     per_symbol.sort(key=lambda r: r["pnl"], reverse=True)
 
+    # Backtest scores — run BacktestExpert scoring for all symbols with ≥10 closed OPT trades.
+    # Uses same df / symbol filter as score_from_trades() so numbers match the Deep-Dive panel.
+    from src.backtest.score import score_from_trades as _score_fn
+    backtest_scores: list[dict] = []
+    for _r in sorted((r for r in per_symbol if r["n"] >= 10), key=lambda r: r["n"], reverse=True)[:80]:
+        _bs = _score_fn(df, _r["sym"])
+        backtest_scores.append({
+            "sym":    _r["sym"],
+            "score":  _bs.composite,
+            "verdict": _bs.verdict,
+            "n":      _bs.total_trades,
+            "wr%":    round(_bs.win_rate * 100),
+            "pf":     _bs.profit_factor,
+            "yrs":    _bs.years_tested,
+            "sample": _bs.sample_score,
+            "expect": _bs.expectancy_score,
+            "risk":   _bs.risk_score,
+            "robust": _bs.robustness_score,
+            "flags":  "; ".join(_bs.red_flags) if _bs.red_flags else "",
+        })
+
     # Trade log — same _all_closed_opt source, newest-first for context-window priority.
     # Prefer dateTime (always populated) over tradeDate (often NaT in Activity query XMLs).
     _date_col = next(
@@ -2428,7 +2917,7 @@ def _build_history_context() -> dict:
                 "pnl":    int(_pnl) if pd.notna(_pnl) else 0,
             })
 
-    result = {"global_stats": global_stats, "per_symbol": per_symbol, "trade_log": trade_log}
+    result = {"global_stats": global_stats, "per_symbol": per_symbol, "trade_log": trade_log, "backtest_scores": backtest_scores}
     st.session_state[_CACHE] = result
     st.session_state[_TS] = time.time()
     st.session_state["llm_hist_pkl_mtime"] = _pkl_mtime
@@ -2571,6 +3060,83 @@ def _build_live_context() -> dict:
     if not live_orders.empty:
         context["open_orders"] = live_orders
 
+    # Consolidated NAV — flex_nav.pkl (EquitySummaryByReportDateInBase, both accounts summed)
+    _nav_pkl = _MASTER_DIR / "flex_nav.pkl"
+    if _nav_pkl.exists():
+        try:
+            _df_nav = pd.read_pickle(_nav_pkl)
+            if not _df_nav.empty and {"reportDate", "total"}.issubset(_df_nav.columns):
+                _nav_ts = _df_nav.set_index("reportDate")["total"].sort_index()
+                _nav_ts = _nav_ts[_nav_ts > 0]
+                if len(_nav_ts) >= 2:
+                    _today_ts   = pd.Timestamp.today().normalize()
+                    _jan25      = pd.Timestamp("2025-01-01")
+                    _ytd_start  = pd.Timestamp(f"{_today_ts.year}-01-01")
+                    _current    = float(_nav_ts.iloc[-1])
+                    _at_jan25   = float(_nav_ts[_nav_ts.index >= _jan25].iloc[0]) if (_nav_ts.index >= _jan25).any() else None
+                    _at_ytd     = float(_nav_ts[_nav_ts.index >= _ytd_start].iloc[0]) if (_nav_ts.index >= _ytd_start).any() else None
+                    # Last value of each month for the past 13 months
+                    _nav_df  = pd.DataFrame({"date": _nav_ts.index, "nav": _nav_ts.values})
+                    _nav_df["ym"] = _nav_df["date"].dt.to_period("M")
+                    _cutoff_ym   = (_today_ts - pd.DateOffset(months=13)).to_period("M")
+                    _monthly_df  = (
+                        _nav_df[_nav_df["ym"] >= _cutoff_ym]
+                        .groupby("ym", sort=True)
+                        .last()
+                        .reset_index()
+                    )
+                    context["nav_summary"] = {
+                        "current":           _current,
+                        "current_date":      str(_nav_ts.index[-1].date()),
+                        "ytd_return_pct":    round((_current / _at_ytd  - 1) * 100, 2) if _at_ytd  else None,
+                        "since_jan2025_pct": round((_current / _at_jan25 - 1) * 100, 2) if _at_jan25 else None,
+                        "monthly":           [
+                            (str(r.date.date()), int(round(r.nav)))
+                            for _, r in _monthly_df.iterrows()
+                        ],
+                    }
+        except Exception:
+            pass
+
+    # Cash transactions — flex_cash.pkl (deposits/withdrawals, dividends, interest)
+    _cash_pkl = _MASTER_DIR / "flex_cash.pkl"
+    if _cash_pkl.exists():
+        try:
+            _df_cash = pd.read_pickle(_cash_pkl)
+            if not _df_cash.empty and {"type", "amount", "date"}.issubset(_df_cash.columns):
+                _df_cash = _df_cash.copy()
+                _df_cash["_year"] = pd.to_datetime(_df_cash["date"]).dt.year
+                _two_yrs_ago = pd.Timestamp.today() - pd.DateOffset(years=2)
+                # Deposits / withdrawals (last 2 years, exclude sub-$1 noise)
+                _dw = _df_cash[
+                    _df_cash["type"].str.contains("Deposit|Withdraw", case=False, na=False)
+                    & (_df_cash["amount"].abs() >= 1.0)
+                    & (_df_cash["date"] >= _two_yrs_ago)
+                ].sort_values("date")
+                # Dividends and interest aggregated by year
+                _div_by_yr = (
+                    _df_cash[_df_cash["type"].str.contains("Dividend", case=False, na=False)]
+                    .groupby("_year")["amount"].sum().round(0).astype(int).to_dict()
+                )
+                _int_by_yr = (
+                    _df_cash[_df_cash["type"].str.contains("Interest", case=False, na=False)]
+                    .groupby("_year")["amount"].sum().round(0).astype(int).to_dict()
+                )
+                context["cash_summary"] = {
+                    "recent_dw": [
+                        {
+                            "date":     str(r["date"].date()) if hasattr(r["date"], "date") else str(r["date"]),
+                            "amount":   round(float(r["amount"]), 2),
+                            "currency": str(r.get("currency", "")),
+                        }
+                        for _, r in _dw.iterrows()
+                    ],
+                    "dividends_by_year": _div_by_yr,
+                    "interest_by_year":  _int_by_yr,
+                }
+        except Exception:
+            pass
+
     return context
 
 
@@ -2671,8 +3237,19 @@ def render_history() -> None:
     """5-year trade history, per-symbol backtest scoring, and live Greeks calculator."""
     from src.backtest.score import score_from_trades
     from src.flex.analyze import dte_distribution, strategy_recommendation, symbol_performance
-    from src.flex.fetch import download_trades, merge_into_pickle
-    from src.flex.parse import mask_accounts, normalize
+    from src.flex.fetch import (
+        download_cash_transactions, download_trades,
+        load_cash_xml, load_nav_xml,
+        merge_cash_into_pickle, merge_into_pickle, merge_nav_into_pickle,
+    )
+    from src.flex.parse import mask_accounts, normalize, normalize_cash
+
+    _render_perf_chart(
+        flex_path=_MASTER_DIR / "flex_trades.pkl",
+        ohlc_path=_MASTER_DIR / "ohlc.pkl",
+        cash_path=_MASTER_DIR / "flex_cash.pkl",
+        nav_path=_MASTER_DIR / "flex_nav.pkl",
+    )
 
     st.markdown("### Trade History & Backtest")
 
@@ -2685,6 +3262,8 @@ def render_history() -> None:
     }
 
     flex_path = _MASTER_DIR / "flex_trades.pkl"
+    cash_path = _MASTER_DIR / "flex_cash.pkl"
+    nav_path  = _MASTER_DIR / "flex_nav.pkl"
 
     # ── Controls ──────────────────────────────────────────────────────────────
     _api_ready = bool(token and qid)
@@ -2698,27 +3277,52 @@ def render_history() -> None:
             "from the last build. Saves data/master/symbol_categories.pkl.\n\n"
             "Run weekly (or after each build) to keep the monthly-only list current. "
             "derive.py uses this to exclude monthly-only symbols from sow candidates and to "
-            "generate breakeven covered calls for monthly-only held stocks."
+            "generate breakeven covered calls for monthly-only held stocks.\n\n"
+            "Press once to run and show results; press again to hide."
         ),
         width="stretch",
     ):
-        with st.spinner("Classifying weekly/monthly symbols…"):
-            from scripts.update_symbol_categories import classify_weeklies
-            _cat_chains = _MASTER_DIR.parent.parent / "data" / "df_chains.pkl"
-            if not _cat_chains.exists():
-                st.error("df_chains.pkl not found — run Generate Orders (build) first.")
-            else:
-                _cat_df = pd.read_pickle(_cat_chains)
-                _sym_cat = classify_weeklies(_cat_df)
-                _sym_cat.to_pickle(_MASTER_DIR / "symbol_categories.pkl")
-                _n_weekly  = int(_sym_cat["is_weekly"].sum())
-                _n_monthly = int((~_sym_cat["is_weekly"]).sum())
-                _monthly_list = sorted(_sym_cat.loc[~_sym_cat["is_weekly"], "symbol"].tolist())
-                st.success(
-                    f"Saved symbol_categories.pkl — {_n_weekly} weekly, {_n_monthly} monthly-only."
-                )
-                if _monthly_list:
-                    st.caption(f"Monthly-only: {', '.join(_monthly_list)}")
+        if "_weeklies_data" in st.session_state:
+            st.session_state.pop("_weeklies_data", None)
+        else:
+            with st.spinner("Classifying weekly/monthly symbols…"):
+                from scripts.update_symbol_categories import classify_weeklies
+                _cat_chains = _MASTER_DIR.parent.parent / "data" / "df_chains.pkl"
+                if not _cat_chains.exists():
+                    st.error("df_chains.pkl not found — run Generate Orders (build) first.")
+                else:
+                    _cat_df = pd.read_pickle(_cat_chains)
+                    _sym_cat = classify_weeklies(_cat_df)
+                    _sym_cat.to_pickle(_MASTER_DIR / "symbol_categories.pkl")
+                    _n_weekly  = int(_sym_cat["is_weekly"].sum())
+                    _n_monthly = int((~_sym_cat["is_weekly"]).sum())
+                    _monthly_list = sorted(_sym_cat.loc[~_sym_cat["is_weekly"], "symbol"].tolist())
+                    st.session_state["_weeklies_data"] = {
+                        "n_weekly": _n_weekly,
+                        "n_monthly": _n_monthly,
+                        "monthly_list": _monthly_list,
+                    }
+
+    if "_weeklies_data" in st.session_state:
+        _wd = st.session_state["_weeklies_data"]
+        _ml = _wd["monthly_list"]
+        st.success(
+            f"symbol_categories.pkl saved — {_wd['n_weekly']} weekly, "
+            f"**{_wd['n_monthly']} monthly-only** (shown below)."
+        )
+        if _ml:
+            _ncols = 10
+            _nrows = (_wd["n_monthly"] + _ncols - 1) // _ncols
+            _padded = _ml + [""] * (_nrows * _ncols - _wd["n_monthly"])
+            _tbl = pd.DataFrame(
+                [_padded[i * _ncols : (i + 1) * _ncols] for i in range(_nrows)],
+                columns=[f"_{i}" for i in range(_ncols)],
+            )
+            st.dataframe(
+                _tbl,
+                hide_index=True,
+                column_config={f"_{i}": st.column_config.TextColumn("") for i in range(_ncols)},
+            )
 
     if _ctrl_trade.button(
         "🔄 Update Trades",
@@ -2728,7 +3332,7 @@ def render_history() -> None:
             "Sources tried in order:\n"
             "1. API — IBKR Flex Web Service (requires TOKEN + TRADES_FLEXID in .env and portal "
             "query period set to 'Last 365 Calendar Days').\n"
-            "2. XML — any flex_*.xml files in data/master/ (manual portal download).\n\n"
+            "2. XML — any *.xml files in data/master/ (manual portal download, e.g. 2024.xml).\n\n"
             "API response is trimmed to 3 days before the pkl's most-recent entry so only "
             "recent rows are reprocessed; XML files are always merged in full. "
             "Both sources are deduplicated before saving."
@@ -2778,13 +3382,58 @@ def render_history() -> None:
                 raw = load_xml(_MASTER_DIR)
                 df_xml = mask_accounts(normalize(raw), _acct_map)
                 if not df_xml.empty:
-                    _n_xml = len(sorted(_MASTER_DIR.glob("flex_*.xml")))
+                    _n_xml = len(sorted(_MASTER_DIR.glob("*.xml")))
                     _sources.append(df_xml)
                     _log.append(f"✓ XML: {len(df_xml):,} rows from {_n_xml} file(s)")
             except FileNotFoundError:
                 _log.append("— XML: no flex_*.xml files in data/master/")
             except Exception as _e:
                 _log.append(f"✗ XML: {_e}")
+
+            # ── Cash transactions (same query — CashTransaction section must be enabled) ──
+            _cash_sources: list[pd.DataFrame] = []
+            if _api_ready:
+                try:
+                    _df_cash_api = mask_accounts(
+                        normalize_cash(download_cash_transactions(token, qid)), _acct_map
+                    )
+                    if not _df_cash_api.empty:
+                        _cash_sources.append(_df_cash_api)
+                        _log.append(f"✓ Cash API: {len(_df_cash_api):,} rows")
+                    else:
+                        _log.append(
+                            "— Cash API: 0 rows (add 'Cash Transactions' section to your "
+                            "Flex Query in IBKR portal → Reports → Flex Queries → edit → Sections)"
+                        )
+                except Exception as _ce:
+                    _log.append(f"✗ Cash API: {_ce}")
+            try:
+                _df_cash_xml = mask_accounts(
+                    normalize_cash(load_cash_xml(_MASTER_DIR)), _acct_map
+                )
+                if not _df_cash_xml.empty:
+                    _cash_sources.append(_df_cash_xml)
+                    _log.append(f"✓ Cash XML: {len(_df_cash_xml):,} rows")
+            except Exception:
+                pass
+            if _cash_sources:
+                merge_cash_into_pickle(
+                    pd.concat(_cash_sources, ignore_index=True), cash_path
+                )
+
+            # ── Daily consolidated NAV (EquitySummaryByReportDateInBase) ──────
+            try:
+                _df_nav_new = load_nav_xml(_MASTER_DIR)
+                if not _df_nav_new.empty:
+                    merge_nav_into_pickle(_df_nav_new, nav_path)
+                    _log.append(f"✓ NAV: {len(_df_nav_new):,} daily rows")
+                else:
+                    _log.append(
+                        "— NAV: no EquitySummaryByReportDateInBase data in XMLs "
+                        "(add 'Equity Summary by Report Date in Base Currency' section to your Flex Query)"
+                    )
+            except Exception as _ne:
+                _log.append(f"✗ NAV: {_ne}")
 
             if _sources:
                 _before = len(pd.read_pickle(flex_path)) if flex_path.exists() else 0
@@ -2810,7 +3459,7 @@ def render_history() -> None:
                     "3. Add TOKEN + TRADES_FLEXID to `.env`\n\n"
                     "**Option B — Manual XML (one-time or gap fills):**\n"
                     "1. Portal → run query, Period = Custom Date Range, Format = XML\n"
-                    "2. Save as `data/master/flex_1.xml` (multiple files for multi-year range)\n"
+                    "2. Save as `data/master/2024.xml`, `2025.xml`, etc. (one file per year)\n"
                     "3. Click **🔄 Update Trades** again"
                 )
 
@@ -2994,28 +3643,23 @@ with _acct_c:
         st.caption(next(iter(_REAL_ACCOUNTS)))
 # _spacer_c intentionally empty — preserves right-side gap for native Streamlit controls
 
-# Second fixed band: [KPI table | Ask AI]
-# JS below finds this block via the Ask AI input placeholder and pins it below the nav row.
-_kpi_c, _ai_c = st.columns([3, 7])
-with _kpi_c:
+# Second fixed band: KPI table on top, Ask AI below — stacked in one full-width column.
+# A hidden marker div lets JS locate the outer stHorizontalBlock to pin.
+with st.columns([1])[0]:
+    st.markdown('<div id="kpi-ai-band" style="display:none"></div>', unsafe_allow_html=True)
     kpi_strip()
-with _ai_c:
     _render_llm_chat()
 
 st.markdown(
     """
     <script>
     (function () {
-        const PH = 'Ask about your portfolio…';
         function applyFix() {
-            const inp = document.querySelector('input[placeholder="' + PH + '"]');
-            if (!inp) return;
-            const bar = inp.closest('[data-testid="stHorizontalBlock"]');
+            /* Pin outer stHorizontalBlock via the hidden marker div */
+            const marker = document.getElementById('kpi-ai-band');
+            const bar = marker ? marker.closest('[data-testid="stHorizontalBlock"]') : null;
             if (!bar) return;
             if (!bar.classList.contains('kpi-bar-fixed')) bar.classList.add('kpi-bar-fixed');
-            const col = inp.closest('[data-testid="stColumn"]');
-            if (col && !col.classList.contains('ask-ai-col')) col.classList.add('ask-ai-col');
-            /* Dynamically set main-content padding to match actual nav+bar heights */
             const nav = document.querySelector('[data-testid="stHorizontalBlock"]:has([data-testid="stRadio"])');
             const main = document.querySelector('section[data-testid="stMain"] > div.block-container');
             if (nav && main) {
@@ -3023,6 +3667,12 @@ st.markdown(
                 bar.style.top = navH + 'px';
                 const h = navH + bar.getBoundingClientRect().height;
                 main.style.paddingTop = Math.max(h + 6, 80) + 'px';
+            }
+            /* Apply ask-ai-col styling to the inner column containing the AI input */
+            const inp = document.querySelector('input[placeholder="Ask about your portfolio…"]');
+            if (inp) {
+                const col = inp.closest('[data-testid="stColumn"]');
+                if (col && !col.classList.contains('ask-ai-col')) col.classList.add('ask-ai-col');
             }
         }
         applyFix();

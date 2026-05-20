@@ -4,66 +4,62 @@ Use when modifying `src/flex/`, `src/backtest/`, or the **History** dashboard ta
 
 ---
 
-## 0. flex_trades.pkl — Load Paths and Safety Rules
+## 0. Flex Pickles — Load Paths and Safety Rules
 
-`data/master/flex_trades.pkl` is the **source of truth** for all trade history. It is tracked in
-the remote repo so the dashboard works even when the raw XML files are absent (XMLs are in
-`.gitignore` to keep account data private).
+Three pickles in `data/master/`, all **gitignored** (contain raw account IDs). XMLs are the only backup.
 
-**Update paths — both MERGE, never replace:**
+| Pickle | Source topic | Built by |
+|---|---|---|
+| `flex_trades.pkl` | `Trade` | 🔄 Update Trades (API + XML) or `scripts/update_trades.py` |
+| `flex_cash.pkl` | `CashTransaction` | 🔄 Update Trades (API + XML) |
+| `flex_nav.pkl` | `EquitySummaryByReportDateInBase` | 🔄 Update Trades (XML only) |
+
+**XML naming:** Year-named files — `2021.xml`, `2022.xml`, … `2026.xml` in `data/master/`. One per year; IBKR caps each portal query run at 365 days. All globs use `*.xml`.
+
+**Update paths — all MERGE, never replace:**
 
 | Method | When to use | How |
 |---|---|---|
-| **🔄 Update Trades** (dashboard) | Routine top-up | API (last 365 days trimmed to 3d before pkl max) + any XML files present |
-| `scripts/update_trades.py` | CLI version of above | `--xml-only` or `--api-only` flags available |
-| **Rebuild from XML** | After pkl corruption | `uv run python scripts/update_trades.py --xml-only` |
+| **🔄 Update Trades** (dashboard) | Routine top-up | API (last 365 days) + any XML files → all three pickles |
+| `scripts/update_trades.py` | CLI version, trades only | `--xml-only` or `--api-only` flags |
+| **Rebuild all from XML** | After pkl corruption | click 🔄 Update Trades in dashboard |
 
-Both paths call `merge_into_pickle()`. Deduplication uses natural key `(accountId, dateTime, symbol, putCall, strike, expiry, quantity, tradePrice)` — IBKR ID columns (`tradeID` etc.) are only used when ≥80% of rows are non-null, preventing NaN-collapse of historical data built before those columns existed.
-
-**CRITICAL: Neither `flex_trades.pkl` nor `flex_*.xml` are tracked in git** (both gitignored). The XMLs downloaded from the portal are the only backup. Keep them safe.
+`merge_into_pickle()` deduplication: IBKR ID columns (`tradeID`, `ibExecID`, `ibOrderID`) only when ≥80% non-null; falls back to composite natural key. `merge_nav_into_pickle()` deduplicates by `reportDate` keep-last. `merge_cash_into_pickle()` deduplicates on `(accountId, date, amount, currency, description)`.
 
 ### First-time full history load (Python, no dashboard needed)
 
-1. Portal → Reports → Flex Queries → find your `TradeHistory` query → hit ▶ run
-2. Period: **Custom Date Range**, Format: **XML**
-3. Run for each year window, saving each file to `data/master/`:
-
-| Run | From | To | Save as |
-|---|---|---|---|
-| 1 | 2025-05-17 | 2026-05-16 | `flex_1.xml` |
-| 2 | 2024-05-17 | 2025-05-16 | `flex_2.xml` |
-| 3 | 2023-05-17 | 2024-05-16 | `flex_3.xml` |
-| 4 | 2022-05-17 | 2023-05-16 | `flex_4.xml` |
-| 5 | 2021-05-17 | 2022-05-16 | `flex_5.xml` |
-| 6 | 2020-05-17 | 2021-05-16 | `flex_6.xml` |
-
+1. Portal → Reports → Flex Queries → find your `TradeHistory` query
+2. **Enable 3 sections**: Trades (19 fields), Cash Transactions, Equity Summary by Report Date in Base Currency
+3. Run for each year with Period = Custom Date Range, Format = XML, save as `data/master/2021.xml` … `2026.xml`
 4. Run from Python:
 
 ```python
 from pathlib import Path
-from src.flex.fetch import load_xml, merge_into_pickle
-from src.flex.parse import normalize, mask_accounts
+from src.flex.fetch import load_xml, load_cash_xml, load_nav_xml
+from src.flex.fetch import merge_into_pickle, merge_cash_into_pickle, merge_nav_into_pickle
+from src.flex.parse import normalize, normalize_cash, mask_accounts
 from src.dashboard.settings import get_settings
 
 s = get_settings()
 acct_map = {s.us_account.get_secret_value(): "US", s.sg_account.get_secret_value(): "SG"}
 master = Path("data/master")
-pkl_path = master / "flex_trades.pkl"
 
-df_new = mask_accounts(normalize(load_xml(master)), acct_map)
-df_merged = merge_into_pickle(df_new, pkl_path)        # safe merge, not replace
-df_merged = mask_accounts(df_merged, acct_map)         # re-mask any legacy raw IDs
-df_merged.to_pickle(pkl_path)
-print(f"Saved {len(df_merged):,} rows")
+# Trades
+df_trades = mask_accounts(normalize(load_xml(master)), acct_map)
+df_merged  = merge_into_pickle(df_trades, master / "flex_trades.pkl")
+mask_accounts(df_merged, acct_map).to_pickle(master / "flex_trades.pkl")
+
+# Cash
+df_cash = mask_accounts(normalize_cash(load_cash_xml(master)), acct_map)
+merge_cash_into_pickle(df_cash, master / "flex_cash.pkl")
+
+# NAV (no mask needed — no accountId in output)
+df_nav = load_nav_xml(master)
+merge_nav_into_pickle(df_nav, master / "flex_nav.pkl")
+print(f"Trades: {len(df_merged):,}  Cash: {len(df_cash):,}  NAV: {len(df_nav):,}")
 ```
 
-5. After the initial load, use **🔄 Refresh via API** for incremental quarterly updates.
-
-### If XML files are missing
-
-The pkl still has all history committed to the repo. Just click **🔄 Refresh via API** to
-top-up, or download a Year-to-Date XML from the portal as `flex_1.xml` and click
-**📂 Merge from XML**. The button shows step-by-step instructions when no XML is found.
+5. After the initial load, click **🔄 Update Trades** for incremental quarterly top-ups.
 
 ### Date columns in Flex Activity XML
 
@@ -152,14 +148,16 @@ print('flexid set:', bool(s.trades_flexid.get_secret_value()))
 
 ## 2. Module Map
 
-| File | Purpose |
+| File | Key functions |
 |---|---|
-| `src/flex/fetch.py` | `download_trades(token, qid)` — thin wrapper around `ib_async.FlexReport` |
-| `src/flex/parse.py` | `normalize(df)` — fix date types, add `pnl` alias, `assetCategory` alias |
+| `src/flex/fetch.py` | `download_trades`, `load_xml`, `merge_into_pickle` (trades); `download_cash_transactions`, `load_cash_xml`, `merge_cash_into_pickle` (cash); `load_nav_xml`, `merge_nav_into_pickle` (consolidated NAV) |
+| `src/flex/parse.py` | `normalize` (trades), `normalize_cash` (cash), `normalize_nav` (NAV — drops zero/NaN rows), `filter_options`, `filter_closed`, `mask_accounts` |
 | `src/flex/analyze.py` | `symbol_performance()`, `dte_distribution()`, `strategy_recommendation()` |
 | `src/backtest/greeks.py` | `black_scholes()`, `implied_vol()`, `greeks_table()` |
 | `src/backtest/strategy.py` | `simulate()`, `covered_call()`, `cash_secured_put()`, `bull_put_spread()`, `iron_condor()` |
 | `src/backtest/score.py` | `score_from_trades()` → `BacktestScore` (adapted Backtest Expert) |
+
+**`load_nav_xml()` detail:** extracts `EquitySummaryByReportDateInBase` from each `*.xml`, drops zero/NaN `total` rows (per-account placeholder rows in multi-account exports), then `groupby("reportDate")["total"].sum()` to get a single consolidated daily NAV.
 
 ---
 
@@ -264,6 +262,12 @@ It uses `settings.token` / `settings.trades_flexid` directly — no separate env
 Flex data is saved to `data/master/flex_trades.pkl` (protected from Clear Data).
 
 **History tab controls:**
-- **🔄 Refresh via API** — merges last 365 days from IBKR Flex API (requires `.env` credentials)
-- **📂 Merge from XML** — merges all `flex_*.xml` from `data/master/` into the pkl; shows
-  portal download instructions if no XML files are present
+- **🔄 Update Trades** — rebuilds all three pickles: trades (API + XML), cash (API + XML), NAV (XML). Shows per-source log lines (✓/✗/—) in the success message.
+- XML files must be year-named (`2021.xml` … `2026.xml`) in `data/master/`. Dashboard instructs user to use this naming in the help tooltip.
+
+**Performance chart** (`_render_perf_chart` in `app.py`, first section in History tab):
+- Requires `flex_trades.pkl`, `ohlc.pkl`, `flex_cash.pkl`, `flex_nav.pkl`
+- "Consolidated" line (purple) = true daily NAV from `flex_nav.pkl`, rebased at display start
+- "OPT P&L" line (blue dashed) = cumulative realized options P&L, rebased at display start
+- SPY / QQQ benchmarks; Consolidated NAV bars on secondary y-axis
+- Hover % values pre-formatted server-side (Plotly d3 format unreliable in unified hover)

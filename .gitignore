@@ -27,6 +27,7 @@ ipython_config.py
 z*/
 **/z*.*
 data/t*.*
+data/master/*.xml
 log/*.*
 .ruff*
 .python*

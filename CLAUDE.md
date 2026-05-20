@@ -28,6 +28,9 @@ Full IBClient patterns, pitfalls, and UI conventions → `.claude/skills/dashboa
 | `config/snp_config.yml` | PORT, CID, CURRENCY, MINCUSHION, MAX_DTE, etc. |
 | `.env` | Secrets: `US_ACCOUNT`, `SG_ACCOUNT`, `TOKEN` (Flex), `TRADES_FLEXID`. |
 | `data/master/` | Protected — never deleted by Clear Data or `src/clear.py`. |
+| `data/master/flex_trades.pkl` | All closed trades (IBKR Flex Activity XML → normalize → mask_accounts). |
+| `data/master/flex_cash.pkl` | Cash transactions (CashTransaction section, same XMLs). Deposits/withdrawals shown as markers on the performance chart. |
+| `data/master/flex_nav.pkl` | Daily consolidated NAV (EquitySummaryByReportDateInBase, same XMLs; per-account rows summed per date). Powers the "Consolidated" line on the performance chart. Jan 1 2025 = $632,507, May 18 2026 = $954,937. |
 | `src/flex/` | `fetch`, `parse`, `analyze` — IBKR Flex Query download + trade history analysis. |
 | `src/backtest/` | `greeks` (Black-Scholes), `strategy` (P/L sim), `score` (Backtest Expert). |
 | `scripts/update_trades.py` | Standalone trade refresh: API + XML → `flex_trades.pkl`. |
@@ -96,6 +99,39 @@ After restart, confirm 🟢 LIVE within 15 s.
 - `width="stretch"`, not `use_container_width` (deprecated in Streamlit).
 - Never print, log, or commit `.env` contents. Dashboard binds to `127.0.0.1` only.
 
+## Flex data pipeline (`src/flex/`)
+
+**Three pickles, all built by 🔄 Update Trades and `scripts/update_trades.py`:**
+
+| Pickle | Source topic | Key functions |
+|---|---|---|
+| `flex_trades.pkl` | `Trade` | `load_xml()`, `download_trades()`, `merge_into_pickle()` |
+| `flex_cash.pkl` | `CashTransaction` | `load_cash_xml()`, `download_cash_transactions()`, `merge_cash_into_pickle()` |
+| `flex_nav.pkl` | `EquitySummaryByReportDateInBase` | `load_nav_xml()`, `merge_nav_into_pickle()` |
+
+**XML naming**: Year-named files — `2021.xml`, `2022.xml`, … `2026.xml` in `data/master/`. Glob is `*.xml` (not `flex_*.xml`). One file per year; IBKR caps each portal query run at 365 days.
+
+**Flex Query required sections** (portal → Reports → Flex Queries → edit → Sections):
+1. **Trades** — 19 field checkboxes; Options sub-reports ALL unchecked (Execution OFF is critical)
+2. **Cash Transactions** — enables `flex_cash.pkl`
+3. **Equity Summary by Report Date in Base Currency** — enables `flex_nav.pkl` (daily consolidated NAV)
+
+**NAV aggregation**: `EquitySummaryByReportDateInBase` has one row per account per day. `load_nav_xml()` drops zeros, groups by date, sums to get consolidated daily NAV.
+
+**parse.py functions**: `normalize()` (trades), `normalize_cash()` (cash), `normalize_nav()` (NAV — drops zero/NaN rows), `filter_options()`, `filter_closed()`, `mask_accounts()`.
+
+## Cumulative Performance chart (History tab)
+
+`_render_perf_chart(flex_path, ohlc_path, cash_path, nav_path)` in `app.py` — above "Trade History & Backtest".
+
+- **"Consolidated" line** (purple): true daily NAV from `flex_nav.pkl`, rebased to 0% at display start date
+- **"OPT P&L" line** (blue dashed): cumulative realized options P&L rebased to 0% at display start date
+- **SPY / QQQ** benchmarks — same rebase logic
+- **Consolidated NAV bars** on secondary y-axis (dollar values)
+- **Deposit/withdrawal markers** from `flex_cash.pkl` (triangle-up = deposit, triangle-down = withdrawal); SGD amounts shown as-is (no FX conversion)
+- **Date range controls**: From/To date inputs; "Consolidated NAV at Start" auto-derived from `flex_nav.pkl` at selected From date
+- **`_clip_rebase(series)`**: clips to `[_d_start_ts, _d_end_ts]`, divides by `s.iloc[0]` → mirrors IBKR's "Cumulative Benchmark Comparison" zero-point logic
+
 ## Talk-to-Data (Ask AI)
 
 Fixed dock visible on every tab. Implementation: `src/dashboard/llm_query.py` (backends + prompt + formatter) + `_build_live_context()` / `_render_llm_chat()` in `app.py`.
@@ -107,9 +143,9 @@ Fixed dock visible on every tab. Implementation: `src/dashboard/llm_query.py` (b
 | `positions`, `greeks`, `metrics` | Live snapshot |
 | `global_stats`, `per_symbol` | `data/master/flex_trades.pkl` — OPT-only closes (matches Symbol Deep-Dive win rates) |
 | `trade_log` | Same pickle — chronological per-trade rows with exact date, symbol, PC, strike, expiry, qty, pnl |
+| `backtest_scores` | Same pickle — per-symbol BacktestExpert score (0–100), verdict (DEPLOY/REFINE/ABANDON), win rate, profit factor, years tested, four 0–25 sub-scores, and CRITICAL/WARNING flags. Symbols with ≥10 closed OPT trades, capped at top-80 by trade count. |
 | `ohlc_stats` | `data/master/ohlc.pkl` |
 | `orders_cover/sow/reap/protect` | `data/df_cov.pkl`, `df_nkd.pkl`, `df_reap.pkl`, `df_protect.pkl` |
-| `orders_monthly_cc` | `data/df_monthly_cov.pkl` — breakeven CCs for monthly-only held stocks |
 
 **Win rate consistency**: `per_symbol` uses all closed OPT trades (including pnl=0 assignments) so trade count matches `trade_log`. `wr%` = pnl>0 / n. STK assignment trades excluded — their inclusion halves the apparent rate for wheel symbols.
 

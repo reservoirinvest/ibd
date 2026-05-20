@@ -92,6 +92,55 @@ def filter_closed(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["openCloseIndicator"] == "C"].copy()
 
 
+def normalize_cash(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a normalized copy of a CashTransaction DataFrame.
+
+    Produces columns: date, amount, currency, type, description, accountId.
+    Handles both 'type' (newer exports) and 'trnsType' (some older formats).
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+
+    # dateTime: same YYYYMMDD;HHMMSS format as trades — strip the semicolon
+    for _col in ("dateTime", "date", "reportDate", "settleDate"):
+        if _col in df.columns:
+            df["date"] = (
+                pd.to_datetime(
+                    df[_col].astype(str).str.replace(";", " ", regex=False),
+                    format="mixed",
+                    errors="coerce",
+                ).dt.normalize()
+            )
+            break
+
+    if "amount" in df.columns:
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+
+    if "type" not in df.columns and "trnsType" in df.columns:
+        df["type"] = df["trnsType"]
+
+    return df.sort_values("date", na_position="last").reset_index(drop=True)
+
+
+def normalize_nav(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize EquitySummaryByReportDateInBase DataFrame.
+
+    Parses reportDate (YYYYMMDD → Timestamp), converts total to float,
+    and drops zero/NaN rows (per-account placeholder rows in multi-account exports).
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+    if "reportDate" in df.columns:
+        df["reportDate"] = pd.to_datetime(
+            df["reportDate"].astype(str), format="%Y%m%d", errors="coerce"
+        )
+    if "total" in df.columns:
+        df["total"] = pd.to_numeric(df["total"], errors="coerce")
+    return df[df["total"].notna() & (df["total"] != 0)].reset_index(drop=True)
+
+
 def mask_accounts(df: pd.DataFrame, account_map: dict[str, str]) -> pd.DataFrame:
     """Replace raw IBKR account IDs with labels (e.g. 'US', 'SG') for privacy.
 
