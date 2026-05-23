@@ -1,15 +1,14 @@
 # %%
 # Classify with status - load imports
 
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from pprint import pprint
 from typing import Union
 
 import pandas as pd
 from ib_async import Contract, Order, util
-from loguru import logger
 
 # pyrefly: ignore [missing-import]
 from src.build import (
@@ -20,6 +19,8 @@ from src.build import (
     get_pickle,
     ROOT,
 )
+
+logger = logging.getLogger(__name__)
 
 # %%
 # Config and constants
@@ -65,7 +66,7 @@ def clean_ib_util_df(
     if isinstance(contracts, pd.Series):
         ct = contracts.to_list()
     elif not isinstance(contracts, list):
-        logger.error(f"Invalid type for contracts: {type(contracts)}. Must be list or pd.Series.")
+        logger.error(f"Invalid type for contracts: {type(contracts)}. Must be list or pd.Series.")  # f-string ok at error level
         return None
     else:
         ct = contracts
@@ -73,7 +74,7 @@ def clean_ib_util_df(
     try:
         udf = util.df(ct)
     except (AttributeError, ValueError) as e:
-        logger.error(f"Error creating DataFrame from contracts: {e}")
+        logger.error(f"Error creating DataFrame from contracts: {e}")  # f-string ok at error level
         return None
 
     if udf is None or udf.empty:
@@ -141,8 +142,7 @@ def get_ib_portfolio(account: str, msg: bool = False) -> pd.DataFrame:
     finally:
         if ib and ib.isConnected():
             ib.disconnect()
-            if msg:
-                print("Disconnected from IB\n")
+            logger.debug("Disconnected from IB")
 
 
 def get_financials(account: str = "", msg: bool = False) -> dict:
@@ -210,8 +210,7 @@ def get_financials(account: str = "", msg: bool = False) -> dict:
     finally:
         if ib and ib.isConnected():
             ib.disconnect()
-            if msg:
-                print("Disconnected from IB\n")
+            logger.debug("Disconnected from IB")
 
 
 def get_open_orders(account_no: str, is_active: bool = False, msg: bool = False) -> pd.DataFrame:
@@ -279,14 +278,13 @@ def get_open_orders(account_no: str, is_active: bool = False, msg: bool = False)
         return dfo
 
     except Exception as e:
-        print(f"Error fetching open orders for {account_no or 'ALL'}: {str(e)}")
-        return OpenOrder().empty()  # Return empty DataFrame on error
+        logger.error("Error fetching open orders for %s: %s", account_no or "ALL", e)
+        return OpenOrder().empty()
 
     finally:
         if ib and ib.isConnected():
             ib.disconnect()
-            if msg:
-                print("Disconnected from IB\n")
+            logger.debug("Disconnected from IB")
 
 
 # %%
@@ -693,8 +691,7 @@ def classifed_results(account_no: str, max_days: int = 1, msg: bool = False) -> 
         result["df_chains"] = get_pickle(path=root_path / "data" / "df_chains.pkl", print_msg=msg)
         result["df_unds"] = get_pickle(path=root_path / "data" / "df_unds.pkl", print_msg=msg)
 
-    # Get portfolio and open orders
-    print(f"\nGetting portfolio for account: {account_no}\n")
+    logger.info("Getting portfolio for account: %s", account_no)
 
     result["df_pf"] = get_ib_portfolio(account=account_no)
     result["df_pf"] = classify_pf(result["df_pf"])
@@ -707,18 +704,12 @@ def classifed_results(account_no: str, max_days: int = 1, msg: bool = False) -> 
         result["df_unds"], result["df_pf"], result["df_openords"]
     )
 
-    if msg:
-        print(
-            f"{len(result['df_pf'][result['df_pf'].secType == 'STK'])} stocks and "
-            f"{len(result['df_pf'][result['df_pf'].secType == 'OPT'])} options in df_pf:\n"
-        )
-        # pyrefly: ignore [bad-argument-type]
-        print(f"\n{len(result['df_openords'])} df_openords:\n")
-
-        print(f"{result['df_pf'].drop('contract', axis=1).to_string()}\n")
-        # pyrefly: ignore [missing-attribute]
-        print(f"{result['df_openords'].drop(columns=['contract', 'order']).to_string()}\n")
-        print(f"\n{len(result['df_unds'])} df_unds:\n {result['df_unds'].head().to_string()}")
+    logger.debug(
+        "%d stocks, %d options in df_pf",
+        len(result["df_pf"][result["df_pf"].secType == "STK"]),
+        len(result["df_pf"][result["df_pf"].secType == "OPT"]),
+    )
+    logger.debug("%d open orders", len(result["df_openords"]))
 
     return result
 
@@ -747,33 +738,27 @@ if __name__ == "__main__":
     sg_fin = get_financials(account=os.getenv("SG_ACCOUNT", ""))
     fin = get_financials()
 
-    print("\nConsolidated Financials:")
-    pprint(fin)
-    print("\nUS Account Financials:")
-    pprint(us_fin)
-    print("\nSG Account Financials:")
-    pprint(sg_fin)
+    logger.info("Consolidated Financials: %s", fin)
+    logger.info("US Account Financials: %s", us_fin)
+    logger.info("SG Account Financials: %s", sg_fin)
 
-    # Get portfolio and open orders for US and SG accounts
-    print(f"\nUsing account: {ACCOUNT}\n")
+    logger.info("Using account: %s", ACCOUNT)
 
     df_pf = get_ib_portfolio(account=ACCOUNT_NO)
     df_pf = classify_pf(df_pf)
-    print(
-        f"{len(df_pf[df_pf.secType == 'STK'])} stocks and {len(df_pf[df_pf.secType == 'OPT'])} options in df_pf:\n"
+    logger.info(
+        "%d stocks, %d options in df_pf",
+        len(df_pf[df_pf.secType == "STK"]),
+        len(df_pf[df_pf.secType == "OPT"]),
     )
-    print(f"{df_pf.drop('contract', axis=1).to_string()}\n")
 
     df_openords = get_open_orders(account_no=ACCOUNT_NO, is_active=True)
     df_openords = classify_open_orders(df_openords, df_pf)
 
-    # pyrefly: ignore [bad-argument-type]
-    print(f"\n{len(df_openords)} df_openords:\n")
-    # pyrefly: ignore [missing-attribute]
-    print(f"{df_openords.drop(columns=['contract', 'order']).to_string()}\n")
+    logger.info("%d open orders", len(df_openords))
 
     # pyrefly: ignore [bad-argument-type]
     df_unds = update_unds_status(df_unds, df_pf, df_openords)
-    print(f"\n{len(df_unds)} df_unds:\n {df_unds.head().to_string()}")
+    logger.info("%d underlyings after status update", len(df_unds))
 
 # %%

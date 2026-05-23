@@ -1,49 +1,29 @@
-"""log_utils.py — Shared logging setup for batch scripts.
-
-Usage in any batch script:
-    import argparse
-    from src.log_utils import setup_logging
-
-    p = argparse.ArgumentParser()
-    p.add_argument("--debug", action="store_true")
-    args = p.parse_args()
-    setup_logging("my_script", debug=args.debug)
-"""
-
+"""log_utils.py — Shared logging setup for batch scripts."""
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
-from loguru import logger
+
+_FMT  = "%(asctime)s | %(levelname)-8s | %(message)s"
+_DATE = "%H:%M:%S"
 
 
 def setup_logging(log_name: str, *, debug: bool = False, log_dir: Path | None = None) -> None:
-    """Configure loguru sinks.
+    """Configure stdlib logging — stdout only, no file handler.
 
-    Terminal: INFO+ normally; DEBUG when debug=True.
-    File:     DEBUG always, at log/<log_name>.log, rotated every 2 days.
+    When run as a subprocess, app.py captures stdout+stderr to a single log file.
     """
-    logger.remove()
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG if debug else logging.INFO)
+    root.handlers.clear()
 
-    logger.add(
-        sys.stderr,
-        level="DEBUG" if debug else "INFO",
-        colorize=True,
-        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
-    )
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.DEBUG if debug else logging.INFO)
+    handler.setFormatter(logging.Formatter(_FMT, datefmt=_DATE))
+    root.addHandler(handler)
 
-    if log_dir is None:
-        from pyprojroot import here
-        log_dir = here() / "log"
-
-    log_dir = Path(log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.add(
-        str(log_dir / f"{log_name}.log"),
-        level="DEBUG",
-        rotation="2 days",
-        encoding="utf-8",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-    )
+    # Suppress noisy third-party loggers
+    for _noisy in ("ib_async", "urllib3", "asyncio"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)

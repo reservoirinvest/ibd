@@ -1,6 +1,7 @@
 # %%
 # IMPORTS
 import argparse as _ap
+import logging
 import os
 import time
 
@@ -31,6 +32,8 @@ from src.classify import (
     get_open_orders,
     classify_open_orders,
 )
+
+logger = logging.getLogger(__name__)
 
 _p = _ap.ArgumentParser(add_help=False)
 _p.add_argument("--debug", action="store_true")
@@ -134,13 +137,13 @@ VIRGIN_CALL_STD_MULT = config.get("VIRGIN_CALL_STD_MULT")
 VIRGIN_PUT_STD_MULT = config.get("VIRGIN_PUT_STD_MULT")
 MINCUSHION = config.get("MINCUSHION", 0.20)
 
-print("Getting financials...")
+logger.info("Getting financials...")
 fin = get_financials(ACCOUNT_NO)
 
 # %% GET CLASSIFIED DATA
 # classifed_results → chains_n_unds opens/closes its own CID=10 connections internally.
 # Open derive.py's long-lived connection AFTER all internal connections have closed.
-print("\n=== GETTING CLASSIFIED PORTFOLIO DATA ===")
+logger.info("=== GETTING CLASSIFIED PORTFOLIO DATA ===")
 data = classifed_results(account_no=ACCOUNT_NO)
 df_unds = data["df_unds"]
 df_pf = data["df_pf"]
@@ -150,19 +153,19 @@ df_unds = df_unds.merge(
     df_pf[df_pf.secType == "STK"][["symbol", "position", "avgCost"]], on="symbol", how="left"
 ).fillna({"position": 0, "avgCost": 0})
 
-print(f"Loaded {len(df_unds)} underlyings")
-print(f"Loaded {len(df_pf)} portfolio positions")
-print(f"Loaded {len(chains)} chain entries")
+logger.info("Loaded %s underlyings", len(df_unds))
+logger.info("Loaded %s portfolio positions", len(df_pf))
+logger.info("Loaded %s chain entries", len(chains))
 
 # Load weekly/monthly classification (built by scripts/update_symbol_categories.py)
 _sym_cat_path = ROOT / "data" / "master" / "symbol_categories.pkl"
 if _sym_cat_path.exists():
     _sym_cat = pd.read_pickle(_sym_cat_path)
     _monthly_syms = set(_sym_cat.loc[~_sym_cat.is_weekly, "symbol"])
-    print(f"Loaded symbol categories: {len(_monthly_syms)} monthly-only symbols")
+    logger.info("Loaded symbol categories: %s monthly-only symbols", len(_monthly_syms))
 else:
     _monthly_syms = set()
-    print("Warning: symbol_categories.pkl missing — run 'Identify Weeklies' in History tab; monthly sow exclusion skipped")
+    logger.info("Warning: symbol_categories.pkl missing — run 'Identify Weeklies' in History tab; monthly sow exclusion skipped")
 
 # Prefetch active open orders before opening our own connection — get_open_orders opens CID=10 itself.
 # is_active=True excludes cancelled/expired orders so they don't block new suggestion generation.
@@ -182,254 +185,244 @@ _oo_reaping = set(
 )
 
 if _oo_covering:
-    print(f"Skipping cover generation for {sorted(_oo_covering)} — active covering order exists")
+    logger.info("Skipping cover for %d symbols with active orders", len(_oo_covering))
 if _oo_sowing:
-    print(f"Skipping sow generation for {sorted(_oo_sowing)} — active sowing order exists")
+    logger.info("Skipping sow for %d symbols with active orders", len(_oo_sowing))
 if _oo_protecting:
-    print(f"Skipping protect generation for {sorted(_oo_protecting)} — active protecting order exists")
+    logger.info("Skipping protect for %d symbols with active orders", len(_oo_protecting))
 if _oo_reaping:
-    print(f"Skipping reap generation for {sorted(_oo_reaping)} — active reaping order exists")
+    logger.info("Skipping reap for %d contracts with active orders", len(_oo_reaping))
 
-print("Connecting to IB...")
+logger.info("Connecting to IB...")
 ib = get_ib_connection("SNP", account_no=ACCOUNT_NO)
 
 # %% MAKE COVERS FOR EXPOSED AND UNCOVERED STOCK POSITIONS
-print("\n=== MAKE COVERS FOR EXPOSED AND UNCOVERED STOCK POSITIONS ===")
+logger.info("=== MAKE COVERS FOR EXPOSED AND UNCOVERED STOCK POSITIONS ===")
 
 delete_pkl_files(["df_cov.pkl"])
 
 df_cov = pd.DataFrame()
 
-uncov = df_unds.state.isin(["exposed", "uncovered"])
-uncov_long = df_unds[
-    uncov & (df_unds.position > 0) & ~df_unds.symbol.isin(_oo_covering)
-].reset_index(drop=True)
+if not COVER_ME:
+    logger.info("COVER_ME=False — skipping cover generation")
+else:
+    uncov = df_unds.state.isin(["exposed", "uncovered"])
+    uncov_long = df_unds[
+        uncov & (df_unds.position > 0) & ~df_unds.symbol.isin(_oo_covering)
+    ].reset_index(drop=True)
 
-if not uncov_long.empty:
-    print(f"Processing {len(uncov_long)} long uncovered/exposed positions...")
+    if not uncov_long.empty:
+        logger.info("Processing %s long uncovered/exposed positions...", len(uncov_long))
 
-    df_cc = (
-        chains[chains.symbol.isin(uncov_long.symbol.unique())]
-        .loc[(chains.dte.between(COVER_MIN_DTE, COVER_MIN_DTE + 7))][
-            ["symbol", "expiry", "strike", "dte"]
-        ]
-        .sort_values(["symbol", "dte"])
-        .reset_index(drop=True)
-    )
-
-    df_cc = df_cc.merge(df_unds[["symbol", "price", "iv", "avgCost"]], on="symbol", how="left")
-    df_cc.rename(columns={"price": "undPrice", "iv": "vy"}, inplace=True)
-
-    long_put_cost = (
-        df_pf[(df_pf.right == "P") & (df_pf.position > 0)]
-        .assign(avgCostPerShare=lambda x: x.avgCost / 100)
-        .groupby("symbol", as_index=False)["avgCostPerShare"]
-        .sum()
-        .rename(columns={"avgCostPerShare": "longPutCost"})
-    )
-
-    df_cc = df_cc.merge(long_put_cost, on="symbol", how="left")
-    df_cc["longPutCost"] = df_cc["longPutCost"].fillna(0)
-
-    df_cc["sdev"] = df_cc.undPrice * df_cc.vy * (df_cc.dte / 365) ** 0.5
-
-    vol_based_price = df_cc.undPrice + config.get("COVER_STD_MULT") * df_cc.sdev
-    df_cc["covPrice"] = np.maximum(df_cc.avgCost + df_cc.longPutCost, vol_based_price)
-
-    no_of_options = 3
-
-    cc_long = (
-        df_cc.groupby(["symbol", "expiry"])[
-            ["symbol", "expiry", "strike", "undPrice", "sdev", "covPrice"]
-        ]
-        .apply(
-            lambda x: x[x["strike"] > x["covPrice"]]
-            .assign(diff=x["strike"] - x["covPrice"])
-            .sort_values("diff")
-            .head(no_of_options)
-        )
-        .drop(columns=["level_2", "diff"], errors="ignore")
-    )
-
-    cov_calls = [
-        Option(s, e, k, "C", "SMART")
-        for s, e, k in zip(cc_long.symbol, cc_long.expiry, cc_long.strike)
-    ]
-
-    print("Qualifying covered call contracts...")
-    valid_contracts = qualify_me(ib, cov_calls, desc="Qualifying covered call contracts")
-    valid_contracts = [v for v in valid_contracts if v is not None]
-
-    if valid_contracts:
-        df_cc1 = clean_ib_util_df(valid_contracts)
-
-        df_ccf = df_cc1.loc[df_cc1.groupby("symbol")["strike"].idxmin()]
-
-        df_ccf = df_ccf.reset_index(drop=True)
-
-        df_ccf = df_ccf.merge(df_unds[["symbol", "price", "iv"]], on="symbol", how="left")
-        df_ccf.rename(columns={"price": "undPrice", "iv": "vy"}, inplace=True)
-
-        df_ccf = df_ccf.merge(
-            df_pf[df_pf.state.isin(["uncovered", "exposed"]) & (df_pf.secType == "STK")][
-                ["symbol", "position", "avgCost"]
-            ],
-            on="symbol",
-            how="left",
+        df_cc = (
+            chains[chains.symbol.isin(uncov_long.symbol.unique())]
+            .loc[(chains.dte.between(COVER_MIN_DTE, COVER_MIN_DTE + 7))][
+                ["symbol", "expiry", "strike", "dte"]
+            ]
+            .sort_values(["symbol", "dte"])
+            .reset_index(drop=True)
         )
 
-        df_ccf["action"] = "SELL"
-        df_ccf["qty"] = df_ccf["position"] / 100
-        df_ccf = df_ccf.drop(columns=["position"])
+        df_cc = df_cc.merge(df_unds[["symbol", "price", "iv", "avgCost"]], on="symbol", how="left")
+        df_cc.rename(columns={"price": "undPrice", "iv": "vy"}, inplace=True)
 
-        print("Getting covered call prices...")
-        df_iv_cc = get_volatilities_snapshot(df_ccf["contract"].tolist(), market="SNP", ib=ib, desc="Fetching covered call volatilities")
+        long_put_cost = (
+            df_pf[(df_pf.right == "P") & (df_pf.position > 0)]
+            .assign(avgCostPerShare=lambda x: x.avgCost / 100)
+            .groupby("symbol", as_index=False)["avgCostPerShare"]
+            .sum()
+            .rename(columns={"avgCostPerShare": "longPutCost"})
+        )
 
-        if not df_iv_cc.empty:
-            df_ccf = df_ccf.merge(df_iv_cc[["symbol", "price"]], on="symbol", how="left")
+        df_cc = df_cc.merge(long_put_cost, on="symbol", how="left")
+        df_cc["longPutCost"] = df_cc["longPutCost"].fillna(0)
 
-            df_ccf["margin"] = df_ccf.apply(
-                lambda x: atm_margin(x.strike, x.undPrice, get_dte(x.expiry), x.vy), axis=1
+        df_cc["sdev"] = df_cc.undPrice * df_cc.vy * (df_cc.dte / 365) ** 0.5
+
+        vol_based_price = df_cc.undPrice + config.get("COVER_STD_MULT") * df_cc.sdev
+        df_cc["covPrice"] = np.maximum(df_cc.avgCost + df_cc.longPutCost, vol_based_price)
+
+        no_of_options = 3
+
+        cc_long = (
+            df_cc.groupby(["symbol", "expiry"])[
+                ["symbol", "expiry", "strike", "undPrice", "sdev", "covPrice"]
+            ]
+            .apply(
+                lambda x: x[x["strike"] > x["covPrice"]]
+                .assign(diff=x["strike"] - x["covPrice"])
+                .sort_values("diff")
+                .head(no_of_options)
             )
+            .drop(columns=["level_2", "diff"], errors="ignore")
+        )
+
+        cov_calls = [
+            Option(s, e, k, "C", "SMART")
+            for s, e, k in zip(cc_long.symbol, cc_long.expiry, cc_long.strike)
+        ]
+
+        logger.info("Qualifying covered call contracts...")
+        valid_contracts = qualify_me(ib, cov_calls, desc="Qualifying covered call contracts")
+        valid_contracts = [v for v in valid_contracts if v is not None]
+
+        if valid_contracts:
+            df_cc1 = clean_ib_util_df(valid_contracts)
+
+            df_ccf = df_cc1.loc[df_cc1.groupby("symbol")["strike"].idxmin()]
+
+            df_ccf = df_ccf.reset_index(drop=True)
+
+            df_ccf = df_ccf.merge(df_unds[["symbol", "price", "iv"]], on="symbol", how="left")
+            df_ccf.rename(columns={"price": "undPrice", "iv": "vy"}, inplace=True)
+
+            df_ccf = df_ccf.merge(
+                df_pf[df_pf.state.isin(["uncovered", "exposed"]) & (df_pf.secType == "STK")][
+                    ["symbol", "position", "avgCost"]
+                ],
+                on="symbol",
+                how="left",
+            )
+
+            df_ccf["action"] = "SELL"
+            df_ccf["qty"] = df_ccf["position"] / 100
+            df_ccf = df_ccf.drop(columns=["position"])
+
+            logger.info("Getting covered call prices...")
+            df_iv_cc = get_volatilities_snapshot(df_ccf["contract"].tolist(), market="SNP", ib=ib, desc="Fetching covered call volatilities")
+
+            if not df_iv_cc.empty:
+                df_ccf = df_ccf.merge(df_iv_cc[["symbol", "price"]], on="symbol", how="left")
+
+                df_ccf["margin"] = df_ccf.apply(
+                    lambda x: atm_margin(x.strike, x.undPrice, get_dte(x.expiry), x.vy), axis=1
+                )
+            else:
+                logger.info("No option price data available for covered calls")
         else:
-            print("No option price data available for covered calls")
+            logger.info("No valid contracts after qualification")
+            df_ccf = pd.DataFrame()
     else:
-        print("No valid contracts after qualification")
         df_ccf = pd.DataFrame()
-else:
-    df_ccf = pd.DataFrame()
-    print("No long uncovered/exposed positions")
+        logger.info("No long uncovered/exposed positions")
 
-uncov_short = df_unds[
-    uncov & (df_unds.position < 0) & ~df_unds.symbol.isin(_oo_covering)
-].reset_index(drop=True)
+    uncov_short = df_unds[
+        uncov & (df_unds.position < 0) & ~df_unds.symbol.isin(_oo_covering)
+    ].reset_index(drop=True)
 
-if not uncov_short.empty:
-    print(f"Processing {len(uncov_short)} short uncovered/exposed positions...")
+    if not uncov_short.empty:
+        logger.info("Processing %s short uncovered/exposed positions...", len(uncov_short))
 
-    df_cp = (
-        chains[chains.symbol.isin(uncov_short.symbol.unique())]
-        .loc[(chains.dte.between(COVER_MIN_DTE, COVER_MIN_DTE + 7))][
-            ["symbol", "expiry", "strike", "dte"]
-        ]
-        .sort_values(["symbol", "dte"])
-        .reset_index(drop=True)
-    )
-
-    df_cp = df_cp.merge(df_unds[["symbol", "price", "iv", "avgCost"]], on="symbol", how="left")
-    df_cp.rename(columns={"price": "undPrice", "iv": "vy"}, inplace=True)
-
-    df_cp["sdev"] = df_cp.undPrice * df_cp.vy * (df_cp.dte / 365) ** 0.5
-
-    vol_based_price = df_cp.undPrice - config.get("COVER_STD_MULT") * df_cp.sdev
-    df_cp["covPrice"] = np.minimum(df_cp.avgCost, vol_based_price)
-
-    no_of_options = 3
-
-    cp_short = (
-        df_cp.groupby(["symbol", "expiry"])[
-            ["symbol", "expiry", "strike", "undPrice", "sdev", "covPrice"]
-        ]
-        .apply(
-            lambda x: x[x["strike"] < x["covPrice"]]
-            .assign(diff=x["covPrice"] - x["strike"])
-            .sort_values("diff")
-            .head(no_of_options)
-        )
-        .drop(columns=["level_2", "diff"], errors="ignore")
-    )
-
-    cov_puts = [
-        Option(s, e, k, "P", "SMART")
-        for s, e, k in zip(cp_short.symbol, cp_short.expiry, cp_short.strike)
-    ]
-
-    print("Qualifying covered put contracts...")
-    valid_contracts = qualify_me(ib, cov_puts, desc="Qualifying covered put contracts")
-    valid_contracts = [v for v in valid_contracts if v is not None]
-
-    if valid_contracts:
-        df_cp1 = clean_ib_util_df(valid_contracts)
-
-        df_cpf = df_cp1.loc[df_cp1.groupby("symbol")["strike"].idxmax()]
-
-        df_cpf = df_cpf.reset_index(drop=True)
-
-        df_cpf = df_cpf.merge(df_unds[["symbol", "price", "iv"]], on="symbol", how="left")
-        df_cpf.rename(columns={"price": "undPrice", "iv": "vy"}, inplace=True)
-
-        df_cpf = df_cpf.merge(
-            df_pf[df_pf.state.isin(["uncovered", "exposed"]) & (df_pf.secType == "STK")][
-                ["symbol", "position", "avgCost"]
-            ],
-            on="symbol",
-            how="left",
+        df_cp = (
+            chains[chains.symbol.isin(uncov_short.symbol.unique())]
+            .loc[(chains.dte.between(COVER_MIN_DTE, COVER_MIN_DTE + 7))][
+                ["symbol", "expiry", "strike", "dte"]
+            ]
+            .sort_values(["symbol", "dte"])
+            .reset_index(drop=True)
         )
 
-        df_cpf["action"] = "SELL"
-        df_cpf["qty"] = abs(df_cpf["position"]) / 100
-        df_cpf = df_cpf.drop(columns=["position"])
+        df_cp = df_cp.merge(df_unds[["symbol", "price", "iv", "avgCost"]], on="symbol", how="left")
+        df_cp.rename(columns={"price": "undPrice", "iv": "vy"}, inplace=True)
 
-        print("Getting covered put prices...")
-        df_iv_cp = get_volatilities_snapshot(df_cpf["contract"].tolist(), market="SNP", ib=ib, desc="Fetching covered put volatilities")
+        df_cp["sdev"] = df_cp.undPrice * df_cp.vy * (df_cp.dte / 365) ** 0.5
 
-        if not df_iv_cp.empty:
-            df_cpf = df_cpf.merge(df_iv_cp[["symbol", "price"]], on="symbol", how="left")
+        vol_based_price = df_cp.undPrice - config.get("COVER_STD_MULT") * df_cp.sdev
+        df_cp["covPrice"] = np.minimum(df_cp.avgCost, vol_based_price)
 
-            df_cpf["margin"] = df_cpf.apply(
-                lambda x: atm_margin(x.strike, x.undPrice, get_dte(x.expiry), x.vy), axis=1
+        no_of_options = 3
+
+        cp_short = (
+            df_cp.groupby(["symbol", "expiry"])[
+                ["symbol", "expiry", "strike", "undPrice", "sdev", "covPrice"]
+            ]
+            .apply(
+                lambda x: x[x["strike"] < x["covPrice"]]
+                .assign(diff=x["covPrice"] - x["strike"])
+                .sort_values("diff")
+                .head(no_of_options)
             )
+            .drop(columns=["level_2", "diff"], errors="ignore")
+        )
+
+        cov_puts = [
+            Option(s, e, k, "P", "SMART")
+            for s, e, k in zip(cp_short.symbol, cp_short.expiry, cp_short.strike)
+        ]
+
+        logger.info("Qualifying covered put contracts...")
+        valid_contracts = qualify_me(ib, cov_puts, desc="Qualifying covered put contracts")
+        valid_contracts = [v for v in valid_contracts if v is not None]
+
+        if valid_contracts:
+            df_cp1 = clean_ib_util_df(valid_contracts)
+
+            df_cpf = df_cp1.loc[df_cp1.groupby("symbol")["strike"].idxmax()]
+
+            df_cpf = df_cpf.reset_index(drop=True)
+
+            df_cpf = df_cpf.merge(df_unds[["symbol", "price", "iv"]], on="symbol", how="left")
+            df_cpf.rename(columns={"price": "undPrice", "iv": "vy"}, inplace=True)
+
+            df_cpf = df_cpf.merge(
+                df_pf[df_pf.state.isin(["uncovered", "exposed"]) & (df_pf.secType == "STK")][
+                    ["symbol", "position", "avgCost"]
+                ],
+                on="symbol",
+                how="left",
+            )
+
+            df_cpf["action"] = "SELL"
+            df_cpf["qty"] = abs(df_cpf["position"]) / 100
+            df_cpf = df_cpf.drop(columns=["position"])
+
+            logger.info("Getting covered put prices...")
+            df_iv_cp = get_volatilities_snapshot(df_cpf["contract"].tolist(), market="SNP", ib=ib, desc="Fetching covered put volatilities")
+
+            if not df_iv_cp.empty:
+                df_cpf = df_cpf.merge(df_iv_cp[["symbol", "price"]], on="symbol", how="left")
+
+                df_cpf["margin"] = df_cpf.apply(
+                    lambda x: atm_margin(x.strike, x.undPrice, get_dte(x.expiry), x.vy), axis=1
+                )
+            else:
+                logger.info("No option price data available for covered puts")
+
         else:
-            print("No option price data available for covered puts")
-
+            logger.info("No valid contracts after qualification")
+            df_cpf = pd.DataFrame()
     else:
-        print("No valid contracts after qualification")
         df_cpf = pd.DataFrame()
-else:
-    df_cpf = pd.DataFrame()
-    print("No short uncovered/exposed positions")
+        logger.info("No short uncovered/exposed positions")
 
-df_cov = pd.concat([df_ccf, df_cpf], ignore_index=True)
+    df_cov = pd.concat([df_ccf, df_cpf], ignore_index=True)
 
-cov_path = ROOT / "data" / "df_cov.pkl"
+    cov_path = ROOT / "data" / "df_cov.pkl"
 
-if not df_cov.empty:
-    df_cov.insert(4, "dte", df_cov.expiry.apply(get_dte))
+    if not df_cov.empty:
+        df_cov.insert(4, "dte", df_cov.expiry.apply(get_dte))
 
-    df_cov = df_cov.dropna(subset=["price"])
+        df_cov = df_cov.dropna(subset=["price"])
 
-    df_cov["xPrice"] = df_cov.apply(
-        lambda x: max(get_prec(x.price * COVXPMULT, 0.01), 0.05) if x.qty != 0 else 0,
-        axis=1,
-    )
+        df_cov["xPrice"] = df_cov.apply(
+            lambda x: max(get_prec(x.price * COVXPMULT, 0.01), 0.05) if x.qty != 0 else 0,
+            axis=1,
+        )
 
-    pickle_me(df_cov, cov_path)
-
-    cost = (df_cov.avgCost * df_cov.qty * 100).sum()
-    premium = (df_cov.xPrice * df_cov.qty * 100).sum()
-    maxProfit = (
-        np.where(
-            df_cov.right == "C",
-            (df_cov.strike - df_cov.undPrice) * df_cov.qty * 100,
-            (df_cov.undPrice - df_cov.strike) * df_cov.qty * 100,
-        ).sum()
-        + premium
-    )
-
-    print(f"Position Cost: $ {cost:,.2f}")
-    print(f"Cover Premium: $ {premium:,.2f}")
-    print(f"Max Profit: $ {maxProfit:,.2f}\n")
-else:
-    print("No covers available!\n")
+        pickle_me(df_cov, cov_path)
+    else:
+        logger.info("No covers generated")
 
 # %% MAKE MONTHLY COVERED CALLS FOR MONTHLY-ONLY HELD STOCKS
-print("\n=== MAKE MONTHLY COVERED CALLS FOR MONTHLY-ONLY HELD STOCKS ===")
+logger.info("=== MAKE MONTHLY COVERED CALLS FOR MONTHLY-ONLY HELD STOCKS ===")
 
 delete_pkl_files(["df_monthly_cov.pkl"])
 df_monthly_cov = pd.DataFrame()
 
-if not _monthly_syms:
-    print("No symbol_categories data — skipping monthly CC generation")
+if not COVER_ME:
+    logger.info("COVER_ME=False — skipping monthly CC generation")
+elif not _monthly_syms:
+    logger.info("No symbol_categories data — skipping monthly CC generation")
 else:
     _monthly_uncov = df_unds[
         df_unds.state.isin(["exposed", "uncovered"])
@@ -439,9 +432,9 @@ else:
     ].reset_index(drop=True)
 
     if _monthly_uncov.empty:
-        print("No monthly-only uncovered positions")
+        logger.info("No monthly-only uncovered positions")
     else:
-        print(f"Processing {len(_monthly_uncov)} monthly-only uncovered positions...")
+        logger.info("Processing %s monthly-only uncovered positions...", len(_monthly_uncov))
 
         _df_mc = chains[chains.symbol.isin(_monthly_uncov.symbol.unique())].copy()
         _df_mc = _df_mc.merge(df_unds[["symbol", "price", "iv", "avgCost"]], on="symbol", how="left")
@@ -459,7 +452,7 @@ else:
                     break
 
         if not _mc_best:
-            print("No viable monthly CC strikes at/above avgCost")
+            logger.info("No viable monthly CC strikes at/above avgCost")
         else:
             _mc_calls_df = pd.DataFrame(_mc_best).reset_index(drop=True)
             _monthly_opts = [
@@ -467,12 +460,12 @@ else:
                 for s, e, k in zip(_mc_calls_df.symbol, _mc_calls_df.expiry, _mc_calls_df.strike)
             ]
 
-            print("Qualifying monthly CC contracts...")
+            logger.info("Qualifying monthly CC contracts...")
             _valid_mc = qualify_me(ib, _monthly_opts, desc="Qualifying monthly CC contracts")
             _valid_mc = [v for v in _valid_mc if v is not None]
 
             if not _valid_mc:
-                print("No valid monthly CC contracts after qualification")
+                logger.info("No valid monthly CC contracts after qualification")
             else:
                 _df_mc1 = clean_ib_util_df(_valid_mc)
                 _df_mcf = _df_mc1.loc[_df_mc1.groupby("symbol")["strike"].idxmin()].reset_index(drop=True)
@@ -492,14 +485,14 @@ else:
                 _df_mcf["qty"] = _df_mcf["position"] / 100
                 _df_mcf = _df_mcf.drop(columns=["position"])
 
-                print("Getting monthly CC prices...")
+                logger.info("Getting monthly CC prices...")
                 _df_iv_mc = get_volatilities_snapshot(
                     _df_mcf["contract"].tolist(), market="SNP", ib=ib,
                     desc="Fetching monthly CC volatilities",
                 )
 
                 if _df_iv_mc.empty:
-                    print("No price data for monthly CCs")
+                    logger.info("No price data for monthly CCs")
                 else:
                     _df_mcf = _df_mcf.merge(_df_iv_mc[["symbol", "price"]], on="symbol", how="left")
                     _df_mcf["dte"] = _df_mcf.expiry.apply(get_dte)
@@ -518,23 +511,15 @@ else:
                     df_monthly_cov = _df_mcf.dropna(subset=["price"]).reset_index(drop=True)
                     pickle_me(df_monthly_cov, ROOT / "data" / "df_monthly_cov.pkl")
 
-                    _mc_prem = (df_monthly_cov.xPrice * 100 * df_monthly_cov.qty).sum()
-                    _mc_profit = (
-                        (df_monthly_cov.strike - df_monthly_cov.avgCost + df_monthly_cov.xPrice)
-                        * 100 * df_monthly_cov.qty
-                    ).sum()
-                    print(f"Monthly CC Premium: $ {_mc_prem:,.2f}")
-                    print(f"Monthly CC Profit if Called: $ {_mc_profit:,.2f}\n")
-
 # %% MAKE SOWING CONTRACTS FOR VIRGIN AND ORPHANED SYMBOLS
-print("\n=== MAKE SOWING CONTRACTS FOR VIRGIN AND ORPHANED SYMBOLS ===")
+logger.info("=== MAKE SOWING CONTRACTS FOR VIRGIN AND ORPHANED SYMBOLS ===")
 
 delete_pkl_files(["df_nkd.pkl"])
 
 if not SOW_NAKEDS:
-    print("SOW_NAKEDS=False — skipping sow generation")
+    logger.info("SOW_NAKEDS=False — skipping sow generation")
 elif fin.get("cushion", 0) < MINCUSHION:
-    print(f"Skipping sow: cushion {fin.get('cushion', 0):.1%} < MINCUSHION {MINCUSHION:.1%}")
+    logger.info("Skipping sow: cushion %s < MINCUSHION %s", f"{fin.get('cushion', 0):.1%}", f"{MINCUSHION:.1%}")
 else:
     df_v = df_unds[
         ((df_unds.state == "virgin") | (df_unds.state == "orphaned"))
@@ -549,7 +534,7 @@ else:
             ]
         )
         if _skipped_monthly:
-            print(f"Skipping sow for monthly-only symbols: {sorted(_skipped_monthly)}")
+            logger.info("Skipping sow for %d monthly-only symbols", len(_skipped_monthly))
 
     sow_chains = chains[chains["expiry"].apply(_is_weekly_expiry)]
     df_virg = sow_chains.loc[
@@ -588,7 +573,7 @@ else:
     df_nkd = pd.DataFrame()
 
     if virg_puts:
-        print("Qualifying virgin put contracts...")
+        logger.info("Qualifying virgin put contracts...")
         valid_contracts = qualify_me(
             ib, virg_puts, desc="Qualifying virgin put contracts", batch_size=150
         )
@@ -606,7 +591,7 @@ else:
             nakeds = nakeds.merge(df_unds[["symbol", "price", "iv"]], on="symbol", how="left")
             nakeds.rename(columns={"price": "undPrice", "iv": "vy"}, inplace=True)
 
-            print("Getting naked put prices...")
+            logger.info("Getting naked put prices...")
             df_iv_n = get_volatilities_snapshot(nakeds["contract"].tolist(), market="SNP", ib=ib, desc="Fetching naked put volatilities")
 
             if not df_iv_n.empty:
@@ -633,67 +618,74 @@ else:
                 pickle_me(df_nkd, nkd_path)
 
                 premium = (df_nkd.xPrice * 100 * df_nkd.qty).sum()
-                print(f"Naked Premiums: $ {premium:,.2f}\n")
+                logger.info("Naked Premiums: $ %s", f"{premium:,.2f}")
             else:
-                print("No option price data available for naked puts")
+                logger.info("No option price data available for naked puts")
         else:
-            print("No valid contracts after qualification")
+            logger.info("No valid contracts after qualification")
     else:
-        print("No suitable put chains found for virgin/orphaned")
+        logger.info("No suitable put chains found for virgin/orphaned")
 
 # %% MAKE REAPS
-print("\n=== MAKE REAPS ===")
+logger.info("=== MAKE REAPS ===")
 
-df_sowed = df_unds[df_unds.state == "unreaped"].reset_index(drop=True)
+delete_pkl_files(["df_reap.pkl"])
 
-df_reap = df_pf[df_pf.symbol.isin(df_sowed.symbol) & (df_pf.secType == "OPT")].reset_index(
-    drop=True
-)
+df_reap = pd.DataFrame()
 
-# Exclude contracts that already have an active BUY order (reaping order already submitted).
-if _oo_reaping and not df_reap.empty:
-    _reap_key = list(zip(df_reap["symbol"], df_reap["right"], df_reap["strike"]))
-    df_reap = df_reap[[k not in _oo_reaping for k in _reap_key]].reset_index(drop=True)
-
-df_reap = df_reap[df_reap.expiry.apply(get_dte) > MINREAPDTE].reset_index(drop=True)
-
-df_reap = df_reap.merge(df_unds[["symbol", "iv", "price"]], on="symbol", how="left")
-df_reap.rename(columns={"iv": "vy", "price": "undPrice"}, inplace=True)
-
-if not df_reap.empty:
-    print(f"Processing {len(df_reap)} unreaped positions...")
-
-    print("Qualifying reap contracts...")
-    valid_contracts = qualify_me(ib, df_reap["contract"].tolist(), desc="Qualifying reap contracts")
-    valid_contracts = [v for v in valid_contracts if v is not None]
-
-    if valid_contracts:
-        print("Calculating reap option prices...")
-        reap_prices = {}
-        df_reap_prices = get_volatilities_snapshot(valid_contracts, market="SNP", ib=ib, desc="Fetching reap volatilities")
-        df_reap["optPrice"] = df_reap.merge(df_reap_prices, on="symbol")["price"]
-
-        df_reap["xPrice"] = df_reap["optPrice"].apply(
-            lambda x: get_prec(max(0.01, x), 0.01) if pd.notna(x) else 0.01
-        )
-
-        df_reap["xPrice"] = df_reap.apply(
-            lambda x: min(x.xPrice, get_prec(abs(x.avgCost * REAPRATIO / 100), 0.01)), axis=1
-        )
-        df_reap["qty"] = df_reap.position.abs().astype(int)
-
-        reaps = (abs(df_reap.mktPrice - df_reap.xPrice) * df_reap.qty * 100).sum()
-
-        reap_path = ROOT / "data" / "df_reap.pkl"
-        pickle_me(df_reap, reap_path)
-        print(f"Have {len(df_reap)} reaping options unlocking US$ {reaps:,.0f}\n")
-    else:
-        print("No valid contracts after qualification")
+if not REAP_ME:
+    logger.info("REAP_ME=False — skipping reap generation")
 else:
-    print("No unreaped positions")
+    df_sowed = df_unds[df_unds.state == "unreaped"].reset_index(drop=True)
+
+    df_reap = df_pf[df_pf.symbol.isin(df_sowed.symbol) & (df_pf.secType == "OPT")].reset_index(
+        drop=True
+    )
+
+    # Exclude contracts that already have an active BUY order (reaping order already submitted).
+    if _oo_reaping and not df_reap.empty:
+        _reap_key = list(zip(df_reap["symbol"], df_reap["right"], df_reap["strike"]))
+        df_reap = df_reap[[k not in _oo_reaping for k in _reap_key]].reset_index(drop=True)
+
+    df_reap = df_reap[df_reap.expiry.apply(get_dte) > MINREAPDTE].reset_index(drop=True)
+
+    df_reap = df_reap.merge(df_unds[["symbol", "iv", "price"]], on="symbol", how="left")
+    df_reap.rename(columns={"iv": "vy", "price": "undPrice"}, inplace=True)
+
+    if not df_reap.empty:
+        logger.info("Processing %s unreaped positions...", len(df_reap))
+
+        logger.info("Qualifying reap contracts...")
+        valid_contracts = qualify_me(ib, df_reap["contract"].tolist(), desc="Qualifying reap contracts")
+        valid_contracts = [v for v in valid_contracts if v is not None]
+
+        if valid_contracts:
+            logger.info("Calculating reap option prices...")
+            reap_prices = {}
+            df_reap_prices = get_volatilities_snapshot(valid_contracts, market="SNP", ib=ib, desc="Fetching reap volatilities")
+            df_reap["optPrice"] = df_reap.merge(df_reap_prices, on="symbol")["price"]
+
+            df_reap["xPrice"] = df_reap["optPrice"].apply(
+                lambda x: get_prec(max(0.01, x), 0.01) if pd.notna(x) else 0.01
+            )
+
+            df_reap["xPrice"] = df_reap.apply(
+                lambda x: min(x.xPrice, get_prec(abs(x.avgCost * REAPRATIO / 100), 0.01)), axis=1
+            )
+            df_reap["qty"] = df_reap.position.abs().astype(int)
+
+            reaps = (abs(df_reap.mktPrice - df_reap.xPrice) * df_reap.qty * 100).sum()
+
+            reap_path = ROOT / "data" / "df_reap.pkl"
+            pickle_me(df_reap, reap_path)
+            logger.info("Have %s reaping options unlocking US$ %s", len(df_reap), f"{reaps:,.0f}")
+        else:
+            logger.info("No valid contracts after qualification")
+    else:
+        logger.info("No unreaped positions")
 
 # %% EXTRACT ORPHANED CONTRACTS FROM df_pf
-print("\n=== EXTRACT ORPHANED CONTRACTS FROM df_pf ===")
+logger.info("=== EXTRACT ORPHANED CONTRACTS FROM df_pf ===")
 
 delete_pkl_files(["df_deorph.pkl"])
 
@@ -704,9 +696,9 @@ df_deorph = df_deorph[
 ]
 
 if not df_deorph.empty:
-    print(f"Processing {len(df_deorph)} orphaned positions...")
+    logger.info("Processing %s orphaned positions...", len(df_deorph))
 
-    print("Qualifying orphaned contracts...")
+    logger.info("Qualifying orphaned contracts...")
     valid_contracts = qualify_me(
         ib, df_deorph["contract"].tolist(), desc="Qualifying orphaned contracts"
     )
@@ -720,421 +712,396 @@ if not df_deorph.empty:
 
         deorph_path = ROOT / "data" / "df_deorph.pkl"
         pickle_me(df_deorph, deorph_path)
-        print(f"Have {len(df_deorph)} orphaned options with total value US$ {deorph_total:,.0f}\n")
+        logger.info("Have %s orphaned options with total value US$ %s", len(df_deorph), f"{deorph_total:,.0f}")
     else:
-        print("No valid contracts after qualification")
+        logger.info("No valid contracts after qualification")
 else:
-    print("There are no orphaned options to process\n")
+    logger.info("There are no orphaned options to process")
 
 # %% IDENTIFY UNPROTECTED POSITIONS
-print("\n=== IDENTIFYING UNPROTECTED POSITIONS ===")
+logger.info("=== IDENTIFYING UNPROTECTED POSITIONS ===")
 
 delete_pkl_files(["df_protect.pkl"])
 
+df_protect = pd.DataFrame()
+
 if not PROTECT_ME:
-    print("Note: PROTECT_ME=False — generating protection recommendations regardless.")
-df_unprot = df_unds[
-    df_unds.state.isin(["unprotected", "exposed"]) & ~df_unds.symbol.isin(_oo_protecting)
-].reset_index(drop=True)
-print(f"Found {len(df_unprot)} unprotected/exposed positions")
+    logger.info("PROTECT_ME=False — skipping protection generation")
+else:
+    df_unprot = df_unds[
+        df_unds.state.isin(["unprotected", "exposed"]) & ~df_unds.symbol.isin(_oo_protecting)
+    ].reset_index(drop=True)
+    logger.info("Found %s unprotected/exposed positions", len(df_unprot))
 
-# Separate long and short positions
-df_ulong = df_unprot[df_unprot.position > 0].copy()
-df_ushort = df_unprot[df_unprot.position < 0].copy()
+    # Separate long and short positions
+    df_ulong = df_unprot[df_unprot.position > 0].copy()
+    df_ushort = df_unprot[df_unprot.position < 0].copy()
 
-print(f"Long unprotected: {len(df_ulong)}")
-print(f"Short unprotected: {len(df_ushort)}")
+    logger.info("Long unprotected: %s", len(df_ulong))
+    logger.info("Short unprotected: %s", len(df_ushort))
 
-# %% BUILD LONG PROTECTION (PUTS FOR LONG STOCK)
-print("\n=== BUILDING LONG PROTECTION RECOMMENDATIONS ===")
+    # %% BUILD LONG PROTECTION (PUTS FOR LONG STOCK)
+    logger.info("=== BUILDING LONG PROTECTION RECOMMENDATIONS ===")
 
-df_lprot = pd.DataFrame()
+    df_lprot = pd.DataFrame()
 
-if not df_ulong.empty:
-    print(f"Processing {len(df_ulong)} long positions...")
+    if not df_ulong.empty:
+        logger.info("Processing %s long positions...", len(df_ulong))
 
-    # Get chains nearest to PROTECT_DTE
-    mask = chains.symbol.isin(df_ulong.symbol)
-    df_uch = (
-        chains[mask]
-        .groupby(["symbol", "strike"])["dte"]
-        .apply(lambda x: x.sub(PROTECT_DTE).abs().idxmin())
-    )
-    # Use .values to get integer indices from idxmin()
-    df_uch = chains.loc[df_uch.values].reset_index(drop=True)
+        # Get chains nearest to PROTECT_DTE
+        mask = chains.symbol.isin(df_ulong.symbol)
+        df_uch = (
+            chains[mask]
+            .groupby(["symbol", "strike"])["dte"]
+            .apply(lambda x: x.sub(PROTECT_DTE).abs().idxmin())
+        )
+        # Use .values to get integer indices from idxmin()
+        df_uch = chains.loc[df_uch.values].reset_index(drop=True)
 
-    # Get PROTECTION_STRIP OTM puts (strikes below undPrice)
-    df_ul = df_uch[df_uch.symbol.isin(df_ulong.symbol)].copy()
-    df_ul = df_ul.sort_values(["symbol", "expiry", "strike"], ascending=[True, True, False])
-    df_ul = df_ul.merge(df_unds[["symbol", "price"]], on="symbol", how="left")
-    df_ul.rename(columns={"price": "undPrice"}, inplace=True)
+        # Get PROTECTION_STRIP OTM puts (strikes below undPrice)
+        df_ul = df_uch[df_uch.symbol.isin(df_ulong.symbol)].copy()
+        df_ul = df_ul.sort_values(["symbol", "expiry", "strike"], ascending=[True, True, False])
+        df_ul = df_ul.merge(df_unds[["symbol", "price"]], on="symbol", how="left")
+        df_ul.rename(columns={"price": "undPrice"}, inplace=True)
 
-    # Filter for puts below underlying price
-    def get_otm_puts(group):
-        und_price = group["undPrice"].iloc[0]
-        otm_puts = group[group["strike"] <= und_price].head(PROTECTION_STRIP)
-        return otm_puts
+        # Filter for puts below underlying price
+        def get_otm_puts(group):
+            und_price = group["undPrice"].iloc[0]
+            otm_puts = group[group["strike"] <= und_price].head(PROTECTION_STRIP)
+            return otm_puts
 
-    df_ul = (
-        df_ul.groupby("symbol", group_keys=True)
-        .apply(get_otm_puts, include_groups=False)
-        .reset_index()
-    )
-
-    if not df_ul.empty:
-        df_ul["right"] = "P"
-        df_ul["contract"] = df_ul.apply(
-            lambda x: Option(x.symbol, x.expiry, x.strike, x.right, "SMART"), axis=1
+        df_ul = (
+            df_ul.groupby("symbol", group_keys=True)
+            .apply(get_otm_puts, include_groups=False)
+            .reset_index()
         )
 
-        # Qualify contracts
-        print("Qualifying long protection contracts...")
-        valid_contracts = qualify_me(
-            ib, df_ul["contract"].tolist(), desc="Qualifying long protection contracts"
-        )
-        valid_contracts = [v for v in valid_contracts if v is not None]
+        if not df_ul.empty:
+            df_ul["right"] = "P"
+            df_ul["contract"] = df_ul.apply(
+                lambda x: Option(x.symbol, x.expiry, x.strike, x.right, "SMART"), axis=1
+            )
 
-        # Get option market data using built-in connection in get_volatilities_snapshot
-        if valid_contracts:
-            print("Getting option prices...")
-            df_iv_p = get_volatilities_snapshot(valid_contracts, market="SNP", ib=ib, desc="Fetching long protection volatilities")
+            # Qualify contracts
+            logger.info("Qualifying long protection contracts...")
+            valid_contracts = qualify_me(
+                ib, df_ul["contract"].tolist(), desc="Qualifying long protection contracts"
+            )
+            valid_contracts = [v for v in valid_contracts if v is not None]
 
-            if not df_iv_p.empty:
-                df_u = clean_ib_util_df(valid_contracts)
-                dfu = df_unds[["symbol", "iv", "price", "position"]].copy()
-                dfu.rename(columns={"iv": "vy", "price": "undPrice"}, inplace=True)
+            # Get option market data using built-in connection in get_volatilities_snapshot
+            if valid_contracts:
+                logger.info("Getting option prices...")
+                df_iv_p = get_volatilities_snapshot(valid_contracts, market="SNP", ib=ib, desc="Fetching long protection volatilities")
 
-                df_ivp = df_u.merge(dfu, on="symbol", how="left")
-                df_ivp = df_ivp.merge(df_iv_p.drop(columns="conId"), on="symbol", how="left")
-                df_ivp["qty"] = (df_ivp.position.abs() / 100).astype("int")
-                df_ivp["dte"] = df_ivp.expiry.apply(get_dte)
-                df_ivp["protection"] = (df_ivp["undPrice"] - df_ivp["strike"]) * 100 * df_ivp.qty
+                if not df_iv_p.empty:
+                    df_u = clean_ib_util_df(valid_contracts)
+                    dfu = df_unds[["symbol", "iv", "price", "position"]].copy()
+                    dfu.rename(columns={"iv": "vy", "price": "undPrice"}, inplace=True)
 
-                # Select closest (cheapest) protection per symbol
-                df_lprot = df_ivp.loc[df_ivp.groupby("symbol")["protection"].idxmin()]
-                print(f"Generated {len(df_lprot)} long protection recommendations")
+                    df_ivp = df_u.merge(dfu, on="symbol", how="left")
+                    df_ivp = df_ivp.merge(df_iv_p.drop(columns="conId"), on="symbol", how="left")
+                    df_ivp["qty"] = (df_ivp.position.abs() / 100).astype("int")
+                    df_ivp["dte"] = df_ivp.expiry.apply(get_dte)
+                    df_ivp["protection"] = (df_ivp["undPrice"] - df_ivp["strike"]) * 100 * df_ivp.qty
+
+                    # Select closest (cheapest) protection per symbol
+                    df_lprot = df_ivp.loc[df_ivp.groupby("symbol")["protection"].idxmin()]
+                    logger.info("Generated %s long protection recommendations", len(df_lprot))
+                else:
+                    logger.info("No option price data available for long protection")
             else:
-                print("No option price data available for long protection")
+                logger.info("No valid contracts after qualification")
         else:
-            print("No valid contracts after qualification")
+            logger.info("No suitable put chains found for long protection")
     else:
-        print("No suitable put chains found for long protection")
-else:
-    print("No long unprotected positions")
+        logger.info("No long unprotected positions")
 
-# %% BUILD SHORT PROTECTION (CALLS FOR SHORT STOCK)
-print("\n=== BUILDING SHORT PROTECTION RECOMMENDATIONS ===")
+    # %% BUILD SHORT PROTECTION (CALLS FOR SHORT STOCK)
+    logger.info("=== BUILDING SHORT PROTECTION RECOMMENDATIONS ===")
 
-df_sprot = pd.DataFrame()
+    df_sprot = pd.DataFrame()
 
-if not df_ushort.empty:
-    print(f"Processing {len(df_ushort)} short positions...")
+    if not df_ushort.empty:
+        logger.info("Processing %s short positions...", len(df_ushort))
 
-    # Get chains nearest to PROTECT_DTE
-    mask = chains.symbol.isin(df_ushort.symbol)
-    df_sch = (
-        chains[mask]
-        .groupby(["symbol", "strike"])["dte"]
-        .apply(lambda x: x.sub(PROTECT_DTE).abs().idxmin())
-    )
-    # Use .values to get integer indices from idxmin()
-    df_sch = chains.loc[df_sch.values].reset_index(drop=True)
+        # Get chains nearest to PROTECT_DTE
+        mask = chains.symbol.isin(df_ushort.symbol)
+        df_sch = (
+            chains[mask]
+            .groupby(["symbol", "strike"])["dte"]
+            .apply(lambda x: x.sub(PROTECT_DTE).abs().idxmin())
+        )
+        # Use .values to get integer indices from idxmin()
+        df_sch = chains.loc[df_sch.values].reset_index(drop=True)
 
-    # Get PROTECTION_STRIP OTM calls (strikes above undPrice)
-    df_us = df_sch[df_sch.symbol.isin(df_ushort.symbol)].copy()
-    df_us = df_us.sort_values(["symbol", "expiry", "strike"], ascending=[True, True, True])
-    df_us = df_us.merge(df_unds[["symbol", "price"]], on="symbol", how="left")
-    df_us.rename(columns={"price": "undPrice"}, inplace=True)
+        # Get PROTECTION_STRIP OTM calls (strikes above undPrice)
+        df_us = df_sch[df_sch.symbol.isin(df_ushort.symbol)].copy()
+        df_us = df_us.sort_values(["symbol", "expiry", "strike"], ascending=[True, True, True])
+        df_us = df_us.merge(df_unds[["symbol", "price"]], on="symbol", how="left")
+        df_us.rename(columns={"price": "undPrice"}, inplace=True)
 
-    # Filter for calls above underlying price
-    def get_otm_calls(group):
-        und_price = group["undPrice"].iloc[0]
-        otm_calls = group[group["strike"] >= und_price].head(PROTECTION_STRIP)
-        return otm_calls
+        # Filter for calls above underlying price
+        def get_otm_calls(group):
+            und_price = group["undPrice"].iloc[0]
+            otm_calls = group[group["strike"] >= und_price].head(PROTECTION_STRIP)
+            return otm_calls
 
-    df_us = (
-        df_us.groupby("symbol", group_keys=True)
-        .apply(get_otm_calls, include_groups=False)
-        .reset_index()
-    )
-
-    if not df_us.empty:
-        df_us["right"] = "C"
-        df_us["contract"] = df_us.apply(
-            lambda x: Option(x.symbol, x.expiry, x.strike, x.right, "SMART"), axis=1
+        df_us = (
+            df_us.groupby("symbol", group_keys=True)
+            .apply(get_otm_calls, include_groups=False)
+            .reset_index()
         )
 
-        # Qualify contracts
-        print("Qualifying short protection contracts...")
-        valid_contracts = qualify_me(
-            ib, df_us["contract"].tolist(), desc="Qualifying short protection contracts"
-        )
-        valid_contracts = [v for v in valid_contracts if v is not None]
+        if not df_us.empty:
+            df_us["right"] = "C"
+            df_us["contract"] = df_us.apply(
+                lambda x: Option(x.symbol, x.expiry, x.strike, x.right, "SMART"), axis=1
+            )
 
-        # Get option market data using built-in connection in get_volatilities_snapshot
-        if valid_contracts:
-            print("Getting option prices...")
-            df_iv_s = get_volatilities_snapshot(valid_contracts, market="SNP", ib=ib, desc="Fetching short protection volatilities")
+            # Qualify contracts
+            logger.info("Qualifying short protection contracts...")
+            valid_contracts = qualify_me(
+                ib, df_us["contract"].tolist(), desc="Qualifying short protection contracts"
+            )
+            valid_contracts = [v for v in valid_contracts if v is not None]
 
-            if not df_iv_s.empty:
-                df_u = clean_ib_util_df(valid_contracts)
-                dfu = df_unds[["symbol", "iv", "price", "position"]].copy()
-                dfu.rename(columns={"iv": "vy", "price": "undPrice"}, inplace=True)
+            # Get option market data using built-in connection in get_volatilities_snapshot
+            if valid_contracts:
+                logger.info("Getting option prices...")
+                df_iv_s = get_volatilities_snapshot(valid_contracts, market="SNP", ib=ib, desc="Fetching short protection volatilities")
 
-                df_ivs = df_u.merge(dfu, on="symbol", how="left")
-                df_ivs = df_ivs.merge(df_iv_s.drop(columns="conId"), on="symbol", how="left")
-                df_ivs["qty"] = (df_ivs.position.abs() / 100).astype("int")
-                df_ivs["dte"] = df_ivs.expiry.apply(get_dte)
-                df_ivs["protection"] = (df_ivs["strike"] - df_ivs["undPrice"]) * 100 * df_ivs.qty
+                if not df_iv_s.empty:
+                    df_u = clean_ib_util_df(valid_contracts)
+                    dfu = df_unds[["symbol", "iv", "price", "position"]].copy()
+                    dfu.rename(columns={"iv": "vy", "price": "undPrice"}, inplace=True)
 
-                # Select closest (cheapest) protection per symbol
-                df_sprot = df_ivs.loc[df_ivs.groupby("symbol")["protection"].idxmin()]
-                print(f"Generated {len(df_sprot)} short protection recommendations")
+                    df_ivs = df_u.merge(dfu, on="symbol", how="left")
+                    df_ivs = df_ivs.merge(df_iv_s.drop(columns="conId"), on="symbol", how="left")
+                    df_ivs["qty"] = (df_ivs.position.abs() / 100).astype("int")
+                    df_ivs["dte"] = df_ivs.expiry.apply(get_dte)
+                    df_ivs["protection"] = (df_ivs["strike"] - df_ivs["undPrice"]) * 100 * df_ivs.qty
+
+                    # Select closest (cheapest) protection per symbol
+                    df_sprot = df_ivs.loc[df_ivs.groupby("symbol")["protection"].idxmin()]
+                    logger.info("Generated %s short protection recommendations", len(df_sprot))
+                else:
+                    logger.info("No option price data available for short protection")
             else:
-                print("No option price data available for short protection")
+                logger.info("No valid contracts after qualification")
         else:
-            print("No valid contracts after qualification")
+            logger.info("No suitable call chains found for short protection")
     else:
-        print("No suitable call chains found for short protection")
-else:
-    print("No short unprotected positions")
+        logger.info("No short unprotected positions")
 
-# %% CALCULATE FINAL PROTECTION PRICES
-print("\n=== CALCULATING FINAL PROTECTION PRICES ===")
+    # %% CALCULATE FINAL PROTECTION PRICES
+    logger.info("=== CALCULATING FINAL PROTECTION PRICES ===")
 
-df_protect = pd.concat([df_lprot, df_sprot], ignore_index=True)
+    df_protect = pd.concat([df_lprot, df_sprot], ignore_index=True)
 
-if df_protect.empty:
-    print("No protection recommendations generated!")
-else:
-    print(f"Combined {len(df_protect)} protection recommendations")
+    if df_protect.empty:
+        logger.info("No protection recommendations generated!")
+    else:
+        logger.info("Combined %s protection recommendations", len(df_protect))
 
-    # Replace 'vy' with 'iv' in 'df_protect' where 'iv' is not NaN
-    mask = df_protect["iv"].notna()
-    df_protect.loc[mask, "vy"] = df_protect.loc[mask, "iv"]
+        # Replace 'vy' with 'iv' in 'df_protect' where 'iv' is not NaN
+        mask = df_protect["iv"].notna()
+        df_protect.loc[mask, "vy"] = df_protect.loc[mask, "iv"]
 
-    df_protect["xPrice"] = df_protect["price"].apply(
-        lambda x: get_prec(max(0.01, x), 0.01) if pd.notna(x) else 0.01
-    )
+        df_protect["xPrice"] = df_protect["price"].apply(
+            lambda x: get_prec(max(0.01, x), 0.01) if pd.notna(x) else 0.01
+        )
 
-    # Calculate costs
-    df_protect["cost"] = df_protect["xPrice"] * df_protect["qty"] * 100
-    df_protect["puc"] = df_protect["protection"] / df_protect["cost"]
+        # Calculate costs
+        df_protect["cost"] = df_protect["xPrice"] * df_protect["qty"] * 100
+        df_protect["puc"] = df_protect["protection"] / df_protect["cost"]
 
-    # Clean up
-    df_protect.drop(columns=["iv", "hv"], inplace=True, errors="ignore")
+        # Clean up
+        df_protect.drop(columns=["iv", "hv"], inplace=True, errors="ignore")
 
-    # Summary
-    total_protection = df_protect["protection"].sum()
-    total_cost = df_protect["cost"].sum()
-    avg_dte = df_protect["dte"].mean()
+        # Save results
+        protect_path = ROOT / "data" / "df_protect.pkl"
+        pickle_me(df_protect, protect_path)
+        logger.info("Saved %s protection recommendations to %s", len(df_protect), protect_path)
 
-    print(f"\n{'=' * 60}")
-    print("PROTECTION SUMMARY")
-    print(f"{'=' * 60}")
-    print(f"Total potential damage prevented:  ${total_protection:,.0f}")
-    print(f"Total protection cost:            ${total_cost:,.0f}")
-    print(f"Number of symbols:               {len(df_protect.symbol.unique())}")
-    print(f"Average DTE:                      {avg_dte:.1f} days")
-    print(f"{'=' * 60}")
-
-    # Save results
-    protect_path = ROOT / "data" / "df_protect.pkl"
-    pickle_me(df_protect, protect_path)
-    print(f"\nSaved protection recommendations to {protect_path}")
-
-    # Show top recommendations
-    print("\nTop 10 Protection Recommendations:")
-    display_cols = [
-        "symbol",
-        "right",
-        "strike",
-        "undPrice",
-        "qty",
-        "protection",
-        "xPrice",
-        "cost",
-        "puc",
-        "dte",
-    ]
-    print(df_protect[display_cols].head(10).round(2).to_string())
-
-# %% FINAL OUTPUT
-print("\n=== PROTECTION RECOMMENDATIONS COMPLETE ===")
+# %% FINAL OUTPUT (PROTECTION)
+logger.info("=== PROTECTION RECOMMENDATIONS COMPLETE ===")
 if not df_protect.empty:
-    print(f"✅ Successfully generated {len(df_protect)} protection recommendations")
-    print(f"📁 Saved to: {ROOT / 'data' / 'df_protect.pkl'}")
+    logger.info("Successfully generated %s protection recommendations", len(df_protect))
 else:
-    print("ℹ️  No protection recommendations needed or generated!")
+    logger.info("No protection recommendations needed or generated!")
 
 # %% ROLLS FOR PROTECTING PUTS
-print("\n=== ROLLS FOR PROTECTING PUTS ===")
+logger.info("=== ROLLS FOR PROTECTING PUTS ===")
 
 delete_pkl_files(["protect_rolls.pkl"])
 
-df_pfu = df_pf.merge(df_unds[["symbol", "price"]], on="symbol", how="left")
-df_pfu.rename(columns={"price": "undPrice"}, inplace=True)
-
-df_rolls = (
-    df_pfu[(df_pfu["state"] == "protecting") & (df_pfu.right == "P")]
-    .assign(
-        odiff=lambda x: (x["undPrice"] - x["strike"]),
-        ostrike=df_pfu.strike,
-        odte=df_pfu.dte,
-        pct_diff=lambda x: (abs(x["strike"] - x["undPrice"]) / x["undPrice"] * 100),
-    )
-    .sort_values("pct_diff", ascending=False)
-    .reset_index(drop=True)
-)
-
-short_itm_calls = (
-    df_pfu[
-        (df_pfu.secType == "OPT")
-        & (df_pfu.right == "C")
-        & (df_pfu.position < 0)
-        & df_pfu["undPrice"].notna()
-    ]
-    .loc[lambda x: x["strike"] < x["undPrice"], "symbol"]
-    .unique()
-)
-
-if short_itm_calls.size:
-    df_rolls = df_rolls[~df_rolls.symbol.isin(short_itm_calls)].reset_index(drop=True)
-    print(
-        "Skipping protecting-put rolls for symbols with ITM short calls: "
-        + ", ".join(sorted(short_itm_calls))
-    )
-
-if not df_rolls.symbol.isnull().all().all():
-    rol_chains = chains[chains.symbol.isin(set(df_rolls.symbol))]
-
-    rol_chains = (
-        rol_chains.set_index("symbol").join(df_unds.set_index("symbol")[["price"]]).reset_index()
-    )
-    rol_chains.rename(columns={"price": "undPrice"}, inplace=True)
-
-    df_cd = filter_closest_dates(rol_chains, PROTECT_DTE, num_dates=1)
-    p = filter_closest_strikes(df_cd, n=-4)
-
+if not PROTECT_ME:
+    logger.info("PROTECT_ME=False — skipping protection rolls")
 else:
-    print("No protecting puts found in portfolio for rolling")
-    p = pd.DataFrame()
+    df_pfu = df_pf.merge(df_unds[["symbol", "price"]], on="symbol", how="left")
+    df_pfu.rename(columns={"price": "undPrice"}, inplace=True)
 
-df_purl = pd.DataFrame()
-
-if not p.empty:
-    p["right"] = "P"
-    # pyrefly: ignore [no-matching-overload]
-    p["contract"] = p.apply(
-        lambda x: Option(x.symbol, x.expiry, x.strike, x.right, "SMART"), axis=1
+    df_rolls = (
+        df_pfu[(df_pfu["state"] == "protecting") & (df_pfu.right == "P")]
+        .assign(
+            odiff=lambda x: (x["undPrice"] - x["strike"]),
+            ostrike=df_pfu.strike,
+            odte=df_pfu.dte,
+            pct_diff=lambda x: (abs(x["strike"] - x["undPrice"]) / x["undPrice"] * 100),
+        )
+        .sort_values("pct_diff", ascending=False)
+        .reset_index(drop=True)
     )
 
-    print("Qualifying protecting put roll contracts...")
-    valid_contracts = qualify_me(
-        ib, p["contract"].tolist(), desc="Qualifying protecting put roll contracts"
+    short_itm_calls = (
+        df_pfu[
+            (df_pfu.secType == "OPT")
+            & (df_pfu.right == "C")
+            & (df_pfu.position < 0)
+            & df_pfu["undPrice"].notna()
+        ]
+        .loc[lambda x: x["strike"] < x["undPrice"], "symbol"]
+        .unique()
     )
-    valid_contracts = [v for v in valid_contracts if v is not None]
 
-    if valid_contracts:
-        df_u = clean_ib_util_df(valid_contracts)
-        df_purl = df_u.groupby("symbol").first().reset_index()
+    if short_itm_calls.size:
+        df_rolls = df_rolls[~df_rolls.symbol.isin(short_itm_calls)].reset_index(drop=True)
+        logger.info(
+            "Skipping protecting-put rolls for symbols with ITM short calls: %s",
+            ", ".join(sorted(short_itm_calls)),
+        )
 
-        print("Getting put roll prices...")
-        df_iv_purl = get_volatilities_snapshot(df_purl["contract"].tolist(), market="SNP", ib=ib, desc="Fetching put roll volatilities")
+    if not df_rolls.symbol.isnull().all().all():
+        rol_chains = chains[chains.symbol.isin(set(df_rolls.symbol))]
 
-        if not df_iv_purl.empty:
-            df_up = df_unds.assign(undPrice=lambda x: x.price)
+        rol_chains = (
+            rol_chains.set_index("symbol").join(df_unds.set_index("symbol")[["price"]]).reset_index()
+        )
+        rol_chains.rename(columns={"price": "undPrice"}, inplace=True)
 
-            purls = df_iv_purl.merge(df_up[["symbol", "undPrice"]], on="symbol")
-            purls = purls.merge(df_u[["conId", "secType", "right", "strike", "expiry"]], on="conId")
-            purls = purls.merge(df_rolls[["symbol", "odiff"]], on="symbol")
-            purls = purls.merge(df_rolls[["symbol", "ostrike"]], on="symbol")
-            purls = purls.merge(df_rolls[["symbol", "odte"]], on="symbol")
+        df_cd = filter_closest_dates(rol_chains, PROTECT_DTE, num_dates=1)
+        p = filter_closest_strikes(df_cd, n=-4)
 
-            purls["diff"] = purls["strike"] / purls["undPrice"] - 1
-            purls = purls.sort_values("diff", key=lambda x: x - purls["odiff"])
-
-            cols = [
-                "symbol",
-                "secType",
-                "expiry",
-                "strike",
-                "ostrike",
-                "odte",
-                "undPrice",
-                "right",
-                "price",
-                "odiff",
-                "diff",
-            ]
-
-            if (purls["diff"] < -0.05).any():
-                print(
-                    "\nWARNING: There are some put rolls whose strike-undPrice is larger than 5%. "
-                    "These will be taken out from auto-roll suggestion."
-                )
-                print(purls[purls["diff"] < -0.05][cols])
-
-            purls1 = purls[purls["diff"] >= -0.05]
-            purls1 = purls1[purls1["strike"] != purls1["ostrike"]]
-
-            purls1 = purls1.copy()
-            purls1["qty"] = purls1["symbol"].map(df_unds.set_index("symbol")["position"] / 100)
-
-            purls1 = purls1.merge(
-                df_pf[(df_pf.secType == "OPT") & (df_pf.right == "P") & (df_pf.position > 0)][
-                    ["symbol", "mktPrice"]
-                ],
-                on="symbol",
-                how="left",
-            )
-            purls1.rename(columns={"mktPrice": "cost"}, inplace=True)
-            purls1["rollcost"] = (
-                (purls1.price - purls1.cost + purls1["strike"] - purls1["ostrike"])
-                * purls1.qty
-                * 100
-            )
-
-            purls1 = purls1.sort_values(["odte", "rollcost"], ascending=[True, False])
-            rol_cols = [
-                "symbol",
-                "conId",
-                "expiry",
-                "undPrice",
-                "strike",
-                "ostrike",
-                "odte",
-                "right",
-                "qty",
-                "price",
-                "cost",
-                "rollcost",
-            ]
-
-            rollover_cost = (
-                (purls1.price - purls1.cost + purls1["strike"] - purls1["ostrike"])
-                * purls1.qty
-                * 100
-            )
-            print(
-                f"\nThe rollover cost of {purls1.symbol.unique().shape[0]} symbols for {purls1.expiry.apply(get_dte).max():.0f} days would be ${rollover_cost.sum():,.0f}.\n"
-            )
-            purls1 = purls1[rol_cols].sort_values("rollcost", ascending=False)
-            purls_path = ROOT / "data" / "df_prot_rolls.pkl"
-            pickle_me(purls1[rol_cols], purls_path)
-        else:
-            print("No option price data available for protecting put rolls")
     else:
-        print("No valid contracts after qualification")
-else:
-    print("No suitable put chains found for protecting rolls")
+        logger.info("No protecting puts found in portfolio for rolling")
+        p = pd.DataFrame()
+
+    df_purl = pd.DataFrame()
+
+    if not p.empty:
+        p["right"] = "P"
+        # pyrefly: ignore [no-matching-overload]
+        p["contract"] = p.apply(
+            lambda x: Option(x.symbol, x.expiry, x.strike, x.right, "SMART"), axis=1
+        )
+
+        logger.info("Qualifying protecting put roll contracts...")
+        valid_contracts = qualify_me(
+            ib, p["contract"].tolist(), desc="Qualifying protecting put roll contracts"
+        )
+        valid_contracts = [v for v in valid_contracts if v is not None]
+
+        if valid_contracts:
+            df_u = clean_ib_util_df(valid_contracts)
+            df_purl = df_u.groupby("symbol").first().reset_index()
+
+            logger.info("Getting put roll prices...")
+            df_iv_purl = get_volatilities_snapshot(df_purl["contract"].tolist(), market="SNP", ib=ib, desc="Fetching put roll volatilities")
+
+            if not df_iv_purl.empty:
+                df_up = df_unds.assign(undPrice=lambda x: x.price)
+
+                purls = df_iv_purl.merge(df_up[["symbol", "undPrice"]], on="symbol")
+                purls = purls.merge(df_u[["conId", "secType", "right", "strike", "expiry"]], on="conId")
+                purls = purls.merge(df_rolls[["symbol", "odiff"]], on="symbol")
+                purls = purls.merge(df_rolls[["symbol", "ostrike"]], on="symbol")
+                purls = purls.merge(df_rolls[["symbol", "odte"]], on="symbol")
+
+                purls["diff"] = purls["strike"] / purls["undPrice"] - 1
+                purls = purls.sort_values("diff", key=lambda x: x - purls["odiff"])
+
+                cols = [
+                    "symbol",
+                    "secType",
+                    "expiry",
+                    "strike",
+                    "ostrike",
+                    "odte",
+                    "undPrice",
+                    "right",
+                    "price",
+                    "odiff",
+                    "diff",
+                ]
+
+                if (purls["diff"] < -0.05).any():
+                    logger.info(
+                        "WARNING: There are some put rolls whose strike-undPrice is larger than 5%. "
+                        "These will be taken out from auto-roll suggestion."
+                    )
+
+                purls1 = purls[purls["diff"] >= -0.05]
+                purls1 = purls1[purls1["strike"] != purls1["ostrike"]]
+
+                purls1 = purls1.copy()
+                purls1["qty"] = purls1["symbol"].map(df_unds.set_index("symbol")["position"] / 100)
+
+                purls1 = purls1.merge(
+                    df_pf[(df_pf.secType == "OPT") & (df_pf.right == "P") & (df_pf.position > 0)][
+                        ["symbol", "mktPrice"]
+                    ],
+                    on="symbol",
+                    how="left",
+                )
+                purls1.rename(columns={"mktPrice": "cost"}, inplace=True)
+                purls1["rollcost"] = (
+                    (purls1.price - purls1.cost + purls1["strike"] - purls1["ostrike"])
+                    * purls1.qty
+                    * 100
+                )
+
+                purls1 = purls1.sort_values(["odte", "rollcost"], ascending=[True, False])
+                rol_cols = [
+                    "symbol",
+                    "conId",
+                    "expiry",
+                    "undPrice",
+                    "strike",
+                    "ostrike",
+                    "odte",
+                    "right",
+                    "qty",
+                    "price",
+                    "cost",
+                    "rollcost",
+                ]
+
+                rollover_cost = (
+                    (purls1.price - purls1.cost + purls1["strike"] - purls1["ostrike"])
+                    * purls1.qty
+                    * 100
+                )
+                logger.info(
+                    "The rollover cost of %s symbols for %s days would be $%s.",
+                    purls1.symbol.unique().shape[0],
+                    f"{purls1.expiry.apply(get_dte).max():.0f}",
+                    f"{rollover_cost.sum():,.0f}",
+                )
+                purls1 = purls1[rol_cols].sort_values("rollcost", ascending=False)
+                purls_path = ROOT / "data" / "df_prot_rolls.pkl"
+                pickle_me(purls1[rol_cols], purls_path)
+            else:
+                logger.info("No option price data available for protecting put rolls")
+        else:
+            logger.info("No valid contracts after qualification")
+    else:
+        logger.info("No suitable put chains found for protecting rolls")
 
 # %% FINAL OUTPUT
 end_time = time.time()
 execution_time = end_time - start_time
 minutes = int(execution_time // 60)
 seconds = int(execution_time % 60)
-print(f"\n{'=' * 50}")
-print(f"Total execution time: {minutes} minutes and {seconds} seconds")
-print(f"{'=' * 50}")
-print("\n=== RECOMMENDATIONS COMPLETE ===")
+logger.info("Total execution time: %s minutes and %s seconds", minutes, seconds)
+logger.info("=== RECOMMENDATIONS COMPLETE ===")

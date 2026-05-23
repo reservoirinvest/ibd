@@ -1,7 +1,8 @@
-#%% 
+#%%
 # IMPORTS
 
 import asyncio
+import logging
 import math
 import os
 import pickle
@@ -11,22 +12,20 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from itertools import product
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import nest_asyncio
 import numpy as np
 import pandas as pd
 # pyrefly: ignore [untyped-import]
 import yaml
-import yfinance as yf
 from dotenv import find_dotenv, load_dotenv
 from ib_async import IB, Contract, Stock
-from loguru import logger
 from pyprojroot import here
-from scipy.stats import norm
 # pyrefly: ignore [untyped-import]
-from tqdm import tqdm as _tqdm
-from tqdm.asyncio import tqdm as async_tqdm
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+
+logger = logging.getLogger(__name__)
 
 # Apply nest_asyncio to allow nested event loops
 nest_asyncio.apply()
@@ -95,11 +94,14 @@ def get_ib_connection(market: str = "SNP", account_no: str = '', msg: bool=False
         try:
             ib.connect('127.0.0.1', PORT, clientId=client_id, account=account_no)
             if msg:
-                print(f"Connected to IB on port {PORT} with client ID {client_id} (market: {market}, account: {account_no or 'default'})")
+                logger.info(
+                    "Connected to IB on port %s with clientId %s (market: %s, account: %s)",
+                    PORT, client_id, market, account_no or "default",
+                )
             return ib
         except Exception as e:
             if attempt < max_retries - 1:
-                print(f"Connection attempt {attempt + 1} failed ({e}), retrying in 2s...")
+                logger.warning("Connection attempt %s/%s failed (%s), retrying in 2 s", attempt + 1, max_retries, e)
                 time.sleep(2)
             else:
                 raise
@@ -112,9 +114,9 @@ def get_safe_ib_connection(client_id, max_retries=3):
             ib.connect('127.0.0.1', PORT, clientId=client_id)  # Use TWS paper trading port
             if ib.isConnected():
                 return ib
-            print(f"Connection attempt {attempt + 1} failed: Not connected")
+            logger.warning("Connection attempt %s/%s failed: Not connected", attempt + 1, max_retries)
         except Exception as e:
-            print(f"Connection attempt {attempt + 1} failed: {str(e)}")
+            logger.warning("Connection attempt %s/%s failed: %s", attempt + 1, max_retries, e)
             time.sleep(2)
     raise ConnectionError(f"Failed to connect to IB after {max_retries} attempts")
 
@@ -136,7 +138,7 @@ def delete_pkl_files(files_to_delete):
         file_path = ROOT / "data" / filename
         if file_path.exists():
             file_path.unlink()
-            print(f"Deleted {file_path}")
+            logger.debug("Deleted %s", file_path)
 
 def pickle_me(obj, file_path: Path):
     with open(str(file_path), "wb") as handle:
@@ -146,11 +148,11 @@ def get_pickle(path: Path, print_msg: bool = True):
     try:
         with open(path, "rb") as f:
             output = pickle.load(f)
-            print(f"Loaded {path}")
+            logger.debug("Loaded %s", path)
             return output
     except FileNotFoundError:
         if print_msg:
-            print(f"File not found: {path}")
+            logger.warning("File not found: %s", path)
         return None
 
 def do_i_refresh(my_path: Path, max_days: float) -> bool:
@@ -248,23 +250,49 @@ def get_prec(v: float, base: float) -> float:
     # pyrefly: ignore [bad-return]
     return output
 
+
+def get_prec_safe(v: Optional[float], base: float) -> Optional[float]:
+    """Graceful-degradation wrapper for get_prec: returns None for None/NaN/±inf/bad base."""
+    if v is None:
+        return None
+    try:
+        if math.isnan(v) or math.isinf(v):
+            return None
+    except (TypeError, ValueError):
+        return None
+    try:
+        return round(round(v / base) * base, -int(math.floor(math.log10(base))))
+    except Exception:
+        return None
+
+
+def _is_valid_price(price) -> bool:
+    """Return True when price is a finite non-sentinel float (not None, NaN, ±inf, or -1.0)."""
+    if price is None:
+        return False
+    try:
+        return price != -1.0 and not math.isnan(price) and not math.isinf(price)
+    except (TypeError, ValueError):
+        return False
+
 def atm_margin(strike, undPrice, dte, vy):
     """
     Calculates the margin for an at-the-money put sale.
-    
+
     Parameters:
     strike (float): The strike price of the put option.
     undPrice (float): The underlying asset price.
     dte (int): The number of days to expiration.
     vy (float): The volatility of the underlying asset.
-    
+
     Returns:
     float: The margin for the put sale.
     """
-    
+    from scipy.stats import norm  # deferred: scipy import only needed here
+
     # Calculate the time to expiration in years
     t = dte / 365
-    
+
     # Calculate the delta of the put option
     d1 = (np.log(undPrice / strike) + (vy**2 / 2) * t) / (vy * np.sqrt(t))
     delta = -norm.cdf(d1)
@@ -305,14 +333,15 @@ def _fetch_weeklys() -> pd.Series:
 
 async def _async_fetch_weeklies_yf(symbols, look_ahead_days=MAX_DTE):
     """Filter S&P 500 symbols for those with weekly options (non-third-Friday expirations).
-    
+
     Args:
         symbols (pd.Series): S&P 500 ticker symbols (Name: Symbol, dtype: object).
         look_ahead_days (int): Days to check for expirations (default: 45).
-    
+
     Returns:
         pd.Series: Symbols with weekly options or error messages.
     """
+    import yfinance as yf  # deferred: heavy import, only needed in this function
     today = datetime.now().date()
     # pyrefly: ignore [bad-argument-type]
     cutoff = today + timedelta(days=look_ahead_days)
@@ -341,7 +370,7 @@ async def _async_fetch_weeklies_yf(symbols, look_ahead_days=MAX_DTE):
     async def main():
         with ThreadPoolExecutor(max_workers=10) as executor:  # Limit concurrency to avoid rate limits
             tasks = [process_symbol(symbol, executor) for symbol in symbols.values]
-            for result in await async_tqdm.gather(*tasks, desc="Checking symbols"):
+            for result in await asyncio.gather(*tasks):
                 if result:  # Skip None results
                     weekly_symbols.append(result)
 
@@ -381,36 +410,26 @@ def get_option_symbols(weeklies: bool = True) -> pd.Series:
         logger.error(f"Failed to retrieve option symbols: {e}")
         return pd.Series(ADDITIONAL_SYMBOLS if weeklies else [], dtype=str)
 
-async def _qualify_batch(ib: IB, contracts: list, pbar=None) -> tuple:
+async def _qualify_batch(ib: IB, contracts: list, advance_fn=None) -> tuple:
     """Async helper to qualify contracts in batch."""
     qualified = []
     failed = []
-    
-    # Create async tasks for all contracts
+
     tasks = [ib.qualifyContractsAsync(contract) for contract in contracts]
-    
-    # Process tasks as they complete
+
     for i, task in enumerate(asyncio.as_completed(tasks)):
         try:
             result = await task
-            contract = contracts[i]
             if result:
                 qualified.extend(result)
-                if pbar:
-                    pbar.set_postfix_str(f"✓ {contract.symbol}")
             else:
-                failed.append(contract.symbol)
-                if pbar:
-                    pbar.set_postfix_str(f"✗ {contract.symbol}")
-        except Exception as e:
-            contract = contracts[i]
-            failed.append(contract.symbol)
-            if pbar:
-                pbar.set_postfix_str(f"✗ {contract.symbol}: {str(e)[:30]}")
-        
-        if pbar:
-            pbar.update(1)
-    
+                failed.append(contracts[i].symbol)
+        except Exception:
+            failed.append(contracts[i].symbol)
+
+        if advance_fn:
+            advance_fn()
+
     return qualified, failed
 
 def qualify_stock_contracts(symbols: pd.Series, market: str = "SNP") -> list:
@@ -433,28 +452,32 @@ def qualify_stock_contracts(symbols: pd.Series, market: str = "SNP") -> list:
         # Create stock contracts
         contracts = [Stock(symbol, 'SMART', 'USD') for symbol in symbols]
         
-        print(f"Qualifying {len(contracts)} contracts asynchronously...")
-        with _tqdm(total=len(contracts), desc="Qualifying symbols", unit="sym") as pbar:
+        logger.info("Qualifying %s contracts via IBKR…", len(contracts))
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[green]{task.completed}[/green]/[cyan]{task.total}[/cyan]"),
+        ) as progress:
+            task = progress.add_task("[cyan]Qualifying symbols…", total=len(contracts))
             # pyrefly: ignore [not-iterable]
-            qualified, failed = ib.run(_qualify_batch(ib, contracts, pbar))
-        
-        print(f"\n✓ Successfully qualified {len(qualified)}/{len(contracts)} contracts")
+            qualified, failed = ib.run(_qualify_batch(ib, contracts, lambda: progress.advance(task)))
+
+        logger.info("Qualified %s/%s contracts", len(qualified), len(contracts))
         if failed:
-            print(f"✗ Failed to qualify {len(failed)} symbols: {', '.join(failed[:10])}")
-            if len(failed) > 10:
-                print(f"  ... and {len(failed) - 10} more")
-        
+            extra = f" + {len(failed) - 10} more" if len(failed) > 10 else ""
+            logger.warning("Failed to qualify %s symbols: %s%s", len(failed), ", ".join(failed[:10]), extra)
+
         return qualified
-        
+
     except Exception as e:
-        logger.error(f"Failed to qualify contracts: {e}")
+        logger.error("Failed to qualify contracts: %s", e)
         return []
-        
+
     finally:
-        # Disconnect from IB
         if ib and ib.isConnected():
             ib.disconnect()
-            print("Disconnected from IB\n")
+            logger.debug("Disconnected from IB")
 
 def qualify_me(
     ib: IB, 
@@ -476,62 +499,74 @@ def qualify_me(
 
         total_contracts = len(contracts)
         if total_contracts == 0:
-            logger.warning("No contracts to qualify")
+            logger.warning("No contracts to qualify")  # no format args needed
             return []
 
         # Calculate number of batches
         num_batches = (total_contracts + batch_size - 1) // batch_size
 
-        # Since we use rich track, we don't need the context manager tqdm.
-        for batch_num in _tqdm(range(num_batches), desc=desc):
-            start_idx = batch_num * batch_size
-            end_idx = min(start_idx + batch_size, total_contracts)
-            batch_contracts = contracts[start_idx:end_idx]
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[green]{task.completed}[/green]/[cyan]{task.total}[/cyan]"),
+        ) as progress:
+            task = progress.add_task(f"[cyan]{desc}…", total=num_batches)
+            for batch_num in range(num_batches):
+                start_idx = batch_num * batch_size
+                end_idx = min(start_idx + batch_size, total_contracts)
+                batch_contracts = contracts[start_idx:end_idx]
 
-            # Per-batch try with one automatic retry on transient socket errors.
-            _batch_ok = False
-            for _attempt in range(2):
-                try:
-                    # pyrefly: ignore [not-iterable]
-                    q_batch, f_batch = ib.run(_qualify_batch(ib, batch_contracts, None))
-                    qualified.extend(q_batch)
-                    failed_total.extend(f_batch)
-                    _batch_ok = True
+                # Per-batch try with one automatic retry on transient socket errors.
+                _batch_ok = False
+                for _attempt in range(2):
+                    try:
+                        # pyrefly: ignore [not-iterable]
+                        q_batch, f_batch = ib.run(_qualify_batch(ib, batch_contracts, None))
+                        qualified.extend(q_batch)
+                        failed_total.extend(f_batch)
+                        _batch_ok = True
+                        break
+                    except Exception as _be:
+                        if _attempt == 0:
+                            logger.warning(
+                                "Batch %s/%s error (%s) — retrying in 3 s…",
+                                batch_num + 1, num_batches, _be,
+                            )
+                            time.sleep(3)
+                        else:
+                            logger.warning(
+                                "Batch %s/%s failed (%s), skipping",
+                                batch_num + 1, num_batches, _be,
+                            )
+                            failed_total.extend(
+                                getattr(c, "symbol", repr(c)) for c in batch_contracts
+                            )
+
+                # If socket is gone after a failed batch, stop early rather than
+                # hammering through the remaining batches with guaranteed failures.
+                if not _batch_ok and not ib.isConnected():
+                    logger.warning("IB socket disconnected — stopping qualification early")  # no args
+                    remaining = contracts[end_idx:]
+                    failed_total.extend(getattr(c, "symbol", repr(c)) for c in remaining)
+                    progress.advance(task)
                     break
-                except Exception as _be:
-                    if _attempt == 0:
-                        logger.warning(
-                            f"Batch {batch_num + 1}/{num_batches} error ({_be}) — "
-                            f"retrying in 3 s…"
-                        )
-                        time.sleep(3)
-                    else:
-                        logger.warning(
-                            f"Batch {batch_num + 1}/{num_batches} failed ({_be}), skipping"
-                        )
-                        failed_total.extend(
-                            getattr(c, "symbol", repr(c)) for c in batch_contracts
-                        )
 
-            # If socket is gone after a failed batch, stop early rather than
-            # hammering through the remaining batches with guaranteed failures.
-            if not _batch_ok and not ib.isConnected():
-                logger.warning("IB socket disconnected — stopping qualification early")
-                remaining = contracts[end_idx:]
-                failed_total.extend(getattr(c, "symbol", repr(c)) for c in remaining)
-                break
-
-            if batch_num < num_batches - 1:
-                ib.sleep(1)  # 1-second pause to avoid rate limiting
+                if batch_num < num_batches - 1:
+                    ib.sleep(1)  # 1-second pause to avoid rate limiting
+                progress.advance(task)
 
         if failed_total:
-            print(f"  Failed to qualify {len(failed_total)} symbols: {', '.join(str(s) for s in failed_total[:10])}"
-                  + (f" + {len(failed_total) - 10} more" if len(failed_total) > 10 else ""))
+            extra = f" + {len(failed_total) - 10} more" if len(failed_total) > 10 else ""
+            logger.warning(
+                "Failed to qualify %s symbols: %s%s",
+                len(failed_total), ", ".join(str(s) for s in failed_total[:10]), extra,
+            )
 
         return qualified
 
     except Exception as e:
-        logger.error(f"Failed to qualify contracts: {e}")
+        logger.error("Failed to qualify contracts: %s", e)
         return []
 
 def get_qualified_symbols(weeklies: bool = True, market: str = "SNP", save: bool = True) -> list:
@@ -547,13 +582,13 @@ def get_qualified_symbols(weeklies: bool = True, market: str = "SNP", save: bool
         List of qualified Stock contracts
     """
     symbols = get_option_symbols(weeklies=weeklies)
-    print(f"Retrieved {len(symbols)} symbols (weeklies={weeklies})")
+    logger.info("Retrieved %s symbols (weeklies=%s)", len(symbols), weeklies)
 
     contracts = qualify_stock_contracts(symbols, market=market)
 
     # Normalize tradingClass for contracts with 'NMS'
     contracts = normalize_trading_class(contracts)
-    contracts = [c for c in contracts if c != None]
+    contracts = [c for c in contracts if c is not None]
     
     if save:
         pickle_me(contracts, file_path=ROOT/'data'/'symbols.pkl')
@@ -561,127 +596,194 @@ def get_qualified_symbols(weeklies: bool = True, market: str = "SNP", save: bool
     return contracts
 
 #%%
-# Contract Prices
+# Contract Prices — Dual-Source Hybrid Pipeline helpers
+
+
+async def _fetch_prices_bulk_yf(symbols: List[str]) -> Dict[str, float]:
+    """Primary source: bulk last-close prices via yfinance (free, unauthenticated).
+
+    Uses asyncio.to_thread so the blocking yf.download call does not block the
+    event loop.  Returns a {symbol: close_price} dict; missing / errored symbols
+    are simply absent (routed to the IBKR fallback by the caller).
+    """
+    if not symbols:
+        return {}
+
+    def _download() -> Dict[str, float]:
+        import yfinance as yf  # deferred: heavy import, only needed in this function
+        raw = yf.download(symbols, period="2d", progress=False, auto_adjust=True)
+        if raw.empty:
+            return {}
+        # yf.download with a list always returns MultiIndex columns (field, symbol)
+        if isinstance(raw.columns, pd.MultiIndex):
+            close_row = raw["Close"].iloc[-1]          # Series: symbol → close
+        else:
+            # Single string passed — regular columns; wrap into Series
+            val = raw["Close"].iloc[-1]
+            close_row = pd.Series({symbols[0]: val})
+        return {
+            sym: float(close_row[sym])
+            for sym in symbols
+            if sym in close_row.index and _is_valid_price(close_row[sym])
+        }
+
+    try:
+        return await asyncio.to_thread(_download)
+    except Exception as exc:
+        logger.warning("Bulk yfinance price fetch failed: %s", exc)
+        return {}
+
+
+async def _fetch_prices_fallback_ib(
+    ib: IB,
+    contracts: List[Contract],
+) -> Dict[str, float]:
+    """Fallback source: precision prices via semaphore-throttled ib_async requests.
+
+    Enforces asyncio.Semaphore(40) — a safe buffer below IBKR's 50 req/s pacing
+    limit.  Each slot is released after a 25 ms controlled pause.  Failures for
+    individual contracts are swallowed and logged at DEBUG level so one bad tick
+    never aborts the batch.
+    """
+    if not contracts:
+        return {}
+
+    sem = asyncio.Semaphore(40)  # pacing guard: max 40 concurrent IBKR requests
+
+    async def _fetch_one(contract: Contract) -> tuple[str, Optional[float]]:
+        async with sem:
+            try:
+                ticker = await ib.reqMktDataAsync(contract, "", snapshot=True)
+                await asyncio.sleep(0.025)              # controlled release pacing
+                price = (
+                    ticker.last if _is_valid_price(ticker.last)
+                    else ticker.close if _is_valid_price(ticker.close)
+                    else None
+                )
+                return contract.symbol, price
+            except Exception as exc:
+                logger.debug("IBKR fallback failed for %s: %s", contract.symbol, exc)
+                return contract.symbol, None
+
+    completed = await asyncio.gather(*[_fetch_one(c) for c in contracts])
+    return {sym: price for sym, price in completed if price is not None}
+
 
 def get_prices(
-    contracts: List[Contract], 
+    contracts: List[Contract],
     market: str = "SNP",
     max_wait_time: int = 10,
     snapshot: bool = True,
     batch_size: int = 50,
-    ib: IB = None
+    ib: IB = None,
 ) -> pd.DataFrame:
+    """Get market prices via the Dual-Source Hybrid Pipeline (audit Issue 2.1).
+
+    Strategy
+    --------
+    1. **Primary** – yfinance bulk download in a thread executor.
+       Fast, free, zero pacing cost.  Populates the ``close`` column.
+    2. **Fallback** – ib_async ``reqMktDataAsync`` with ``Semaphore(40)``
+       for every symbol yfinance could not price.  Stays safely below
+       IBKR's 50 req/s pacing ceiling.  Populates ``last`` (and ``close``
+       when ``last`` is absent).
+
+    The ``bid`` / ``ask`` / ``volume`` / ``high`` / ``low`` / ``open``
+    columns are retained for API compatibility but will be ``None`` for
+    yfinance-sourced rows; only IBKR-sourced rows may populate them in a
+    future enhancement.
+
+    Parameters
+    ----------
+    contracts:     Qualified ``Contract`` objects.
+    market:        Config key (default ``'SNP'``).
+    max_wait_time: Kept for API compatibility; not used in the async path.
+    snapshot:      Kept for API compatibility; fallback always uses snapshot mode.
+    batch_size:    Kept for API compatibility; concurrency is managed by the semaphore.
+    ib:            Optional pre-connected ``IB`` instance.  Created on demand
+                   (and disconnected in ``finally``) only when the fallback runs.
     """
-    Get market prices for a list of qualified contracts.
-    
-    Args:
-        contracts: List of qualified Contract objects
-        market: Market name for config loading (default: 'SNP')
-        max_wait_time: Maximum seconds to wait for each ticker to populate (default: 10)
-        snapshot: If True, request snapshot; if False, stream data (default: True)
-        batch_size: Number of contracts to request at once (default: 50)
-        ib: Optional existing IB connection
-    
-    Returns:
-        DataFrame with symbol, bid, ask, last, close, volume, and other price data
-    """
-    try:
-        # Connect to IB
-        disconnect = False
-        if ib is None:
-            ib = get_ib_connection(market)
-            disconnect = True
-        
-        # Process contracts in batches to avoid ticker limit
-        all_price_data = []
-        total_batches = (len(contracts) + batch_size - 1) // batch_size
-        
-        def is_valid_price(price):
-            """Check if price is valid: not None, not -1.0, and not NaN"""
-            if price is None:
-                return False
-            try:
-                return price != -1.0 and not math.isnan(price)
-            except (TypeError, ValueError):
-                return False
-        
-        for batch_num in _tqdm(range(total_batches), desc="Fetching prices"):
-            start_idx = batch_num * batch_size
-            end_idx = min(start_idx + batch_size, len(contracts))
-            batch_contracts = contracts[start_idx:end_idx]
-            
-            # Request market data for batch
-            tickers = []
-            for contract in batch_contracts:
-                ticker = ib.reqMktData(contract, '', snapshot, False)
-                tickers.append(ticker)
-            
-            # Wait for each ticker to get first price, with max timeout
-            start_time = time.time()
-            tickers_pending = set(range(len(tickers)))
-            
-            while tickers_pending and (time.time() - start_time) < max_wait_time:
-                ib.sleep(0.1)  # Small sleep to allow data to come in
-                
-                # Check which tickers have received data
-                for idx in list(tickers_pending):
-                    ticker = tickers[idx]
-                    # Consider ticker filled if it has last, close, bid, or ask
-                    if (is_valid_price(ticker.last) or 
-                        is_valid_price(ticker.close) or
-                        is_valid_price(ticker.bid) or
-                        is_valid_price(ticker.ask)):
-                        tickers_pending.remove(idx)
-            
-            # Extract price data
-            for ticker in tickers:
-                # Check if data is valid (not -1, nan, or None)
-                bid = ticker.bid if is_valid_price(ticker.bid) else None
-                ask = ticker.ask if is_valid_price(ticker.ask) else None
-                last = ticker.last if is_valid_price(ticker.last) else None
-                close = ticker.close if is_valid_price(ticker.close) else None
-                all_price_data.append({
-                    'symbol': ticker.contract.symbol,
-                    'conId': ticker.contract.conId,
-                    'bid': bid,
-                    'ask': ask,
-                    'last': last,
-                    'close': close,
-                    'volume': ticker.volume if is_valid_price(ticker.volume) else None,
-                    'high': ticker.high if is_valid_price(ticker.high) else None,
-                    'low': ticker.low if is_valid_price(ticker.low) else None,
-                    'open': ticker.open if is_valid_price(ticker.open) else None,
-                    'bidSize': ticker.bidSize,
-                    'askSize': ticker.askSize,
-                    'lastSize': ticker.lastSize,
-                    'halted': ticker.halted,
-                    'time': ticker.time
-                })
-            
-            # Cancel market data subscriptions if not snapshot
-            if not snapshot:
-                for contract in batch_contracts:
-                    ib.cancelMktData(contract)
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(all_price_data)
-        
-        # Report data quality
-        valid_prices = df[df['last'].notna() | df['close'].notna()]
-        print(f"\n✓ Retrieved prices for {len(df)} contracts")
-        print(f"✓ Valid prices: {len(valid_prices)}/{len(df)} ({100*len(valid_prices)/len(df):.1f}%)")
-        
-        return df
-        
-    except Exception as e:
-        logger.error(f"Failed to get prices: {e}")
+    if not contracts:
         return pd.DataFrame()
-        
+
+    sym_to_contract: Dict[str, Contract] = {c.symbol: c for c in contracts}
+    symbols: List[str] = list(sym_to_contract)
+    _created_ib = False
+
+    try:
+        # ── Stage 1: yfinance bulk fetch (primary source) ─────────────────
+        yf_prices: Dict[str, float] = asyncio.run(
+            _fetch_prices_bulk_yf(symbols)
+        )
+        logger.info(
+            "yfinance priced %s/%s symbols",
+            len(yf_prices), len(symbols),
+        )
+
+        # ── Stage 2: IBKR fallback for symbols yfinance missed ────────────
+        missed = [s for s in symbols if s not in yf_prices]
+        ib_prices: Dict[str, float] = {}
+
+        if missed:
+            if ib is None:
+                ib = get_ib_connection(market)
+                _created_ib = True
+            missed_contracts = [sym_to_contract[s] for s in missed]
+            ib_prices = asyncio.run(
+                _fetch_prices_fallback_ib(ib, missed_contracts)
+            )
+            logger.info(
+                "IBKR fallback priced %s/%s missed symbols",
+                len(ib_prices), len(missed),
+            )
+
+        # ── Stage 3: assemble output DataFrame ───────────────────────────
+        _COLS = [
+            "symbol", "conId", "bid", "ask", "last", "close",
+            "volume", "high", "low", "open",
+            "bidSize", "askSize", "lastSize", "halted", "time",
+        ]
+        rows = []
+        for contract in contracts:
+            sym = contract.symbol
+            yf_close = yf_prices.get(sym)
+            ib_last = ib_prices.get(sym)
+            rows.append({
+                "symbol":   sym,
+                "conId":    contract.conId,
+                "bid":      None,
+                "ask":      None,
+                "last":     ib_last,
+                "close":    yf_close if yf_close is not None else ib_last,
+                "volume":   None,
+                "high":     None,
+                "low":      None,
+                "open":     None,
+                "bidSize":  None,
+                "askSize":  None,
+                "lastSize": None,
+                "halted":   None,
+                "time":     None,
+            })
+
+        df = pd.DataFrame(rows, columns=_COLS)
+
+        valid = int((df["last"].notna() | df["close"].notna()).sum())
+        total = len(df)
+        logger.info(
+            "Prices: %s/%s valid (%s%%)",
+            valid, total,
+            f"{100 * valid / total if total else 0.0:.1f}",
+        )
+        return df
+
+    except Exception as exc:
+        logger.error("get_prices failed: %s", exc)
+        return pd.DataFrame()
+
     finally:
-        # Disconnect from IB
-        if ib and ib.isConnected():
+        if _created_ib and ib is not None and ib.isConnected():
             ib.disconnect()
-            print("Disconnected from IB\n")
 
 def get_prices_snapshot(
     contracts: List[Contract], 
@@ -718,7 +820,7 @@ def get_prices_snapshot(
             else None,
         axis=1
     )
-    df['price'] = df['price'].apply(lambda x: get_prec(x, 0.01) if x is not None else None)
+    df['price'] = df['price'].apply(lambda x: get_prec_safe(x, 0.01))
     
     return df
     
@@ -758,61 +860,62 @@ def get_volatilities_snapshot(
         # Process contracts in batches
         total_batches = (len(contracts) + batch_size - 1) // batch_size
 
-        for batch_num in _tqdm(range(total_batches), desc=desc):
-            start_idx = batch_num * batch_size
-            end_idx = min(start_idx + batch_size, len(contracts))
-            batch_contracts = contracts[start_idx:end_idx]
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[green]{task.completed}[/green]/[cyan]{task.total}[/cyan]"),
+        ) as progress:
+            task = progress.add_task(f"[cyan]{desc}…", total=total_batches)
+            for batch_num in range(total_batches):
+                start_idx = batch_num * batch_size
+                end_idx = min(start_idx + batch_size, len(contracts))
+                batch_contracts = contracts[start_idx:end_idx]
 
-            # Run the asynchronous volatility fetching function within the IB event loop
-            # ib.run is the synchronous way to execute async code with ib_insync
-            batch_results = ib.run(
-                volatilities(
-                    contracts=batch_contracts,
-                    ib=ib,
-                    sleep_time=max_wait_time, # Pass max_wait_time as sleep_time for async
-                    gentick="106, 104" # Standard genticks for IV (106) and HV (104)
+                # pyrefly: ignore [missing-attribute]
+                batch_results = ib.run(
+                    volatilities(
+                        contracts=batch_contracts,
+                        ib=ib,
+                        sleep_time=max_wait_time,
+                        gentick="106, 104",
+                    )
                 )
-            )
-            
-            # Process and flatten the batch results
-            # pyrefly: ignore [missing-attribute]
-            for contract_key, data in batch_results.items():
-                if isinstance(contract_key, Contract):
-                    symbol = contract_key.symbol
-                    conId = contract_key.conId
-                else: # Assuming contract_key is the symbol string
-                    symbol = contract_key
-                    conId = None # conId not readily available if key is string
 
-                all_vol_data.append({
-                    'symbol': symbol,
-                    'conId': conId,
-                    'price': data.get('price'),
-                    'iv': data.get('iv'),
-                    'hv': data.get('hv')
-                })
+                for contract_key, data in batch_results.items():
+                    if isinstance(contract_key, Contract):
+                        symbol = contract_key.symbol
+                        conId = contract_key.conId
+                    else:
+                        symbol = contract_key
+                        conId = None
 
-        # Convert to DataFrame
+                    all_vol_data.append({
+                        "symbol": symbol,
+                        "conId": conId,
+                        "price": data.get("price"),
+                        "iv": data.get("iv"),
+                        "hv": data.get("hv"),
+                    })
+                progress.advance(task)
+
         df = pd.DataFrame(all_vol_data)
-
-        # Report data quality
-        valid_ivs = df[df['iv'].notna()]
-        print(f"\n✓ Retrieved data for {len(df)} contracts")
-        print(f"✓ Valid Implied Volatilities: {len(valid_ivs)}/{len(df)} ({100*len(valid_ivs)/len(df):.1f}%)")
-        
+        valid_ivs = df[df["iv"].notna()]
+        logger.info(
+            "Volatility snapshot: %s contracts, %s/%s valid IVs (%s%%)",
+            len(df), len(valid_ivs), len(df),
+            f"{100 * len(valid_ivs) / len(df) if len(df) else 0.0:.1f}",
+        )
         return df
 
     except Exception as e:
-        # Assuming logger is defined elsewhere
-        # logger.error(f"Failed to get volatilities: {e}") 
-        print(f"Failed to get volatilities: {e}")
+        logger.error("Failed to get volatilities: %s", e)
         return pd.DataFrame()
 
     finally:
-        # Disconnect from IB
         if disconnect and ib and ib.isConnected():
             ib.disconnect()
-            print("Disconnected from IB\n")
+            logger.debug("Disconnected from IB")
 
 async def volatilities(
     contracts: list, ib: IB, sleep_time: int = 3, gentick: str = "106, 104"
@@ -928,126 +1031,101 @@ def get_option_chains(
         # Process contracts in batches
         total_batches = (len(contracts) + batch_size - 1) // batch_size
 
-        for batch_num in _tqdm(range(total_batches), desc="Fetching option chains"):
-            start_idx = batch_num * batch_size
-            end_idx = min(start_idx + batch_size, len(contracts))
-            batch_contracts = contracts[start_idx:end_idx]
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[green]{task.completed}[/green]/[cyan]{task.total}[/cyan]"),
+        ) as progress:
+            task = progress.add_task("[cyan]Fetching option chains…", total=total_batches)
+            for batch_num in range(total_batches):
+                start_idx = batch_num * batch_size
+                end_idx = min(start_idx + batch_size, len(contracts))
+                batch_contracts = contracts[start_idx:end_idx]
 
-            # Run the asynchronous chain fetching function
-            batch_results = ib.run(
-                chains(
-                    contracts=batch_contracts,
-                    ib=ib,
-                    sleep_time=max_wait_time
-                )
-            )
-
-            # Process results and track failed symbols
-            for contract in batch_contracts:
-                symbol = contract.symbol
                 # pyrefly: ignore [missing-attribute]
-                chain = batch_results.get(symbol)
-
-                if chain is None:
-                    failed_symbols.append(contract)
-                    all_chain_data.append({
-                        'symbol': symbol,
-                        'conId': contract.conId,
-                        'tradingClass': None,
-                        'expiries': None,
-                        'strikes': None
-                    })
-                    continue
-
-                all_chain_data.append({
-                    'symbol': symbol,
-                    'conId': chain.underlyingConId,
-                    'tradingClass': chain.tradingClass,
-                    'expiries': chain.expirations,
-                    'strikes': chain.strikes
-                })
-
-            # Add inter-batch delay to avoid rate limiting
-            if batch_num < total_batches - 1:
-                ib.sleep(inter_batch_delay)
-
-        # Retry failed symbols once
-        if failed_symbols:
-            print(f"Retrying {len(failed_symbols)} failed symbols...")
-            retry_results = ib.run(
-                chains(
-                    contracts=failed_symbols,
-                    ib=ib,
-                    sleep_time=max_wait_time
+                batch_results = ib.run(
+                    chains(contracts=batch_contracts, ib=ib, sleep_time=max_wait_time)
                 )
-            )
 
-            # Update all_chain_data with retry results
+                for contract in batch_contracts:
+                    symbol = contract.symbol
+                    chain = batch_results.get(symbol)
+
+                    if chain is None:
+                        failed_symbols.append(contract)
+                        all_chain_data.append({
+                            "symbol": symbol, "conId": contract.conId,
+                            "tradingClass": None, "expiries": None, "strikes": None,
+                        })
+                    else:
+                        all_chain_data.append({
+                            "symbol": symbol, "conId": chain.underlyingConId,
+                            "tradingClass": chain.tradingClass,
+                            "expiries": chain.expirations, "strikes": chain.strikes,
+                        })
+
+                if batch_num < total_batches - 1:
+                    ib.sleep(inter_batch_delay)
+                progress.advance(task)
+
+        if failed_symbols:
+            logger.info("Retrying %s failed symbols…", len(failed_symbols))
+            # pyrefly: ignore [missing-attribute]
+            retry_results = ib.run(
+                chains(contracts=failed_symbols, ib=ib, sleep_time=max_wait_time)
+            )
             retry_data = []
             for contract in failed_symbols:
                 symbol = contract.symbol
-                # pyrefly: ignore [missing-attribute]
                 chain = retry_results.get(symbol)
-
                 if chain is None:
                     retry_data.append({
-                        'symbol': symbol,
-                        'conId': contract.conId,
-                        'tradingClass': None,
-                        'expiries': None,
-                        'strikes': None
+                        "symbol": symbol, "conId": contract.conId,
+                        "tradingClass": None, "expiries": None, "strikes": None,
                     })
                 else:
                     retry_data.append({
-                        'symbol': symbol,
-                        'conId': chain.underlyingConId,
-                        'tradingClass': chain.tradingClass,
-                        'expiries': chain.expirations,
-                        'strikes': chain.strikes
+                        "symbol": symbol, "conId": chain.underlyingConId,
+                        "tradingClass": chain.tradingClass,
+                        "expiries": chain.expirations, "strikes": chain.strikes,
                     })
-
-            # Replace failed entries with retry results
-            all_chain_data = [d for d in all_chain_data if d['symbol'] not in [c.symbol for c in failed_symbols]]
+            all_chain_data = [
+                d for d in all_chain_data
+                if d["symbol"] not in {c.symbol for c in failed_symbols}
+            ]
             all_chain_data.extend(retry_data)
 
-        # Convert to DataFrame
         df = pd.DataFrame(all_chain_data)
-
-        # Report data quality
-        valid_chains = df[df['expiries'].notna()]
-        print(f"\n✓ Retrieved data for {len(df)} contracts")
-        print(f"✓ Valid option chains: {len(valid_chains)}/{len(df)} ({100*len(valid_chains)/len(df):.1f}%)")
+        valid_chains = df[df["expiries"].notna()]
+        logger.info(
+            "Option chains: %s contracts, %s/%s valid (%s%%)",
+            len(df), len(valid_chains), len(df),
+            f"{100 * len(valid_chains) / len(df) if len(df) else 0.0:.1f}",
+        )
 
         if df.empty:
             return pd.DataFrame()
 
-        # Expand rows for each expiry and strike combination
         expanded_rows = []
-        for index, row in df.iterrows():
-            if row['expiries'] is None or row['strikes'] is None:
+        for _, row in df.iterrows():
+            if row["expiries"] is None or row["strikes"] is None:
                 continue
-            for expiry, strike in product(row['expiries'], row['strikes']):
-                expanded_rows.append({
-                    'symbol': row['symbol'],
-                    'expiry': expiry,
-                    'strike': strike
-                })
+            for expiry, strike in product(row["expiries"], row["strikes"]):
+                expanded_rows.append({"symbol": row["symbol"], "expiry": expiry, "strike": strike})
 
-        # Create final DataFrame
         df_out = pd.DataFrame(expanded_rows)
-        df_out['dte'] = get_dte(df_out['expiry'])
-
+        df_out["dte"] = get_dte(df_out["expiry"])
         return df_out
 
     except Exception as e:
-        logger.error(f"Failed to get option chains: {e}")
+        logger.error("Failed to get option chains: %s", e)
         return pd.DataFrame()
 
     finally:
-        # Disconnect from IB
         if disconnect and ib and ib.isConnected():
             ib.disconnect()
-            print("Disconnected from IB\n")
+            logger.debug("Disconnected from IB")
 
 # Change tradingClass for contracts that have 'NMS' in them.
 # This is due to some error in NYSE that puts tradingClass as 'NMS'.
@@ -1106,7 +1184,7 @@ def chains_n_unds(msg: bool = False):
 
     # Get qualified contracts
     if do_i_refresh(my_path=sym_path, max_days=1):
-        print("symbols.pkl missing/stale — rebuilding from web + IB (takes ~2-3 min)...")
+        logger.info("symbols.pkl missing/stale — rebuilding from web + IB (takes ~2-3 min)…")  # no args
         qualified_contracts = get_qualified_symbols(weeklies=True, market="SNP", save=True)
         pickle_me(qualified_contracts, file_path=sym_path)
     else:
@@ -1144,7 +1222,7 @@ def chains_n_unds(msg: bool = False):
         df_unds['margin'] = pd.Series(dtype=float)
 
     if df_unds.empty or 'symbol' not in df_unds.columns:
-        print("Warning: df_unds is empty — no volatility data retrieved")
+        logger.warning("df_unds is empty — no volatility data retrieved")
     pickle_me(df_unds, file_path=ROOT / 'data' / 'df_unds.pkl')
 
     return df_chains, df_unds
@@ -1180,9 +1258,6 @@ if __name__ == "__main__":
     else:
         df_chains = get_pickle(path=chain_path)
 
-    # pyrefly: ignore [missing-attribute]
-    print(df_chains.head(10))
-
     # Get price with volatilities and margins for qualified contracts
     # pyrefly: ignore [bad-argument-type]
     df_unds = get_volatilities_snapshot(qualified_contracts, market="SNP", batch_size=50)
@@ -1201,5 +1276,4 @@ if __name__ == "__main__":
     else:
         df_unds['margin'] = pd.Series(dtype=float)
 
-    print(df_unds[['symbol', 'iv', 'hv', 'margin', 'price']].head(10))
     pickle_me(df_unds, file_path=ROOT/'data'/'df_unds.pkl')
