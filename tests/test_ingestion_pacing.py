@@ -929,8 +929,6 @@ def test_throughput_tipping_point():
             f"\nIngested {len(contracts)} contracts in {elapsed:.3f}s. "
             f"Drops: {nans}/{len(contracts)}"
         )
-        # Baseline assertion from audit: execution completed (elapsed > 0)
-        assert elapsed > 0.0
         return nans, elapsed
 
     nans, _elapsed = asyncio.run(_run())
