@@ -33,4 +33,3 @@ log/*.*
 .python*
 uv.lock
 *dump*
-data/master/flex*.*

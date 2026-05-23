@@ -51,6 +51,14 @@ MIN_DAYS = 548  # 1.5 years ≈ 548 calendar days
 _OHLC_COLS = ["Open", "High", "Low", "Close", "Volume"]
 _CONCURRENCY = 20  # parallel yfinance coroutines
 
+# Benchmark symbols always backfilled to this date for full-history performance comparison
+_BENCHMARK_START = date(2019, 12, 31)
+_BENCHMARK_SYMS: set[str] = {"SPY", "QQQ"}
+_BENCHMARK_SPECS: list[SymbolSpec] = [
+    {"symbol": s, "exchange": "SMART", "currency": "USD"}
+    for s in sorted(_BENCHMARK_SYMS)
+]
+
 # ---------------------------------------------------------------------------
 # Symbol / ticker utilities
 # ---------------------------------------------------------------------------
@@ -390,7 +398,8 @@ def _merge(
             existing[sym] = pd.concat([existing[sym], new_rows]).sort_index()
             added[sym] = len(new_rows)
         else:
-            df_trimmed = df_new[df_new.index.date >= cutoff]
+            # Use fetch_start (not cutoff) so benchmark symbols store their full history
+            df_trimmed = df_new[df_new.index.date >= fetch_start]
             existing[sym] = df_trimmed
             added[sym] = len(df_trimmed)
     return added
@@ -406,6 +415,13 @@ async def _run_async(specs: list[SymbolSpec], log_fh: TextIO) -> None:
     today = date.today()
     cutoff = today - timedelta(days=MIN_DAYS)
 
+    # Benchmark backfill: remove SPY/QQQ from existing if they don't reach BENCHMARK_START
+    # so the fetch plan treats them as new symbols and re-fetches their full history.
+    for _bsym in _BENCHMARK_SYMS:
+        if _bsym in existing and not existing[_bsym].empty:
+            if existing[_bsym].index.min().date() > _BENCHMARK_START:
+                del existing[_bsym]
+
     # Build per-symbol fetch plan: symbol → (spec, start_date)
     fetch_plan: dict[str, tuple[SymbolSpec, date]] = {}
     up_to_date = 0
@@ -418,8 +434,23 @@ async def _run_async(specs: list[SymbolSpec], log_fh: TextIO) -> None:
                 continue
             fetch_start = last + timedelta(days=1)
         else:
-            fetch_start = cutoff
+            fetch_start = _BENCHMARK_START if sym in _BENCHMARK_SYMS else cutoff
         fetch_plan[sym] = (spec, fetch_start)
+
+    # Inject benchmark symbols not covered by specs (e.g. QQQ not in S&P 500 list)
+    _spec_syms = {s["symbol"] for s in specs}
+    for _bspec in _BENCHMARK_SPECS:
+        _bsym = _bspec["symbol"]
+        if _bsym in fetch_plan or _bsym in _spec_syms:
+            continue
+        if _bsym in existing and not existing[_bsym].empty:
+            _last = existing[_bsym].index.max().date()
+            if _last >= today - timedelta(days=1):
+                up_to_date += 1
+                continue
+            fetch_plan[_bsym] = (_bspec, _last + timedelta(days=1))
+        else:
+            fetch_plan[_bsym] = (_bspec, _BENCHMARK_START)
 
     log_fh.write(
         f"Symbols : {len(specs)} total  |  "

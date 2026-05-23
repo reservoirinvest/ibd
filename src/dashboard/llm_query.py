@@ -24,7 +24,18 @@ load_dotenv()
 
 _SYSTEM_PROMPT_TEMPLATE = """\
 You are a quantitative trading assistant with access to:
-- Live portfolio: current positions, Greeks (delta/theta/vega), and account metrics
+- Live portfolio: current positions, Greeks (delta/theta/vega), and account metrics. \
+The positions list is the COMPLETE and DEFINITIVE record of what is held right now — \
+if a symbol is absent from the positions list it is NOT currently held, regardless of \
+what appears in trade history. Positions may be live (connected) or cached (last known \
+state); the header will say which. If positions are absent entirely, do not infer \
+holdings from trade history. \
+Key metric definitions: \
+"Cushion" = ExcessLiquidity / NetLiquidation (already expressed as a percentage in the metrics — \
+do NOT recalculate it; a 23.6% Cushion means 23.6%, not 0.01). \
+"GrossPositionValue" is NOT a leverage denominator — it is the sum of absolute market values \
+of all positions; the relevant leverage metric is NetLiquidation vs InitMarginReq or \
+the Cushion percentage directly.
 - Trade history: 6 years of closed option trades (OPT asset category only — stock assignment \
 trades excluded) with per-symbol trade count (n), win rate, P&L, and strategy fingerprints \
 (CSP=cash-secured put, CC=covered call, LP=long put, LC=long call). \
@@ -32,9 +43,12 @@ A symbol with both CSP and CC in its strategy column has been traded as a wheel.
 n counts ALL closed OPT trades including assignments (pnl=0); wr% = pnl>0 trades / n. \
 An assignment shows pnl=0 because IBKR credits the premium to the stock cost basis at exercise, \
 not the option close row — it is neither a win nor a loss in the options ledger.
-- Chronological trade log: every individual closed option trade with its exact trade date, \
-symbol, strike (formatted as put/call+price, e.g. C4140.0 or P3960.0), expiry, \
+- Chronological trade log: every individual CLOSED (no longer open) option trade with its exact \
+trade date, symbol, strike (formatted as put/call+price, e.g. C4140.0 or P3960.0), expiry, \
 quantity (negative=sold/short), and realised P&L in dollars. \
+CRITICAL: this log is HISTORICAL — it contains only trades that have already been closed. \
+Do NOT use it to infer what is currently held or open. For current positions use the positions \
+section exclusively. \
 Sorted newest-to-oldest so the most recent trades always appear first. \
 Assignment closes show pnl=0 — the premium collected at open was transferred into the stock \
 cost basis by IBKR rather than credited to the option close row.
@@ -59,14 +73,27 @@ expiry, action, qty, remaining, limit price, status).
 Sow (sell naked puts/calls to open new positions), Reap (buy-to-close profitable open options), \
 and Protect (buy puts for downside hedging). Each order row includes symbol, right (C/P), \
 strike, expiry, dte, qty (contracts), undPrice, xPrice (expected execution price), and a \
-pre-computed total. xPrice × qty × 100 = dollar value per row.
-- Consolidated NAV: daily total portfolio value (US + SG accounts combined), sourced from IBKR \
-Flex EquitySummaryByReportDateInBase. Reflects full MTM including unrealized P&L, dividends, \
-interest, and FX. Provided as month-end values for the last 13 months plus YTD and since-Jan-2025 \
-returns. Confirmed: Jan 1 2025 = $632,507; May 18 2026 = $954,938.
+pre-computed total. xPrice × qty × 100 = dollar value per row. \
+IMPORTANT: Reap entries are derived directly from live positions — every row is a currently open \
+option. Use the right/strike/expiry/avgCost values from the Reap table (not trade_log) for \
+current position details.
+- Consolidated NAV: month-end total portfolio value (US + SG accounts combined), sourced from \
+IBKR Flex EquitySummaryByReportDateInBase. Reflects full MTM including unrealized P&L, dividends, \
+interest, and FX. Provided as month-end values for the full available history (from ~2020) plus \
+YTD and since-Jan-2025 returns. Confirmed: Jan 1 2025 = $632,507; May 18 2026 = $954,938.
+- SPY & QQQ benchmark monthly closes: price history from Jan 2020 (month-end closes in USD). \
+Use these to compare portfolio NAV growth against market benchmarks, compute cumulative returns, \
+or answer questions like "how did the portfolio compare to SPY since 2022?"
 - Cash transactions: deposits and withdrawals for the last 2 years (SGD amounts = SG account; \
 USD = US account; no FX conversion applied), plus dividends and broker interest aggregated by \
 year. Use these to understand capital injections, income, and to cross-check NAV changes.
+- Symbol classification: the Monthly-only list names every S&P 500 symbol that has ONLY \
+monthly/quarterly expiries (gap ≥20 days). Any symbol NOT in that list has weekly or near-weekly \
+expiries. Lookup rule: to answer "is X weekly?" — if X is absent from the monthly-only list → \
+YES (weekly); if X appears in the list → NO (monthly-only).
+- IB commissions: total_commissions_usd in global_stats is the sum of ibCommission for all trades \
+in the Flex history (negative = cost paid to IBKR). Taxes are not separately tracked in the Flex \
+export.
 
 You can cross-reference all data sources to answer questions, including max-earning scenarios \
 from suggested orders.
@@ -240,11 +267,22 @@ def _format_context(context: dict) -> str:
     """Format context dict as readable prompt text."""
     lines = []
 
+    _pos_live = context.get("positions_is_live", True)
+    _pos_as_of = context.get("positions_as_of", "")
     if "positions" in context:
-        lines.append("=== Current Positions ===")
+        _pos_label = "Current Positions (LIVE)" if _pos_live else f"Current Positions (CACHED as of {_pos_as_of} — dashboard offline)"
+        lines.append(f"=== {_pos_label} ===")
+        lines.append("AUTHORITATIVE: for options the right/strike/expiry columns below are definitive.")
+        lines.append("Do NOT use trade_log to infer any option's right, strike, or expiry — trade_log is closed history only.")
+        if not _pos_live:
+            lines.append("WARNING: live IBKR connection unavailable. Positions may be stale. Qualify any recommendations accordingly.")
         positions = context["positions"]
-        text = positions.to_string() if hasattr(positions, "to_string") else str(positions)
-        lines.append(text[:1500])
+        text = positions.to_string(index=False)
+        lines.append(text[:2000])
+    else:
+        lines.append("=== Current Positions ===")
+        lines.append("NO POSITIONS — portfolio is empty or dashboard is not connected to IBKR.")
+        lines.append("Do NOT infer current holdings from trade history. The portfolio holds nothing right now.")
 
     if "greeks" in context:
         lines.append("\n=== Greeks Summary ===")
@@ -286,11 +324,17 @@ def _format_context(context: dict) -> str:
 
     if "trade_log" in context:
         tlog: list[dict] = context["trade_log"]
+        _tlog_cap = 200
+        _tlog_shown = tlog[:_tlog_cap]
+        _tlog_note = (
+            f" (showing most recent {_tlog_cap} of {len(tlog)} total)"
+            if len(tlog) > _tlog_cap else ""
+        )
         lines.append(
-            "\n=== Chronological Trade Log (closed OPT only, sorted oldest→newest) ==="
+            f"\n=== Chronological Trade Log (closed OPT only, newest→oldest{_tlog_note}) ==="
         )
         lines.append("date,sym,strike,expiry,qty,pnl")
-        for t in tlog:
+        for t in _tlog_shown:
             lines.append(
                 f"{t['date']},{t['sym']},{t['strike']},{t['expiry']},{t['qty']},{t['pnl']}"
             )
@@ -344,9 +388,18 @@ def _format_context(context: dict) -> str:
         if nav.get("since_jan2025_pct") is not None:
             lines.append(f"Since 2025-01-01: {nav['since_jan2025_pct']:+.2f}%")
         if nav.get("monthly"):
-            lines.append("Month-end NAV (last 13 months):")
+            lines.append("Month-end NAV (full history):")
             for d, v in nav["monthly"]:
                 lines.append(f"  {d}: ${v:,}")
+
+    if "benchmark_prices" in context:
+        bp: dict[str, list] = context["benchmark_prices"]
+        if bp:
+            lines.append("\n=== SPY & QQQ Benchmark Monthly Closes (USD, 2020 onwards) ===")
+            lines.append("Format: YYYY-MM: price")
+            for bsym, pairs in bp.items():
+                price_str = "  ".join(f"{m}: {v}" for m, v in pairs)
+                lines.append(f"{bsym}: {price_str}")
 
     if "cash_summary" in context:
         cash = context["cash_summary"]
@@ -395,5 +448,26 @@ def _format_context(context: dict) -> str:
                 lines.append(f"Total protection cost: ${float(df['cost'].sum()):,.0f}")
             else:
                 lines.append(f"Total expected premium: ${prem:,.0f}")
+
+    if "symbol_categories" in context:
+        sc = context["symbol_categories"]
+        monthly_only: list[str] = sc.get("monthly_only", [])
+        weekly_count = len(sc.get("weekly", []))
+        lines.append(
+            "\n=== Symbol Classification — Weekly vs Monthly-Only Options ==="
+        )
+        lines.append(
+            "LOOKUP RULE: if a symbol is NOT in the Monthly-only list below → it HAS weekly "
+            "options (answer YES to 'is X weekly?'). If it IS in the list → monthly-only "
+            "(answer NO to 'is X weekly?')."
+        )
+        lines.append(
+            f"Monthly-only ({len(monthly_only)} symbols — ONLY monthly/quarterly expiries; "
+            f"must NOT be sown weekly): {', '.join(monthly_only)}"
+        )
+        lines.append(
+            f"All other ~{weekly_count} S&P 500 symbols in the chain have near-weekly expiries "
+            f"and CAN be sown weekly."
+        )
 
     return "\n".join(lines)

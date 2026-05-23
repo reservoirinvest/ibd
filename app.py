@@ -150,17 +150,22 @@ st.markdown(
         min-width: 0 !important;
         width: 10ch !important;
     }
-    /* KPI compact banded table */
-    .kpi-tbl { width: 100%; border-collapse: collapse; font-size: 0.84rem; table-layout: fixed; }
-    .kpi-tbl td { padding: 3px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .kpi-lbl { opacity: 0.6; font-size: 0.74rem; }
-    .kpi-val { font-weight: 600; font-size: 0.92rem; text-align: right; }
+    /* KPI flex band — responsive, wraps on narrow viewports */
+    .kpi-band { display: flex; flex-direction: column; }
+    .kpi-row { display: flex; flex-wrap: wrap; padding: 3px 4px; align-items: center; }
     .kpi-row-a { background-color: rgba(128,128,128,0.04); }
     .kpi-row-b { background-color: rgba(128,128,128,0.1); }
+    .kpi-cell { display: flex; align-items: center; gap: 5px; flex: 1 1 22%; min-width: 130px; padding: 1px 10px 1px 0; }
+    .kpi-lbl-stack { display: flex; flex-direction: column; line-height: 1.2; }
+    .kpi-lbl { opacity: 0.6; font-size: 1.48rem; white-space: nowrap; }
+    .kpi-sub { font-size: 0.74rem; opacity: 0.55; white-space: nowrap; }
+    .kpi-val { font-weight: 600; font-size: 1.84rem; white-space: nowrap; }
     .kpi-breach { color: #ef4444 !important; }
-    /* Left padding on non-first labels — visual gap between pairs */
-    .kpi-lbl2 { padding-left: 1.2rem !important; }
-    /* Tooltip trigger (?) inside KPI table — circle badge, hover-friendly */
+    /* st.metric() — match value/label sizes to NLV table */
+    [data-testid="stMetricValue"] { font-size: 1.84rem !important; font-weight: 600 !important; }
+    [data-testid="stMetricLabel"] { font-size: 1.0rem !important; opacity: 0.7; }
+    [data-testid="stMetricDelta"] { font-size: 0.95rem !important; }
+    /* Tooltip (?) badge */
     .kpi-help {
         cursor: help; opacity: 0.65; font-size: 0.72rem; line-height: 1;
         display: inline-flex; align-items: center; justify-content: center;
@@ -344,9 +349,11 @@ def _save_cfg() -> None:
     except Exception:
         cfg = {}
     changed: list[str] = []
-    for sk, yk, cast, _ in _CFG_KEYS:
-        new_val = cast(st.session_state[sk])
-        old_val = cast(cfg.get(yk, new_val))
+    for sk, yk, cast, default in _CFG_KEYS:
+        # fall back to current YAML value if Streamlit cleaned up a hidden widget's key
+        _yaml_val = cast(cfg.get(yk, default))
+        new_val = cast(st.session_state.get(sk, _yaml_val))
+        old_val = _yaml_val
         if new_val != old_val:
             changed.append(f"{yk}={new_val!r}")
         cfg[yk] = new_val
@@ -563,7 +570,6 @@ def header() -> None:
     else:
         st_html = "🔴 <b>DISC.</b>"
 
-    as_of = snap.as_of.strftime('%H:%M:%S') if snap.as_of else '—'
     pos_n = len(positions_filt)
 
     st.markdown(
@@ -572,15 +578,36 @@ def header() -> None:
         f'&nbsp;&nbsp;{st_html}&nbsp;&nbsp;'
         f'<span class="hdr-cur">{settings.currency}</span>'
         f'<br>'
-        f'<span class="hdr-item">as_of:&nbsp;{as_of}</span>'
-        f'&nbsp;&bull;&nbsp;<span class="hdr-item">port:&nbsp;{settings.ib_port}&nbsp;cid:&nbsp;{settings.ib_client_id}</span>'
+        f'<span class="hdr-item">port:&nbsp;{settings.ib_port}&nbsp;cid:&nbsp;{settings.ib_client_id}</span>'
         f'&nbsp;&bull;&nbsp;<span class="hdr-item">pos:&nbsp;{pos_n}</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
 
 
-@st.fragment(run_every=2.0)
+@st.fragment(run_every=5)
+def _nav_time() -> None:
+    """Live local clock + data-age shown next to the Refresh button."""
+    snap = client.snapshot()
+    _now_str = datetime.now().strftime("%H:%M:%S")
+
+    _ago_str = "—"
+    if snap.as_of:
+        _elapsed_s = max(0, int((datetime.now().astimezone() - snap.as_of.astimezone()).total_seconds()))
+        _h, _rem = divmod(_elapsed_s, 3600)
+        _m, _s   = divmod(_rem, 60)
+        _ago_str = f"{_h}:{_m:02d}:{_s:02d}"
+
+    st.markdown(
+        f'<div class="hdr-bar" style="text-align:right;">'
+        f'<span class="hdr-item">{_now_str}</span><br>'
+        f'<span class="hdr-item" style="font-size:0.65rem;opacity:0.7;">Refreshed {_ago_str} before</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+@st.fragment(run_every=10)
 def kpi_strip() -> None:
     snap = client.snapshot()
     acct = _selected_account()
@@ -626,80 +653,70 @@ def kpi_strip() -> None:
         _dr_r4_val = ""
         _dr_r4_tip = ""
 
+    min_c_pct = f"{settings.min_cushion:.0%}"
+
     def _lbl(text: str, tip: str) -> str:
         safe_tip = tip.replace('"', '&quot;')
-        return f'<span title="{safe_tip}">{text}&nbsp;<span class="kpi-help">?</span></span>'
+        return f'<span class="kpi-lbl" title="{safe_tip}">{text}&nbsp;<span class="kpi-help">?</span></span>'
 
-    c_cls = ' class="kpi-breach"' if k["cushion_breach"] else ""
-    min_c_pct = f"{settings.min_cushion:.0%}"
-    _dr_lbl1 = _lbl(_dr_r1_lbl, _dr_r1_tip) if _dr_r1_lbl else ""
-    _dr_lbl4 = _lbl(_dr_r4_lbl, _dr_r4_tip) if _dr_r4_lbl else ""
+    def _lbl_sub(text: str, tip: str, sub: str) -> str:
+        safe_tip = tip.replace('"', '&quot;')
+        return (
+            f'<div class="kpi-lbl-stack">'
+            f'<span class="kpi-lbl" title="{safe_tip}">{text}&nbsp;<span class="kpi-help">?</span></span>'
+            f'<span class="kpi-sub">{sub}</span>'
+            f'</div>'
+        )
 
-    # 10-column table: 5 label-value pairs per row → 4 rows total (thinner than 6-row 3-pair layout)
-    rows: list[tuple] = [
-        # Row 1: NLV | Drop withstand | ΣΔ($) | Cushion | Excess Liq
-        (
-            _lbl("NLV", "Net Liquidation Value: total portfolio value including cash, stocks and options at current market prices."),
-            money(k["nlv"]), "",
-            _dr_lbl1, _dr_r1_val, "",
-            _lbl("&#x3A3;&#x394; ($)", "Portfolio Dollar Delta: P&amp;L change for a 1-point broad market move."),
-            signed_money(g["delta_$"]), "",
-            _lbl(f"Cushion (min {min_c_pct})", f"Margin cushion = Excess Liquidity ÷ NLV. Alert threshold: {min_c_pct}. Breach turns red."),
-            pct(k["cushion"]), c_cls,
-            _lbl("Excess Liq", "Excess Liquidity: funds available above the maintenance margin requirement."),
-            money(k["excess_liquidity"]), "",
-        ),
-        # Row 2: Leverage-S | Opt Value | ΣΘ($/d) | Dividend | Maint Margin
-        (
-            _lbl("Leverage-S", "Short leverage: portfolio exposure ÷ equity. Higher = more leveraged (Leverage-S)."),
-            f"{leverage_s:.2f}×", "",
-            _lbl("Opt Value", "Option Market Value: total mark-to-market value of all option positions."),
-            money(opt_val), "",
-            _lbl("&#x3A3;&#x398; ($/d)", "Portfolio Dollar Theta: daily time decay across all options in dollars. Positive = net premium seller collecting theta."),
-            signed_money(g["theta_$"]), "",
-            _lbl("Dividend", "Accrued dividends not yet received (AccruedDividend)."),
-            money(dividend), "",
-            _lbl("Maint Margin", "Maintenance Margin Requirement: minimum equity you must hold to keep current positions open."),
-            money(k["maint_margin"]), "",
-        ),
-        # Row 3: Stock Value | Init Margin | ΣΓ($) | Buying Power | Avail Funds
-        (
-            _lbl("Stock Value", "Total market value of all stock positions at current prices (StockMarketValue)."),
-            money(stock_val), "",
-            _lbl("Init Margin", "Initial Margin Requirement: equity needed to open current positions (InitMarginReq)."),
-            money(init_mg), "",
-            _lbl("&#x3A3;&#x3B3; ($)", "Portfolio Dollar Gamma: rate of change of dollar delta per 1-point move."),
-            signed_money(g["gamma_$"]), "",
-            _lbl("Buying Power", "Maximum new position size without adding more funds (BuyingPower)."),
-            money(buy_pow), "",
-            _lbl("Avail Funds", "Funds available for trading above the maintenance margin (AvailableFunds)."),
-            money(avail_fnds), "",
-        ),
-        # Row 4: ΣΝ($) | dr_r4 | (empty × 3)
-        (
-            _lbl("&#x3A3;&#x3BD; ($)", "Portfolio Dollar Vega: P&amp;L sensitivity to a 1% rise in implied volatility across all options."),
-            signed_money(g["vega_$"]), "",
-            _dr_lbl4, _dr_r4_val, "",
-            "", "", "",
-            "", "", "",
-            "", "", "",
-        ),
+    def _cell(lbl_html: str, val: str, breach: bool = False) -> str:
+        vcls = ' class="kpi-val kpi-breach"' if breach else ' class="kpi-val"'
+        return f'<div class="kpi-cell">{lbl_html}<span{vcls}>{val}</span></div>'
+
+    _dr_cell1 = _cell(
+        _lbl(_dr_r1_lbl, _dr_r1_tip) if _dr_r1_lbl else "",
+        _dr_r1_val,
+    )
+
+    # Row 1: NLV | Drop withstand | Cushion (min X% below) | Excess Liq
+    row1 = [
+        _cell(_lbl("NLV", "Net Liquidation Value: total portfolio value including cash, stocks and options at current market prices."), money(k["nlv"])),
+        _dr_cell1,
+        _cell(_lbl_sub("Cushion", f"Margin cushion = Excess Liquidity ÷ NLV. Alert threshold: {min_c_pct}. Breach turns red.", f"min {min_c_pct}"), pct(k["cushion"]), k["cushion_breach"]),
+        _cell(_lbl("Excess Liq", "Excess Liquidity: funds available above the maintenance margin requirement."), money(k["excess_liquidity"])),
+    ]
+    # Row 2: ΣΔ | ΣΓ | ΣΘ | ΣΝ  (Delta → Gamma → Theta → Volatility/Vega)
+    row2 = [
+        _cell(_lbl("&#x3A3;&#x394; ($)", "Portfolio Dollar Delta: P&amp;L change for a 1-point broad market move."), signed_money(g["delta_$"])),
+        _cell(_lbl("&#x3A3;&#x3B3; ($)", "Portfolio Dollar Gamma: rate of change of dollar delta per 1-point move."), signed_money(g["gamma_$"])),
+        _cell(_lbl("&#x3A3;&#x398; ($/d)", "Portfolio Dollar Theta: daily time decay across all options in dollars. Positive = net premium seller collecting theta."), signed_money(g["theta_$"])),
+        _cell(_lbl("&#x3A3;&#x3BD; ($)", "Portfolio Dollar Vega: P&amp;L sensitivity to a 1% rise in implied volatility across all options."), signed_money(g["vega_$"])),
+    ]
+    # Row 3: Init Margin | Leverage-S | Buying Power | Avail Funds
+    row3 = [
+        _cell(_lbl("Init Margin", "Initial Margin Requirement: equity needed to open current positions (InitMarginReq)."), money(init_mg)),
+        _cell(_lbl("Leverage-S", "Short leverage: portfolio exposure ÷ equity. Higher = more leveraged (Leverage-S)."), f"{leverage_s:.2f}×"),
+        _cell(_lbl("Buying Power", "Maximum new position size without adding more funds (BuyingPower)."), money(buy_pow)),
+        _cell(_lbl("Avail Funds", "Funds available for trading above the maintenance margin (AvailableFunds)."), money(avail_fnds)),
+    ]
+    # Row 4: Opt Value | Stock Value | Maint Margin | Dividend
+    row4 = [
+        _cell(_lbl("Opt Value", "Option Market Value: total mark-to-market value of all option positions."), money(opt_val)),
+        _cell(_lbl("Stock Value", "Total market value of all stock positions at current prices (StockMarketValue)."), money(stock_val)),
+        _cell(_lbl("Maint Margin", "Maintenance Margin Requirement: minimum equity you must hold to keep current positions open."), money(k["maint_margin"])),
+        _cell(_lbl("Dividend", "Accrued dividends not yet received (AccruedDividend)."), money(dividend)),
     ]
 
-    html_parts = ['<table class="kpi-tbl">']
-    for i, row in enumerate(rows):
-        l1,v1,cls1, l2,v2,cls2, l3,v3,cls3, l4,v4,cls4, l5,v5,cls5 = row
+    all_rows = [row1, row2, row3, row4]
+    if _dr_r4_lbl:
+        all_rows.append([
+            _cell(_lbl(_dr_r4_lbl, _dr_r4_tip), _dr_r4_val),
+        ])
+
+    html_parts = ['<div class="kpi-band">']
+    for i, row_cells in enumerate(all_rows):
         rc = "kpi-row-a" if i % 2 == 0 else "kpi-row-b"
-        html_parts.append(
-            f'<tr class="{rc}">'
-            f'<td class="kpi-lbl">{l1}</td><td class="kpi-val"{cls1}>{v1}</td>'
-            f'<td class="kpi-lbl kpi-lbl2">{l2}</td><td class="kpi-val"{cls2}>{v2}</td>'
-            f'<td class="kpi-lbl kpi-lbl2">{l3}</td><td class="kpi-val"{cls3}>{v3}</td>'
-            f'<td class="kpi-lbl kpi-lbl2">{l4}</td><td class="kpi-val"{cls4}>{v4}</td>'
-            f'<td class="kpi-lbl kpi-lbl2">{l5}</td><td class="kpi-val"{cls5}>{v5}</td>'
-            f'</tr>'
-        )
-    html_parts.append('</table>')
+        html_parts.append(f'<div class="kpi-row {rc}">{"".join(row_cells)}</div>')
+    html_parts.append('</div>')
     st.markdown("\n".join(html_parts), unsafe_allow_html=True)
 
     _n_ohlc, _n_weekly = _cached_ohlc_stats()
@@ -707,7 +724,7 @@ def kpi_strip() -> None:
         st.caption(f"{_n_ohlc} symbols in OHLC store — {_n_weekly} weekly S&P 500")
 
 
-@st.fragment(run_every=3.0)
+@st.fragment(run_every=10)
 def render_orders() -> None:
     snap = client.snapshot()
     acct = _selected_account()
@@ -715,12 +732,9 @@ def render_orders() -> None:
 
     # ── Subprocess state ─────────────────────────────────────────────────────
     proc: subprocess.Popen | None       = st.session_state.get("derive_proc")
-    ohlc_proc: subprocess.Popen | None  = st.session_state.get("ohlc_proc")
     exec_proc: subprocess.Popen | None  = st.session_state.get("execute_proc")
     frozen     = client.is_frozen()
-    # OHLC runs without freezing (IBKR fallback uses CID=12, never conflicts with dashboard CID=10)
-    _ohlc_running = ohlc_proc is not None and ohlc_proc.poll() is None
-    frozen_for = st.session_state.get("frozen_for", "")   # "derive" | "ohlc" | "execute" | ""
+    frozen_for = st.session_state.get("frozen_for", "")   # "derive" | "execute" | ""
 
     # Auto-unfreeze when each subprocess finishes (derive + execute only; ohlc runs without freeze)
     def _auto_unfreeze(tag: str, proc_key: str) -> None:
@@ -737,18 +751,10 @@ def render_orders() -> None:
 
     # Capture exit codes the moment each process ends
     _capture_exit(proc,      "_derive_exit")
-    _capture_exit(ohlc_proc, "_ohlc_exit")
     _capture_exit(exec_proc, "_execute_exit")
 
-    # ── Imports needed by Generate OHLCs ──────────────────────────────────────
-    from src.dashboard.ohlc import (   # noqa: PLC0415  (local import inside fragment)
-        OHLC_PATH,
-        get_sp500_symbols,
-        write_symbol_list,
-    )
-
-    # ── Action buttons — single row: generate/fetch/execute/clear ────────────────
-    gen_col, ohlc_col, exec_col, clr_col, _btn_spacer = st.columns([2, 2, 2, 2, 2])
+    # ── Action buttons — single row: generate/execute/clear ──────────────────
+    gen_col, exec_col, clr_col, _btn_spacer = st.columns([2, 2, 2, 4])
 
     # ── Generate Orders ────────────────────────────────────────────────────────
     with gen_col:
@@ -773,61 +779,12 @@ def render_orders() -> None:
             )
             st.session_state["derive_proc"] = new_proc
             logger.info("derive.py started pid={}", new_proc.pid)
-            # No st.rerun() — fragment run_every=3.0 picks up frozen state automatically
+            # No st.rerun() — fragment run_every=10 picks up frozen state automatically
         # Last-derive timestamp sits right under the button
         if "_derive_exit" not in st.session_state and not frozen:
             ages = [_pkl_age(n) for n in ["df_cov.pkl", "df_nkd.pkl", "df_reap.pkl"]]
             age_str = ages[0] if len(set(ages)) == 1 else " | ".join(ages)
             st.caption(f"Last: {age_str}")
-
-    # ── Generate OHLCs ────────────────────────────────────────────────────────
-    with ohlc_col:
-        if st.button(
-            "📊 Generate OHLCs",
-            disabled=frozen or _ohlc_running,
-            width="stretch",
-            help=(
-                "Fetch / update 1.5 yr daily OHLC for S&P500 weekly underlyings + "
-                "portfolio positions. Runs in background; dashboard stays connected."
-            ),
-        ):
-            # Build combined symbol list: S&P500 weekly underlyings + portfolio extras.
-            # Use primaryExch / currency from the position row so non-US ETFs
-            # (e.g. CSPX on LSE) get the correct yfinance ticker suffix.
-            sp500_specs = get_sp500_symbols()
-            seen: set[str] = {s["symbol"] for s in sp500_specs}
-            port_specs: list[dict[str, str]] = []
-            if not snap.positions.empty:
-                for _, _pos in snap.positions.iterrows():
-                    _sym = str(_pos.get("symbol", ""))
-                    if not _sym or _sym in seen:
-                        continue
-                    port_specs.append({
-                        "symbol":   _sym,
-                        "exchange": str(_pos.get("primaryExch", "")) or "SMART",
-                        "currency": str(_pos.get("currency", "")) or "USD",
-                    })
-                    seen.add(_sym)
-            write_symbol_list(sp500_specs + port_specs)
-
-            # No freeze needed: primary fetch is yfinance; IBKR fallback uses CID=12
-            # (separate from dashboard CID=10 — no conflict).
-            _OHLC_LOG.parent.mkdir(parents=True, exist_ok=True)
-            _ohlc_log_fh = open(_OHLC_LOG, "w", encoding="utf-8")   # noqa: SIM115
-            _env = _sub_env()
-            st.session_state.pop("_ohlc_exit", None)
-            _ohlc_new_proc = subprocess.Popen(
-                [sys.executable, str(_here() / "src" / "fetch_ohlc.py")],
-                stdout=_ohlc_log_fh,
-                stderr=subprocess.STDOUT,
-                env=_env,
-            )
-            st.session_state["ohlc_proc"] = _ohlc_new_proc
-            logger.info("fetch_ohlc.py started pid={}", _ohlc_new_proc.pid)
-            # No st.rerun() — fragment run_every=3.0 polls process state automatically
-        # Last-OHLC timestamp sits right under the button
-        if not _ohlc_running and "_ohlc_exit" not in st.session_state:
-            st.caption(f"Last: {_pkl_age('', path=OHLC_PATH)}")
 
     # ── Execute Orders ────────────────────────────────────────────────────────
     with exec_col:
@@ -927,14 +884,14 @@ def render_orders() -> None:
                     f"⚠️ {', '.join(_locked)} still in use — retry in a moment",
                     icon="⚠️",
                 )
-            # No st.rerun() here — fragment auto-refreshes every 3 s via run_every.
+            # No st.rerun() here — fragment auto-refreshes every 10 s via run_every.
             # Calling st.rerun() from inside a fragment triggers a full-page rerun
             # which can race with the IBKR connection and produce error 326.
         st.caption("Keeps OHLC store.")
 
-    # ── Status row (derive + OHLC + execute) ────────────────────────────────────
-    if frozen or _ohlc_running or "_derive_exit" in st.session_state or "_ohlc_exit" in st.session_state or "_execute_exit" in st.session_state:
-        gen_status_col, ohlc_status_col, exec_status_col, _st_spacer = st.columns([2.5, 2.5, 2.5, 2.5])
+    # ── Status row (derive + execute) ────────────────────────────────────────
+    if frozen or "_derive_exit" in st.session_state or "_execute_exit" in st.session_state:
+        gen_status_col, exec_status_col, _st_spacer = st.columns([2.5, 2.5, 5])
         with gen_status_col:
             if frozen and frozen_for == "derive":
                 _pct, phase, _ = _derive_progress()
@@ -945,16 +902,6 @@ def render_orders() -> None:
                     st.success("✅ Orders generated")
                 else:
                     st.error(f"❌ Generate Orders failed (exit {rc})")
-        with ohlc_status_col:
-            if _ohlc_running:
-                _op, _ol = _ohlc_progress()
-                st.progress(_op, text=f"⏳ {_ol}")
-            elif "_ohlc_exit" in st.session_state:
-                rc = st.session_state["_ohlc_exit"]
-                if rc == 0:
-                    st.success("✅ OHLCs up to date")
-                else:
-                    st.error(f"❌ OHLC fetch failed (exit {rc})")
         with exec_status_col:
             if frozen and frozen_for == "execute":
                 st.progress(0.5, text="⏳ Executing orders…")
@@ -966,10 +913,6 @@ def render_orders() -> None:
                     st.error(f"❌ Order execution failed (exit {rc})")
 
     # ── Scrollable log (live during run; collapsible after) ───────────────────
-    if _ohlc_running:
-        _ohlc_live = _ohlc_log_lines(30)
-        if _ohlc_live:
-            st.code("\n".join(_strip_ansi(ln) for ln in _ohlc_live), language=None)
     if frozen and frozen_for == "execute":
         _exec_log = _here() / "log" / "execute.log"
         if _exec_log.exists():
@@ -986,11 +929,6 @@ def render_orders() -> None:
     elif "_derive_exit" in st.session_state:
         rc = st.session_state["_derive_exit"]
         _render_log_expander("📋 derive.py log", _DERIVE_LOG, expanded=rc != 0)
-
-    # Post-run OHLC log — collapsible after freeze ends
-    if "_ohlc_exit" in st.session_state:
-        rc = st.session_state["_ohlc_exit"]
-        _render_log_expander("📋 OHLC log", _OHLC_LOG, expanded=rc != 0)
 
     # Post-run Execute log — collapsible after freeze ends
     if "_execute_exit" in st.session_state:
@@ -1364,7 +1302,7 @@ def render_config_panel() -> None:
             st.error(f"Save failed: {e}")
 
 
-@st.fragment(run_every=3.0)
+@st.fragment(run_every=30)
 def render_diagnostics() -> None:
     snap = client.snapshot()
     acct = _selected_account()
@@ -1479,15 +1417,409 @@ def _cached_ohlc_stats() -> tuple[int, int]:
     return total, weekly_in_ohlc
 
 
-def _sync_analysis_to_pos_filter() -> None:
-    pass  # callback kept for selectbox; Positions tab removed
 
-
-@st.fragment(run_every=5.0)
+@st.fragment
 def render_analysis() -> None:
     """Cover/Protect gaps + OHLC chart browser."""
+    from src.backtest.score import score_from_trades
+    from src.flex.analyze import dte_distribution, strategy_recommendation, symbol_performance
+    from src.flex.fetch import (
+        download_cash_transactions, download_nav, download_trades,
+        load_cash_xml, load_nav_xml,
+        merge_cash_into_pickle, merge_into_pickle, merge_nav_into_pickle,
+    )
+    from src.flex.parse import mask_accounts, normalize, normalize_cash
+
     snap = client.snapshot()
     acct = _selected_account()
+
+    # ── Persist Analysis tab state across tab switches ────────────────────────
+    # Streamlit cleans up widget-backed keys when the tab is not rendered.
+    # Shadow keys (_ana_*) are manually set so they survive navigation.
+    # Bidirectional sync: save on each render; restore when returning.
+    _ANA_PERSIST: list[tuple[str, object]] = [
+        ("pf_sym",            ""),
+        ("pf_sectype",        "ALL"),
+        ("pf_f_state",        "ALL"),
+        ("pf_dte_sel",        "ALL"),
+        ("pf_itm_only",       False),
+        ("scr_sym",           ""),
+        ("scr_strat",         "ALL"),
+        ("gap_needs_sel",     "ALL"),
+        ("deep_dive_sym",     None),
+        ("analysis_chart_sym", None),
+        ("perf_date_start",   None),
+        ("perf_date_end",     None),
+        ("exp_ana_actions",   False),
+        ("exp_ana_positions", False),
+        ("exp_ana_screener",  False),
+        ("exp_ana_cover",     False),
+        ("exp_ana_treemap",   False),
+        ("exp_ana_pnl",       False),
+        ("exp_ana_deep_dive", False),
+        ("exp_ana_chart",     False),
+        ("exp_ana_perf",      True),
+    ]
+    for _wk, _wdefault in _ANA_PERSIST:
+        _sk = f"_ana_{_wk}"
+        if _wk in st.session_state:
+            st.session_state[_sk] = st.session_state[_wk]   # save current
+        elif _sk in st.session_state:
+            st.session_state[_wk] = st.session_state[_sk]   # restore on re-entry
+
+    # ── Variables needed by Update Trades + flex data ────────────────────────
+    flex_path = _MASTER_DIR / "flex_trades.pkl"
+    cash_path = _MASTER_DIR / "flex_cash.pkl"
+    nav_path  = _MASTER_DIR / "flex_nav.pkl"
+    token = settings.token.get_secret_value()
+    qid = settings.trades_flexid.get_secret_value()
+    _acct_map = {a: lbl for lbl, a in (("US", _US), ("SG", _SG)) if a}
+
+    # ── Imports needed by Generate OHLCs ─────────────────────────────────────
+    from src.dashboard.ohlc import (   # noqa: PLC0415
+        OHLC_PATH,
+        get_sp500_symbols,
+        write_symbol_list,
+    )
+
+    # ── OHLC subprocess state ─────────────────────────────────────────────────
+    ohlc_proc: subprocess.Popen | None = st.session_state.get("ohlc_proc")
+    _ohlc_running = ohlc_proc is not None and ohlc_proc.poll() is None
+    _capture_exit(ohlc_proc, "_ohlc_exit")
+
+    # ── Auto Update Trades after OHLC completes ───────────────────────────────
+    # When OHLC subprocess finishes successfully and the auto-flag is set,
+    # launch scripts/update_trades.py as a background subprocess.
+    _api_ready = bool(token and qid)
+    if (
+        st.session_state.get("_ohlc_exit") == 0
+        and st.session_state.get("_auto_update_trades_pending")
+        and not st.session_state.get("trades_proc")
+    ):
+        st.session_state.pop("_auto_update_trades_pending", None)
+        _ut_log_fh = open(_here() / "log" / "update_trades.log", "w", encoding="utf-8")  # noqa: SIM115
+        _ut_proc = subprocess.Popen(
+            [sys.executable, str(_here() / "scripts" / "update_trades.py")],
+            stdout=_ut_log_fh,
+            stderr=subprocess.STDOUT,
+            env=_sub_env(),
+        )
+        st.session_state["trades_proc"] = _ut_proc
+        logger.info("update_trades.py auto-started after OHLC pid={}", _ut_proc.pid)
+
+    # Check if auto trades subprocess finished
+    _trades_proc: subprocess.Popen | None = st.session_state.get("trades_proc")
+    if _trades_proc is not None and _trades_proc.poll() is not None:
+        st.session_state["_trades_exit"] = _trades_proc.poll()
+        st.session_state["trades_proc"] = None
+
+    # ── Actions twistie ───────────────────────────────────────────────────────
+    with st.expander("🛠 Actions", expanded=False, key="exp_ana_actions"):
+        _ohlc_btn_col, _trades_btn_col, _weeklies_btn_col, _clr_btn_col = st.columns(4)
+        if _clr_btn_col.button("✕ Clear", key="btn_actions_clear", width="stretch"):
+            for _k in ("_ohlc_exit", "_weeklies_data", "_trades_exit", "llm_hist_cache"):
+                st.session_state.pop(_k, None)
+            st.rerun()
+
+        # ── Generate OHLCs ────────────────────────────────────────────────────────
+        with _ohlc_btn_col:
+            if st.button(
+                "📊 Generate OHLCs",
+                disabled=_ohlc_running,
+                width="stretch",
+                help=(
+                    "Fetch / update 1.5 yr daily OHLC for S&P500 weekly underlyings + "
+                    "portfolio positions. Runs in background; Update Trades runs automatically after."
+                ),
+            ):
+                sp500_specs = get_sp500_symbols()
+                seen: set[str] = {s["symbol"] for s in sp500_specs}
+                port_specs: list[dict[str, str]] = []
+                if not snap.positions.empty:
+                    for _, _pos in snap.positions.iterrows():
+                        _sym = str(_pos.get("symbol", ""))
+                        if not _sym or _sym in seen:
+                            continue
+                        port_specs.append({
+                            "symbol":   _sym,
+                            "exchange": str(_pos.get("primaryExch", "")) or "SMART",
+                            "currency": str(_pos.get("currency", "")) or "USD",
+                        })
+                        seen.add(_sym)
+                write_symbol_list(sp500_specs + port_specs)
+
+                _OHLC_LOG.parent.mkdir(parents=True, exist_ok=True)
+                _ohlc_log_fh = open(_OHLC_LOG, "w", encoding="utf-8")   # noqa: SIM115
+                _env = _sub_env()
+                st.session_state.pop("_ohlc_exit", None)
+                st.session_state["_auto_update_trades_pending"] = True
+                _ohlc_new_proc = subprocess.Popen(
+                    [sys.executable, str(_here() / "src" / "fetch_ohlc.py")],
+                    stdout=_ohlc_log_fh,
+                    stderr=subprocess.STDOUT,
+                    env=_env,
+                )
+                st.session_state["ohlc_proc"] = _ohlc_new_proc
+                logger.info("fetch_ohlc.py started pid={}", _ohlc_new_proc.pid)
+            if not _ohlc_running and "_ohlc_exit" not in st.session_state:
+                st.caption(f"Last: {_pkl_age('', path=OHLC_PATH)}")
+
+        # ── Update Trades ─────────────────────────────────────────────────────────
+        if _trades_btn_col.button(
+            "🔄 Update Trades",
+            key="btn_flex_update",
+            help=(
+                "Merges all available sources into flex_trades.pkl — never erases history.\n\n"
+                "Sources tried in order:\n"
+                "1. API — IBKR Flex Web Service (requires TOKEN + TRADES_FLEXID in .env and portal "
+                "query period set to 'Last 365 Calendar Days').\n"
+                "2. XML — any *.xml files in data/master/ (manual portal download, e.g. 2024.xml).\n\n"
+                "API response is trimmed to 3 days before the pkl's most-recent entry so only "
+                "recent rows are reprocessed; XML files are always merged in full. "
+                "Both sources are deduplicated before saving."
+            ),
+            width="stretch",
+        ):
+            with st.spinner("Updating flex_trades.pkl…"):
+                from src.flex.fetch import load_xml
+                _sources: list[pd.DataFrame] = []
+                _log: list[str] = []
+
+                _pkl_max_dt: pd.Timestamp | None = None
+                if flex_path.exists():
+                    try:
+                        _df_ex = pd.read_pickle(flex_path)
+                        if not _df_ex.empty and "dateTime" in _df_ex.columns:
+                            _t = _df_ex["dateTime"].max()
+                            _pkl_max_dt = _t if pd.notna(_t) else None
+                    except Exception:
+                        pass
+
+                if _api_ready:
+                    try:
+                        df_api = mask_accounts(normalize(download_trades(token, qid)), _acct_map)
+                        if df_api.empty:
+                            _log.append(
+                                "— API: 0 rows returned. In IBKR portal edit your Flex Query → "
+                                "set Period to **Last 365 Calendar Days** (not Custom Date Range)."
+                            )
+                        else:
+                            if _pkl_max_dt is not None and "dateTime" in df_api.columns:
+                                _cutoff = _pkl_max_dt - pd.Timedelta(days=3)
+                                df_api = df_api[df_api["dateTime"] >= _cutoff]
+                            _sources.append(df_api)
+                            _log.append(f"✓ API: {len(df_api):,} rows")
+                    except Exception as _e:
+                        _log.append(f"✗ API: {_e}")
+                else:
+                    _log.append("— API: skipped (TOKEN / TRADES_FLEXID not in .env)")
+
+                try:
+                    raw = load_xml(_MASTER_DIR)
+                    df_xml = mask_accounts(normalize(raw), _acct_map)
+                    if not df_xml.empty:
+                        _n_xml = len(sorted(_MASTER_DIR.glob("*.xml")))
+                        _sources.append(df_xml)
+                        _log.append(f"✓ XML: {len(df_xml):,} rows from {_n_xml} file(s)")
+                except FileNotFoundError:
+                    _log.append("— XML: no flex_*.xml files in data/master/")
+                except Exception as _e:
+                    _log.append(f"✗ XML: {_e}")
+
+                _cash_sources: list[pd.DataFrame] = []
+                if _api_ready:
+                    try:
+                        _df_cash_api = mask_accounts(
+                            normalize_cash(download_cash_transactions(token, qid)), _acct_map
+                        )
+                        if not _df_cash_api.empty:
+                            _cash_sources.append(_df_cash_api)
+                            _log.append(f"✓ Cash API: {len(_df_cash_api):,} rows")
+                        else:
+                            _log.append(
+                                "— Cash API: 0 rows (add 'Cash Transactions' section to your "
+                                "Flex Query in IBKR portal → Reports → Flex Queries → edit → Sections)"
+                            )
+                    except Exception as _ce:
+                        _log.append(f"✗ Cash API: {_ce}")
+                try:
+                    _df_cash_xml = mask_accounts(
+                        normalize_cash(load_cash_xml(_MASTER_DIR)), _acct_map
+                    )
+                    if not _df_cash_xml.empty:
+                        _cash_sources.append(_df_cash_xml)
+                        _log.append(f"✓ Cash XML: {len(_df_cash_xml):,} rows")
+                except Exception:
+                    pass
+                if _cash_sources:
+                    merge_cash_into_pickle(
+                        pd.concat(_cash_sources, ignore_index=True), cash_path
+                    )
+
+                _nav_sources: list[pd.DataFrame] = []
+                if _api_ready:
+                    try:
+                        _df_nav_api = download_nav(token, qid)
+                        if not _df_nav_api.empty:
+                            _nav_sources.append(_df_nav_api)
+                            _log.append(f"✓ NAV API: {len(_df_nav_api):,} daily rows")
+                        else:
+                            _log.append(
+                                "— NAV API: 0 rows (add 'Equity Summary by Report Date in Base Currency' "
+                                "section to your Flex Query)"
+                            )
+                    except Exception as _ne:
+                        _log.append(f"✗ NAV API: {_ne}")
+                try:
+                    _df_nav_xml = load_nav_xml(_MASTER_DIR)
+                    if not _df_nav_xml.empty:
+                        _nav_sources.append(_df_nav_xml)
+                        _log.append(f"✓ NAV XML: {len(_df_nav_xml):,} daily rows")
+                except Exception as _ne:
+                    _log.append(f"✗ NAV XML: {_ne}")
+                if _nav_sources:
+                    merge_nav_into_pickle(
+                        pd.concat(_nav_sources, ignore_index=True), nav_path
+                    )
+                elif not _api_ready:
+                    _log.append(
+                        "— NAV: no EquitySummaryByReportDateInBase data in XMLs "
+                        "(add 'Equity Summary by Report Date in Base Currency' section to your Flex Query)"
+                    )
+
+                if _sources:
+                    _before = len(pd.read_pickle(flex_path)) if flex_path.exists() else 0
+                    df_combined = pd.concat(_sources, ignore_index=True)
+                    df_merged = merge_into_pickle(df_combined, flex_path)
+                    if _acct_map:
+                        df_merged = mask_accounts(df_merged, _acct_map)
+                        df_merged.to_pickle(flex_path)
+                    _added = len(df_merged) - _before
+                    st.success(
+                        f"Updated — **{len(df_merged):,}** rows total (**{_added:+,}** new).\n\n"
+                        + "  \n".join(_log)
+                    )
+                    st.session_state.pop("llm_hist_cache", None)
+                else:
+                    st.warning("No data found from any source.")
+                    for _msg in _log:
+                        st.caption(_msg)
+                    st.info(
+                        "**Option A — API (routine updates, no file download):**\n"
+                        "1. IBKR Portal → Reports → Flex Queries → find `TradeHistory`\n"
+                        "2. Edit → set **Period** to `Last 365 Calendar Days` → Save\n"
+                        "3. Add TOKEN + TRADES_FLEXID to `.env`\n\n"
+                        "**Option B — Manual XML (one-time or gap fills):**\n"
+                        "1. Portal → run query, Period = Custom Date Range, Format = XML\n"
+                        "2. Save as `data/master/2024.xml`, `2025.xml`, etc. (one file per year)\n"
+                        "3. Click **🔄 Update Trades** again"
+                    )
+
+        with _weeklies_btn_col:
+            if st.button(
+                "🗓 Identify Weeklies",
+                key="btn_identify_weeklies",
+                help=(
+                    "Classifies all S&P 500 symbols as weekly or monthly based on the option chain data "
+                    "from the last build. Saves data/master/symbol_categories.pkl.\n\n"
+                    "Run weekly (or after each build) to keep the monthly-only list current. "
+                    "derive.py uses this to exclude monthly-only symbols from sow candidates and to "
+                    "generate breakeven covered calls for monthly-only held stocks.\n\n"
+                    "Press once to run and show results; press again to hide."
+                ),
+                width="stretch",
+            ):
+                if "_weeklies_data" in st.session_state:
+                    st.session_state.pop("_weeklies_data", None)
+                else:
+                    with st.spinner("Classifying weekly/monthly symbols…"):
+                        from scripts.update_symbol_categories import classify_weeklies
+                        _cat_chains = _MASTER_DIR.parent.parent / "data" / "df_chains.pkl"
+                        if not _cat_chains.exists():
+                            st.error("df_chains.pkl not found — run Generate Orders (build) first.")
+                        else:
+                            _cat_df = pd.read_pickle(_cat_chains)
+                            _sym_cat = classify_weeklies(_cat_df)
+                            _sym_cat.to_pickle(_MASTER_DIR / "symbol_categories.pkl")
+                            _n_weekly  = int(_sym_cat["is_weekly"].sum())
+                            _n_monthly = int((~_sym_cat["is_weekly"]).sum())
+                            _monthly_list = sorted(_sym_cat.loc[~_sym_cat["is_weekly"], "symbol"].tolist())
+                            st.session_state["_weeklies_data"] = {
+                                "n_weekly": _n_weekly,
+                                "n_monthly": _n_monthly,
+                                "monthly_list": _monthly_list,
+                            }
+
+        # ── Result displays ────────────────────────────────────────────────────────
+        # OHLC status
+        if _ohlc_running:
+            _op, _ol = _ohlc_progress()
+            st.progress(_op, text=f"⏳ {_ol}")
+        elif "_ohlc_exit" in st.session_state:
+            _ohlc_rc = st.session_state["_ohlc_exit"]
+            if _ohlc_rc == 0:
+                st.success("✅ OHLCs up to date")
+            else:
+                st.error(f"❌ OHLC fetch failed (exit {_ohlc_rc})")
+        if _ohlc_running:
+            _ohlc_live = _ohlc_log_lines(30)
+            if _ohlc_live:
+                st.code("\n".join(_strip_ansi(ln) for ln in _ohlc_live), language=None)
+        if "_ohlc_exit" in st.session_state:
+            _ohlc_post_rc = st.session_state["_ohlc_exit"]
+            _render_log_expander("📋 OHLC log", _OHLC_LOG, expanded=_ohlc_post_rc != 0)
+
+        # Auto Update Trades status (triggered after OHLC)
+        if st.session_state.get("trades_proc") is not None:
+            st.info("⏳ Update Trades running in background…")
+        elif "_trades_exit" in st.session_state:
+            _ut_rc = st.session_state["_trades_exit"]
+            if _ut_rc == 0:
+                st.success("✅ Update Trades completed (auto-triggered after OHLC)")
+            else:
+                st.error(f"❌ Update Trades failed (exit {_ut_rc})")
+
+        # Update Trades caption
+        _warn = []
+        if not _api_ready:
+            _warn.append("⚠ TOKEN / TRADES_FLEXID not set — API disabled")
+        st.caption("  ".join(_warn) if _warn else f"flex_trades.pkl — {_pkl_age('', path=flex_path)}")
+
+        # Identify Weeklies result
+        if "_weeklies_data" in st.session_state:
+            _wd = st.session_state["_weeklies_data"]
+            _ml = _wd["monthly_list"]
+            st.success(
+                f"symbol_categories.pkl saved — {_wd['n_weekly']} weekly, "
+                f"**{_wd['n_monthly']} monthly-only** (shown below)."
+            )
+            if _ml:
+                _ncols = 10
+                _nrows = (_wd["n_monthly"] + _ncols - 1) // _ncols
+                _padded = _ml + [""] * (_nrows * _ncols - _wd["n_monthly"])
+                # Row numbers: 1-based, each covers _ncols symbols
+                _row_nums = [str(i * _ncols + 1) for i in range(_nrows)]
+                _tbl = pd.DataFrame(
+                    [_padded[i * _ncols : (i + 1) * _ncols] for i in range(_nrows)],
+                    columns=[f"_{i}" for i in range(_ncols)],
+                )
+                _tbl.insert(0, "#", _row_nums)
+                st.dataframe(
+                    _tbl,
+                    hide_index=True,
+                    column_config={
+                        "#": st.column_config.TextColumn("#", width="small"),
+                        **{f"_{i}": st.column_config.TextColumn("") for i in range(_ncols)},
+                    },
+                )
+
+    # ── Cumulative Performance chart ──────────────────────────────────────────
+    _render_perf_chart(
+        flex_path=flex_path,
+        ohlc_path=_MASTER_DIR / "ohlc.pkl",
+        cash_path=cash_path,
+        nav_path=nav_path,
+    )
 
     # ── Positions table (live — with filters + ITM highlighting) ─────────────
     if not snap.positions.empty:
@@ -1510,7 +1842,7 @@ def render_analysis() -> None:
                 .reset_index(drop=True)
             )
 
-        with st.expander("📋 Positions", expanded=False):
+        with st.expander("📋 Positions", expanded=False, key="exp_ana_positions"):
             _pf_c1, _pf_c2, _pf_c3, _pf_c4, _pf_c5, _pf_c6 = st.columns([2.5, 1, 2, 1, 1, 1])
             _pf_sym = _pf_c1.text_input(
                 "Symbol", key="pf_sym", placeholder="exact, e.g. A"
@@ -1637,7 +1969,7 @@ def render_analysis() -> None:
             _oo_raw = _oo_raw[~_illiq].reset_index(drop=True)
 
         _scr_n = f" — {len(_scr_raw)} signals · {len(_oo_raw)} legs" if not _scr_raw.empty else ""
-        with st.expander(f"📡 Option Screener{_scr_n}", expanded=False):
+        with st.expander(f"📡 Option Screener{_scr_n}", expanded=False, key="exp_ana_screener"):
             if _scr_raw.empty and _oo_raw.empty:
                 st.info(
                     "No data — run `uv run python scripts/option_strategy_screener.py` "
@@ -1749,7 +2081,7 @@ def render_analysis() -> None:
             cover_std_mult=settings.cover_std_mult,
             max_dte=settings.max_dte,
         )
-        with st.expander(f"🔍 Cover/Protect gaps (PROTECT_ME={settings.protect_me})", expanded=False):
+        with st.expander(f"🔍 Cover/Protect gaps (PROTECT_ME={settings.protect_me})", expanded=False, key="exp_ana_cover"):
             if gaps.empty:
                 st.success("No gaps — all stocks covered and protected.")
             else:
@@ -1818,7 +2150,7 @@ def render_analysis() -> None:
     ohlc_store = _cached_ohlc()
     if not ohlc_store:
         st.info(
-            "No OHLC data yet. Click **📊 Generate OHLCs** in the Orders tab "
+            "No OHLC data yet. Click **📊 Generate OHLCs** above "
             "to build the store (requires data/symbols.pkl from build.py first)."
         )
         return
@@ -1826,7 +2158,7 @@ def render_analysis() -> None:
     all_symbols = sorted(ohlc_store.keys())
 
     # ── Portfolio Treemap ─────────────────────────────────────────────────────
-    with st.expander("🗺️ Portfolio Treemap", expanded=False):
+    with st.expander("🗺️ Portfolio Treemap", expanded=False, key="exp_ana_treemap"):
         pos_df = _filter_positions(snap.positions, acct)
         if not pos_df.empty:
             df_tree = pos_df.copy()
@@ -1871,8 +2203,135 @@ def render_analysis() -> None:
         else:
             st.info("No positions to display.")
 
+    # ── Load flex trade data (needed for Options P&L + Symbol Deep-Dive) ─────
+    _flex_loaded = flex_path.exists()
+    if _flex_loaded:
+        df_all = pd.read_pickle(flex_path)
+        if df_all.empty or "pnl" not in df_all.columns:
+            if not df_all.empty:
+                df_all = normalize(df_all)
+        _has_raw_ids = (
+            _acct_map and "accountId" in df_all.columns
+            and df_all["accountId"].isin(set(_acct_map.keys())).any()
+        )
+        if _has_raw_ids:
+            df_all = mask_accounts(df_all, _acct_map)
+            df_all.to_pickle(flex_path)
+        perf = symbol_performance(df_all)
+        _unds_path = _DATA_DIR / "df_unds.pkl"
+        _unds = pd.read_pickle(_unds_path).set_index("symbol") if _unds_path.exists() else pd.DataFrame()
+        _pos_map: dict[str, str] = {}
+        if not snap.positions.empty:
+            for _sym_k, _grp in _filter_positions(snap.positions, acct).groupby("symbol"):
+                _parts = []
+                _stk = _grp[_grp["secType"] == "STK"]
+                if not _stk.empty:
+                    _qty = int(_stk["position"].sum())
+                    _parts.append(f"STK {_qty:+d}")
+                _opt = _grp[_grp["secType"] == "OPT"]
+                for _, _orow in _opt.iterrows():
+                    _r = _orow.get("right", "?")
+                    _q = int(_orow["position"])
+                    _parts.append(f"{_r} {_q:+d}")
+                if _parts:
+                    _pos_map[str(_sym_k)] = "  ".join(_parts)
+        _av2 = _select_account_values(snap, acct)
+        _nlv = float(_av2.get("NetLiquidation", 0)) if _av2 else 0.0
+        _qty_mult = st.session_state.get("cfg_virgin_qty_mult", 0.055)
+        _vd = {"DEPLOY": "🟢", "REFINE": "🟡", "ABANDON": "🔴"}
+
+        if not perf.empty:
+            _extra: list[dict] = []
+            for _sym in perf["symbol"]:
+                _u = _unds.loc[_sym] if _sym in _unds.index else None
+                _extra.append({
+                    "current_price": round(float(_u["price"]), 2) if _u is not None else None,
+                    "hv":  round(float(_u["hv"]) * 100, 1)  if _u is not None else None,
+                    "iv":  round(float(_u["iv"]) * 100, 1)  if _u is not None else None,
+                    "position": _pos_map.get(_sym, ""),
+                    "margin": round(float(_u["margin"]), 0) if _u is not None else None,
+                })
+            _extra_df = pd.DataFrame(_extra)
+            _sym_idx = perf.columns.get_loc("symbol") + 1
+            for _col in reversed(["current_price", "hv", "iv", "position", "margin"]):
+                perf.insert(_sym_idx, _col, _extra_df[_col].values)
+
+        # ── Options P&L by Underlying ─────────────────────────────────────────
+        with st.expander("📊 Options P&L by Underlying", expanded=False, key="exp_ana_pnl"):
+            if perf.empty:
+                st.info("No closed options trades in the Flex data.")
+            else:
+                st.dataframe(
+                    _banded(perf).format({
+                        "current_price": "${:,.2f}",
+                        "hv":  "{:.1f}%",
+                        "iv":  "{:.1f}%",
+                        "margin":        "${:,.0f}",
+                        "win_rate":      "{:.0%}",
+                        "profit_factor": "{:.2f}",
+                        "avg_win":       "${:,.0f}",
+                        "avg_loss":      "${:,.0f}",
+                        "total_pnl":     "${:,.0f}",
+                    }, na_rep="—"),
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "symbol":        st.column_config.TextColumn("Symbol",        help="Underlying ticker"),
+                        "current_price": st.column_config.NumberColumn("Price",       help="Last close from df_unds (yfinance)"),
+                        "hv":            st.column_config.TextColumn("HV %",          help="20-day historical volatility (annualised) from df_unds"),
+                        "iv":            st.column_config.TextColumn("IV %",          help="Implied volatility from df_unds"),
+                        "position":      st.column_config.TextColumn("Position",      help="Current live position: STK ±shares, P/C ±contracts"),
+                        "margin":        st.column_config.TextColumn("Margin",        help="Estimated margin per contract from df_unds"),
+                        "trades":        st.column_config.NumberColumn("Trades",      help="Closed option contracts"),
+                        "win_rate":      st.column_config.TextColumn("Win %",         help="% of closed trades with positive P&L"),
+                        "profit_factor": st.column_config.TextColumn("PF",            help="Gross profit ÷ gross loss. ≥1.5 = strong edge"),
+                        "avg_win":       st.column_config.TextColumn("Avg Win",       help="Average P&L on winning trades"),
+                        "avg_loss":      st.column_config.TextColumn("Avg Loss",      help="Average P&L on losing trades (negative)"),
+                        "total_pnl":     st.column_config.TextColumn("Total P&L",     help="Sum of all realised P&L for this symbol"),
+                    },
+                )
+
+        # ── Symbol Deep-Dive ──────────────────────────────────────────────────
+        with st.expander("🔍 Symbol Deep-Dive", expanded=False, key="exp_ana_deep_dive"):
+            if perf.empty:
+                st.info("No data.")
+            else:
+                _sym_list = perf["symbol"].tolist()
+                _dc1, _dc2 = st.columns([1, 3])
+                with _dc1:
+                    _sel = st.selectbox("Symbol", _sym_list, key="deep_dive_sym")
+                dte_df = dte_distribution(df_all)
+                rec = strategy_recommendation(perf, dte_df, _sel)
+                _sel_margin = (
+                    float(_unds.loc[_sel, "margin"])
+                    if not _unds.empty and _sel in _unds.index
+                    else 0.0
+                )
+                if _nlv > 0 and _sel_margin > 0 and _qty_mult > 0:
+                    _suggested_qty = max(1, int(_qty_mult * _nlv / _sel_margin))
+                    rec += (
+                        f"\nSuggested qty: {_suggested_qty} contract(s)"
+                        f"  (VIRGIN_QTY_MULT {_qty_mult} × NLV ${_nlv:,.0f} ÷ margin ${_sel_margin:,.0f})"
+                    )
+                with _dc2:
+                    st.code(rec)
+
+                _score = score_from_trades(df_all, _sel)
+                _s1, _s2, _s3, _s4, _s5 = st.columns(5)
+                _s1.metric("Score", f"{_score.composite:.0f}/100",
+                           f"{_vd.get(_score.verdict, '')} {_score.verdict}",
+                           help="Composite backtest quality 0–100. DEPLOY ≥70, REFINE 40–69, ABANDON <40.")
+                _s2.metric("Trades", _score.total_trades,
+                           help="Closed option contracts used in the backtest.")
+                _s3.metric("Win Rate", f"{_score.win_rate:.0%}",
+                           help="Percentage of closed trades with positive realised P&L.")
+                _s4.metric("Profit Factor", f"{_score.profit_factor:.2f}",
+                           help="Gross profit ÷ gross loss. <1.0 = losing edge, 1.5+ = strong edge.")
+                _s5.metric("Years Tested", f"{_score.years_tested:.1f}",
+                           help="Date span of trade history used. <3 years = insufficient for robust scoring.")
+
     # ── Chart & Positions ─────────────────────────────────────────────────────
-    with st.expander("📈 Chart with table", expanded=False):
+    with st.expander("📈 Single Symbol Chart with Position Table", expanded=False, key="exp_ana_chart"):
         # Guard stale session_state (e.g. symbol removed from OHLC store after a refresh)
         _cur_sym = st.session_state.get("analysis_chart_sym")
         if _cur_sym not in all_symbols:
@@ -1885,7 +2344,6 @@ def render_analysis() -> None:
                 "Symbol",
                 all_symbols,
                 key="analysis_chart_sym",
-                on_change=_sync_analysis_to_pos_filter,
                 label_visibility="collapsed",
             )
             st.markdown('</div>', unsafe_allow_html=True)
@@ -2330,7 +2788,7 @@ def _render_perf_chart(
     """Cumulative performance vs. SPY/QQQ benchmark — shown above Trade History & Backtest."""
     import math
 
-    with st.expander("📈 Cumulative Performance vs. Benchmark", expanded=True):
+    with st.expander("📈 Cumulative Performance vs. Benchmark", expanded=True, key="exp_ana_perf"):
 
         # ── Guards ────────────────────────────────────────────────────────
         if not flex_path.exists() or not ohlc_path.exists():
@@ -2365,6 +2823,23 @@ def _render_perf_chart(
                     _nav_series_full = _df_nav.set_index("reportDate")["total"].sort_index()
             except Exception:
                 pass
+
+        # ── Patch today with live NLV when Flex data is stale ────────────
+        # Keeps the chart current on any trading day without needing a manual Flex update.
+        _today_ts = pd.Timestamp.today().normalize()
+        if len(_nav_series_full) >= 1 and _nav_series_full.index.max() < _today_ts:
+            try:
+                _live_snap = client.snapshot()
+                if _live_snap.connected and _live_snap.account_values:
+                    _live_nlv = account_kpis(_live_snap)["nlv"]
+                    if _live_nlv > 0:
+                        _nav_series_full = pd.concat([
+                            _nav_series_full,
+                            pd.Series({_today_ts: _live_nlv}),
+                        ]).sort_index()
+            except Exception:
+                pass
+
         _have_nav = len(_nav_series_full) >= 2
 
         # ── Load USD cash flows for TWR adjustment ─────────────────────────
@@ -2402,9 +2877,37 @@ def _render_perf_chart(
         t0        = min(t0_trades, t0_nav)
         _today    = pd.Timestamp.today().normalize()
 
-        # ── Controls: date pickers first so values feed metric cards ─────────
+        # ── Period shortcut buttons — set From/To then rerun so date pickers update ──
+        # Presets are stored in non-widget keys to avoid StreamlitAPIException.
+        # On the rerun we pop the widget key so date_input falls back to value=.
+        _preset_start = st.session_state.pop("_perf_preset_start", None)
+        _preset_end   = st.session_state.pop("_perf_preset_end",   None)
+        if _preset_start is not None:
+            st.session_state.pop("perf_date_start", None)
+        if _preset_end is not None:
+            st.session_state.pop("perf_date_end", None)
+
+        _pb = st.columns(8)
+        _period_presets = [
+            ("Focus", max(_DEFAULT_PERF_START.date(), t0.date())),
+            ("MTD",   max(_today.replace(day=1).date(), t0.date())),
+            ("1M",    max((_today - pd.DateOffset(months=1)).date(), t0.date())),
+            ("3M",    max((_today - pd.DateOffset(months=3)).date(), t0.date())),
+            ("YTD",   max(_today.replace(month=1, day=1).date(), t0.date())),
+            ("1Y",    max((_today - pd.DateOffset(years=1)).date(), t0.date())),
+            ("3Y",    max((_today - pd.DateOffset(years=3)).date(), t0.date())),
+            ("All",   t0.date()),
+        ]
+        for _pcol, (_plbl, _pstart) in zip(_pb, _period_presets):
+            if _pcol.button(_plbl, key=f"perf_period_{_plbl}", width="stretch"):
+                st.session_state["_perf_preset_start"] = _pstart
+                st.session_state["_perf_preset_end"]   = _today.date()
+                st.rerun()
+
+        # ── Controls: date pickers — value= driven by preset or previous input ──
         _c1, _c2, _c3, _c4, _c5 = st.columns([2, 2, 2, 1, 1])
-        _default_start = max(_DEFAULT_PERF_START.date(), t0.date())
+        _default_start = _preset_start if _preset_start is not None else max(_DEFAULT_PERF_START.date(), t0.date())
+        _default_end   = _preset_end   if _preset_end   is not None else _today.date()
         _d_start = _c4.date_input(
             "From",
             value=_default_start,
@@ -2414,7 +2917,7 @@ def _render_perf_chart(
         )
         _d_end = _c5.date_input(
             "To",
-            value=_today.date(),
+            value=_default_end,
             min_value=t0.date(),
             max_value=_today.date(),
             key="perf_date_end",
@@ -2537,15 +3040,36 @@ def _render_perf_chart(
 
         # ── Clip & rebase (for OPT P&L, SPY, QQQ — no deposit adjustment) ─
         def _clip_rebase(series: pd.Series) -> pd.Series:
-            s = series[(series.index >= _d_start_ts) & (series.index <= _d_end_ts)]
+            # Right-clip only; rebase at _d_start_ts so pre-start data is visible when
+            # zooming out with 1Y/3Y/All without leaving an empty gap.
+            s = series[series.index <= _d_end_ts]
             if len(s) < 2:
                 return pd.Series(dtype=float)
-            return (s / s.iloc[0] - 1.0) * 100.0
+            _base_cands = s[s.index <= _d_start_ts]
+            if _base_cands.empty:
+                return pd.Series(dtype=float)
+            base = float(_base_cands.iloc[-1])
+            if base == 0:
+                return pd.Series(dtype=float)
+            return (s / base - 1.0) * 100.0
 
-        nav_index = (
-            _compute_twr(_nav_series_full, _cf_daily, _d_start_ts, _d_end_ts)
-            if _have_nav else pd.Series(dtype=float)
-        )
+        # NAV TWR: compute from t0 (full history) then reanchor to 0% at _d_start_ts
+        if _have_nav:
+            _nav_twr_raw = _compute_twr(_nav_series_full, _cf_daily, t0, _d_end_ts)
+            if not _nav_twr_raw.empty:
+                _anchor_cands = _nav_twr_raw[_nav_twr_raw.index <= _d_start_ts]
+                if not _anchor_cands.empty:
+                    _anchor_pct = float(_anchor_cands.iloc[-1])
+                    nav_index = (
+                        (1.0 + _nav_twr_raw / 100.0) / (1.0 + _anchor_pct / 100.0) - 1.0
+                    ) * 100.0
+                else:
+                    nav_index = _nav_twr_raw
+            else:
+                nav_index = _nav_twr_raw
+        else:
+            nav_index = pd.Series(dtype=float)
+
         opt_index = _clip_rebase(options_nav_full)
         spy_index = _clip_rebase(spy_closes)
         qqq_index = _clip_rebase(qqq_closes) if not qqq_closes.empty else pd.Series(dtype=float)
@@ -2554,32 +3078,36 @@ def _render_perf_chart(
             st.info("No data in the selected date range.")
             return
 
-        # Display-range dollar series (for bar chart and hover customdata)
+        # Full-history dollar series for bars and hover customdata (right-clip only)
         _nav_display = (
-            _nav_bdays_full[
-                (_nav_bdays_full.index >= _d_start_ts) & (_nav_bdays_full.index <= _d_end_ts)
-            ] if _have_nav else pd.Series(dtype=float)
+            _nav_bdays_full[_nav_bdays_full.index <= _d_end_ts]
+            if _have_nav else pd.Series(dtype=float)
         )
-        _opt_display = options_nav_full[
-            (options_nav_full.index >= _d_start_ts) & (options_nav_full.index <= _d_end_ts)
-        ]
+        _opt_display = options_nav_full[options_nav_full.index <= _d_end_ts]
 
-        # ── Metrics ───────────────────────────────────────────────────────
+        # ── Metrics (period-clipped to [_d_start_ts, _d_end_ts] so cards stay correct) ──
         _primary_pct = nav_index if not nav_index.empty else opt_index
         _primary_nav = _nav_display if (_have_nav and not _nav_display.empty) else _opt_display
 
+        # Period-only slices for metric cards — traces extend further but metrics stay pinned
+        _opt_period  = options_nav_full[
+            (options_nav_full.index >= _d_start_ts) & (options_nav_full.index <= _d_end_ts)
+        ]
+        _pct_period  = _primary_pct[_primary_pct.index >= _d_start_ts] if not _primary_pct.empty else pd.Series(dtype=float)
+        _nav_period  = _primary_nav[_primary_nav.index >= _d_start_ts] if not _primary_nav.empty else pd.Series(dtype=float)
+
         display_pnl = (
-            float(_opt_display.iloc[-1] - _opt_display.iloc[0])
-            if len(_opt_display) >= 2 else 0.0
+            float(_opt_period.iloc[-1] - _opt_period.iloc[0])
+            if len(_opt_period) >= 2 else 0.0
         )
         _consolidated_ret = float(_primary_pct.iloc[-1]) if not _primary_pct.empty else 0.0
         spy_ret_pct = float(spy_index.iloc[-1]) if not spy_index.empty else None
         alpha_pp    = (_consolidated_ret - spy_ret_pct) if spy_ret_pct is not None else None
 
-        # Max drawdown with peak→trough dates (on the % series)
+        # Max drawdown with peak→trough dates — computed on period only
         max_dd, _dd_period = 0.0, ""
-        if not _primary_pct.empty:
-            _pct1    = 1.0 + _primary_pct / 100.0
+        if not _pct_period.empty:
+            _pct1    = 1.0 + _pct_period / 100.0
             _peak_tw = _pct1.cummax()
             _dd_tw   = (_pct1 / _peak_tw - 1.0) * 100.0
             max_dd   = float(_dd_tw.min())
@@ -2589,7 +3117,7 @@ def _render_perf_chart(
             _dd_period = f"{_dd_peak.strftime('%b %d, %Y')} → {_dd_trough.strftime('%b %d, %Y')}"
 
         _daily_ret = (
-            _primary_nav.pct_change()
+            _nav_period.pct_change()
             .replace([float("inf"), float("-inf")], float("nan"))
             .dropna()
         )
@@ -2643,7 +3171,7 @@ def _render_perf_chart(
                 name=_bar_label,
                 marker_color="rgba(148,163,184,0.22)",
                 yaxis="y",
-                hovertemplate=f"$%{{y:,.0f}}<extra>{_bar_label}</extra>",
+                hoverinfo="skip",
             ))
 
         # All % lines on SECONDARY (right) axis
@@ -2690,11 +3218,9 @@ def _render_perf_chart(
                 hovertemplate="%{text}  $%{customdata:,.0f}<extra>QQQ</extra>",
             ))
 
-        # Cash markers on secondary % axis (at 0%)
+        # Cash markers on secondary % axis (at 0%) — full history so they show when zoomed out
         if not _dep_events.empty:
-            _dve  = _dep_events[
-                (_dep_events["date"] >= _d_start_ts) & (_dep_events["date"] <= _d_end_ts)
-            ]
+            _dve  = _dep_events[_dep_events["date"] <= _d_end_ts]
             _deps = _dve[_dve["amount"] > 0]
             _wits = _dve[_dve["amount"] < 0]
             if not _deps.empty:
@@ -2718,6 +3244,31 @@ def _render_perf_chart(
                     hovertemplate="%{text}<extra>Withdrawal</extra>",
                 ))
 
+        # ── Y-axis ranges: computed from visible window so period buttons rescale ──
+        def _windowed_range(
+            series_list: list[pd.Series],
+            extra_vals: list[float] | None = None,
+            pad: float = 0.08,
+        ) -> list[float] | None:
+            vals: list[float] = list(extra_vals or [])
+            for _s in series_list:
+                if _s.empty:
+                    continue
+                _w = _s[(_s.index >= _d_start_ts) & (_s.index <= _d_end_ts)]
+                if not _w.empty:
+                    vals.extend(_w.dropna().tolist())
+            if not vals:
+                return None
+            _lo, _hi = min(vals), max(vals)
+            _span = (_hi - _lo) or 1.0
+            return [_lo - _span * pad, _hi + _span * pad]
+
+        _y1_range = _windowed_range([_bar_y])
+        _y2_range = _windowed_range(
+            [nav_index, opt_index, spy_index, qqq_index],
+            extra_vals=[0.0],  # keep zeroline in view
+        )
+
         _y1_title = "Consolidated NAV ($)" if _have_nav else "OPT NAV ($)"
         fig.update_layout(
             height=400,
@@ -2735,24 +3286,21 @@ def _render_perf_chart(
                 tickformat="$,.0f",
                 tickfont=dict(color="rgba(148,163,184,0.6)"),
                 showgrid=False,
+                **({} if _y1_range is None else {"range": _y1_range}),
             ),
             yaxis2=dict(
                 overlaying="y", side="right",
                 ticksuffix="%", tickformat=".1f",
                 zeroline=True, zerolinecolor="rgba(148,163,184,0.5)", zerolinewidth=1,
                 showgrid=True,
+                **({} if _y2_range is None else {"range": _y2_range}),
             ),
         )
+        # range= always bounded to real data dates → no blank future months.
+        # autorange=False prevents Plotly from padding beyond _d_end_ts.
         fig.update_xaxes(
-            rangeselector=dict(buttons=[
-                dict(count=1, label="MTD", step="month", stepmode="todate"),
-                dict(count=1, label="1M",  step="month", stepmode="backward"),
-                dict(count=3, label="3M",  step="month", stepmode="backward"),
-                dict(count=1, label="YTD", step="year",  stepmode="todate"),
-                dict(count=1, label="1Y",  step="year",  stepmode="backward"),
-                dict(count=3, label="3Y",  step="year",  stepmode="backward"),
-                dict(label="Focus", step="all"),
-            ]),
+            range=[str(_d_start_ts.date()), str(_d_end_ts.date())],
+            autorange=False,
             rangeslider=dict(visible=False),
             hoverformat="%b %d, %Y",
         )
@@ -2811,6 +3359,10 @@ def _build_history_context() -> dict:
     date_min = df["dateTime"].min() if "dateTime" in df.columns else None
     date_max = df["dateTime"].max() if "dateTime" in df.columns else None
 
+    total_commissions = (
+        int(df["ibCommission"].sum()) if "ibCommission" in df.columns else None
+    )
+
     global_stats = {
         "date_range": f"{date_min.date() if date_min is not pd.NaT else '?'} to {date_max.date() if date_max is not pd.NaT else '?'}",
         "total_rows_all": len(df),
@@ -2821,6 +3373,8 @@ def _build_history_context() -> dict:
         "best_trade": _trade_label(best_row) if best_row is not None else "N/A",
         "worst_trade": _trade_label(worst_row) if worst_row is not None else "N/A",
     }
+    if total_commissions is not None:
+        global_stats["total_commissions_usd"] = total_commissions
 
     # All closed OPT trades, including pnl=0 (assignments and worthless expirations where IBKR
     # books the premium to the stock cost basis at assignment time, not the option close row).
@@ -3012,22 +3566,68 @@ def _build_ohlc_context(focus_symbols: set[str]) -> dict:
     return result
 
 
+_PF_PICKLE = _MASTER_DIR.parent / "df_pf.pkl"   # data/df_pf.pkl — auto-saved snapshot
+
+
 def _build_live_context() -> dict:
     """Build LLM context from the live dashboard snapshot, trade history, and OHLC stats."""
     snap = client.snapshot()
     acct = _selected_account()
     positions = _filter_positions(snap.positions, acct)
     context: dict = {}
+
+    # ── Positions: live → auto-save; empty → load cached pickle with staleness warning ──
+    _pos_is_live = not positions.empty
+    _pos_as_of: str | None = None
+
+    if _pos_is_live:
+        # Persist snapshot so future queries can fall back if dashboard goes offline
+        try:
+            _now = datetime.now()
+            _pf_meta = {"positions": positions, "as_of": _now}
+            with open(_PF_PICKLE, "wb") as _fh:
+                pickle.dump(_pf_meta, _fh)
+            _pos_as_of = _now.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+    else:
+        # Live snapshot empty — fall back to last saved pickle
+        try:
+            with open(_PF_PICKLE, "rb") as _fh:
+                _pf_meta = pickle.load(_fh)
+            positions = _pf_meta.get("positions", pd.DataFrame())
+            _saved_at: datetime = _pf_meta.get("as_of", datetime.min)
+            _pos_as_of = _saved_at.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            positions = pd.DataFrame()
+
+    # Always send positions key so the AI knows exactly what is held (or that nothing is)
     if not positions.empty:
-        cols = [c for c in ("symbol", "secType", "position", "marketPrice",
-                             "marketValue", "delta", "theta", "vega") if c in positions.columns]
+        cols = [c for c in (
+            "symbol", "secType", "right", "strike", "expiry",
+            "position", "marketPrice", "marketValue", "avgCost",
+            "delta", "theta", "vega",
+        ) if c in positions.columns]
         context["positions"] = positions[cols]
+    context["positions_is_live"] = _pos_is_live
+    if _pos_as_of:
+        context["positions_as_of"] = _pos_as_of
+
     g = greek_dollar_sums(positions, snap.tickers) if not positions.empty else {}
     if g:
         context["greeks"] = {k: round(v, 2) for k, v in g.items() if isinstance(v, float)}
     av = _select_account_values(snap, acct)
     if av:
-        context["metrics"] = {k: str(v) for k, v in av.items()}
+        kpis = account_kpis(snap, min_cushion=settings.min_cushion, account=acct)
+        metrics = {k: str(v) for k, v in av.items()}
+        # IBKR's raw "Cushion" tag uses a different formula and reads as ~0.01.
+        # Replace with the dashboard's definition: ExcessLiquidity / NLV (shown as % in the KPI strip).
+        metrics["Cushion"] = (
+            f"{kpis['cushion']:.1%} = ExcessLiquidity / NLV"
+            f" (alert threshold {settings.min_cushion:.0%};"
+            f" {'BREACH' if kpis['cushion_breach'] else 'OK'})"
+        )
+        context["metrics"] = metrics
 
     hist = _build_history_context()
     context.update(hist)
@@ -3043,6 +3643,9 @@ def _build_live_context() -> dict:
     context.update(_build_ohlc_context(pos_syms | hist_syms))
 
     # Suggested Orders — load pickles so the LLM can reason about them
+    _live_conids: set = (
+        set(positions["conId"]) if not positions.empty and "conId" in positions.columns else set()
+    )
     for ctx_key, pkl_name in (
         ("orders_cover",   "df_cov.pkl"),
         ("orders_sow",     "df_nkd.pkl"),
@@ -3050,6 +3653,9 @@ def _build_live_context() -> dict:
         ("orders_protect", "df_protect.pkl"),
     ):
         df_ord = _load_pkl(pkl_name)
+        if ctx_key == "orders_reap" and _live_conids and "conId" in df_ord.columns:
+            # Guard against stale derive.py output: only keep options still in live positions
+            df_ord = df_ord[df_ord["conId"].isin(_live_conids)]
         if not df_ord.empty:
             context[ctx_key] = df_ord
 
@@ -3075,12 +3681,11 @@ def _build_live_context() -> dict:
                     _current    = float(_nav_ts.iloc[-1])
                     _at_jan25   = float(_nav_ts[_nav_ts.index >= _jan25].iloc[0]) if (_nav_ts.index >= _jan25).any() else None
                     _at_ytd     = float(_nav_ts[_nav_ts.index >= _ytd_start].iloc[0]) if (_nav_ts.index >= _ytd_start).any() else None
-                    # Last value of each month for the past 13 months
+                    # Month-end NAV — full history (needed for multi-year performance questions)
                     _nav_df  = pd.DataFrame({"date": _nav_ts.index, "nav": _nav_ts.values})
                     _nav_df["ym"] = _nav_df["date"].dt.to_period("M")
-                    _cutoff_ym   = (_today_ts - pd.DateOffset(months=13)).to_period("M")
                     _monthly_df  = (
-                        _nav_df[_nav_df["ym"] >= _cutoff_ym]
+                        _nav_df
                         .groupby("ym", sort=True)
                         .last()
                         .reset_index()
@@ -3133,6 +3738,40 @@ def _build_live_context() -> dict:
                     ],
                     "dividends_by_year": _div_by_yr,
                     "interest_by_year":  _int_by_yr,
+                }
+        except Exception:
+            pass
+
+    # SPY / QQQ monthly closes from 2020 (benchmark comparison for Ask AI — full history for
+    # multi-year return questions like "compare to SPY since 2022")
+    try:
+        _ohlc_store = _cached_ohlc()
+        _bench_start_ts = pd.Timestamp("2020-01-01")
+        _bench_data: dict[str, list[tuple[str, float]]] = {}
+        for _bsym in ("SPY", "QQQ"):
+            _bdf = _ohlc_store.get(_bsym)
+            if _bdf is not None and not _bdf.empty and "Close" in _bdf.columns:
+                _bcloses = _bdf["Close"].dropna()
+                _bcloses = _bcloses[_bcloses.index >= _bench_start_ts]
+                if not _bcloses.empty:
+                    _bmo = _bcloses.resample("ME").last().dropna()
+                    _bench_data[_bsym] = [
+                        (str(dt)[:7], round(float(v), 2)) for dt, v in _bmo.items()
+                    ]
+        if _bench_data:
+            context["benchmark_prices"] = _bench_data
+    except Exception:
+        pass
+
+    # Symbol categories — weekly vs monthly-only (from symbol_categories.pkl)
+    _sym_cat_pkl = _MASTER_DIR / "symbol_categories.pkl"
+    if _sym_cat_pkl.exists():
+        try:
+            _sym_cat_df = pd.read_pickle(_sym_cat_pkl)
+            if not _sym_cat_df.empty and {"symbol", "is_weekly"}.issubset(_sym_cat_df.columns):
+                context["symbol_categories"] = {
+                    "monthly_only": sorted(_sym_cat_df.loc[~_sym_cat_df["is_weekly"], "symbol"].tolist()),
+                    "weekly": sorted(_sym_cat_df.loc[_sym_cat_df["is_weekly"], "symbol"].tolist()),
                 }
         except Exception:
             pass
@@ -3228,391 +3867,7 @@ def _render_llm_chat() -> None:
                 st.code(f"Q: {_last_q}\n\nA: {cached}", language=None)
 
 
-# ---------------------------------------------------------------------------
-# History tab
-# ---------------------------------------------------------------------------
-
-@st.fragment
-def render_history() -> None:
-    """5-year trade history, per-symbol backtest scoring, and live Greeks calculator."""
-    from src.backtest.score import score_from_trades
-    from src.flex.analyze import dte_distribution, strategy_recommendation, symbol_performance
-    from src.flex.fetch import (
-        download_cash_transactions, download_trades,
-        load_cash_xml, load_nav_xml,
-        merge_cash_into_pickle, merge_into_pickle, merge_nav_into_pickle,
-    )
-    from src.flex.parse import mask_accounts, normalize, normalize_cash
-
-    _render_perf_chart(
-        flex_path=_MASTER_DIR / "flex_trades.pkl",
-        ohlc_path=_MASTER_DIR / "ohlc.pkl",
-        cash_path=_MASTER_DIR / "flex_cash.pkl",
-        nav_path=_MASTER_DIR / "flex_nav.pkl",
-    )
-
-    st.markdown("### Trade History & Backtest")
-
-    token = settings.token.get_secret_value()
-    qid = settings.trades_flexid.get_secret_value()
-    _acct_map = {
-        a: lbl
-        for lbl, a in (("US", _US), ("SG", _SG))
-        if a
-    }
-
-    flex_path = _MASTER_DIR / "flex_trades.pkl"
-    cash_path = _MASTER_DIR / "flex_cash.pkl"
-    nav_path  = _MASTER_DIR / "flex_nav.pkl"
-
-    # ── Controls ──────────────────────────────────────────────────────────────
-    _api_ready = bool(token and qid)
-    _ctrl_trade, _ctrl_weekly = st.columns(2)
-
-    if _ctrl_weekly.button(
-        "🗓 Identify Weeklies",
-        key="btn_identify_weeklies",
-        help=(
-            "Classifies all S&P 500 symbols as weekly or monthly based on the option chain data "
-            "from the last build. Saves data/master/symbol_categories.pkl.\n\n"
-            "Run weekly (or after each build) to keep the monthly-only list current. "
-            "derive.py uses this to exclude monthly-only symbols from sow candidates and to "
-            "generate breakeven covered calls for monthly-only held stocks.\n\n"
-            "Press once to run and show results; press again to hide."
-        ),
-        width="stretch",
-    ):
-        if "_weeklies_data" in st.session_state:
-            st.session_state.pop("_weeklies_data", None)
-        else:
-            with st.spinner("Classifying weekly/monthly symbols…"):
-                from scripts.update_symbol_categories import classify_weeklies
-                _cat_chains = _MASTER_DIR.parent.parent / "data" / "df_chains.pkl"
-                if not _cat_chains.exists():
-                    st.error("df_chains.pkl not found — run Generate Orders (build) first.")
-                else:
-                    _cat_df = pd.read_pickle(_cat_chains)
-                    _sym_cat = classify_weeklies(_cat_df)
-                    _sym_cat.to_pickle(_MASTER_DIR / "symbol_categories.pkl")
-                    _n_weekly  = int(_sym_cat["is_weekly"].sum())
-                    _n_monthly = int((~_sym_cat["is_weekly"]).sum())
-                    _monthly_list = sorted(_sym_cat.loc[~_sym_cat["is_weekly"], "symbol"].tolist())
-                    st.session_state["_weeklies_data"] = {
-                        "n_weekly": _n_weekly,
-                        "n_monthly": _n_monthly,
-                        "monthly_list": _monthly_list,
-                    }
-
-    if "_weeklies_data" in st.session_state:
-        _wd = st.session_state["_weeklies_data"]
-        _ml = _wd["monthly_list"]
-        st.success(
-            f"symbol_categories.pkl saved — {_wd['n_weekly']} weekly, "
-            f"**{_wd['n_monthly']} monthly-only** (shown below)."
-        )
-        if _ml:
-            _ncols = 10
-            _nrows = (_wd["n_monthly"] + _ncols - 1) // _ncols
-            _padded = _ml + [""] * (_nrows * _ncols - _wd["n_monthly"])
-            _tbl = pd.DataFrame(
-                [_padded[i * _ncols : (i + 1) * _ncols] for i in range(_nrows)],
-                columns=[f"_{i}" for i in range(_ncols)],
-            )
-            st.dataframe(
-                _tbl,
-                hide_index=True,
-                column_config={f"_{i}": st.column_config.TextColumn("") for i in range(_ncols)},
-            )
-
-    if _ctrl_trade.button(
-        "🔄 Update Trades",
-        key="btn_flex_update",
-        help=(
-            "Merges all available sources into flex_trades.pkl — never erases history.\n\n"
-            "Sources tried in order:\n"
-            "1. API — IBKR Flex Web Service (requires TOKEN + TRADES_FLEXID in .env and portal "
-            "query period set to 'Last 365 Calendar Days').\n"
-            "2. XML — any *.xml files in data/master/ (manual portal download, e.g. 2024.xml).\n\n"
-            "API response is trimmed to 3 days before the pkl's most-recent entry so only "
-            "recent rows are reprocessed; XML files are always merged in full. "
-            "Both sources are deduplicated before saving."
-        ),
-        width="stretch",
-    ):
-        with st.spinner("Updating flex_trades.pkl…"):
-            from src.flex.fetch import load_xml
-            _sources: list[pd.DataFrame] = []
-            _log: list[str] = []
-
-            # Reference date: most-recent dateTime in the existing pkl.
-            # API response will be trimmed to (ref - 3 days) so we only reprocess recent rows.
-            _pkl_max_dt: pd.Timestamp | None = None
-            if flex_path.exists():
-                try:
-                    _df_ex = pd.read_pickle(flex_path)
-                    if not _df_ex.empty and "dateTime" in _df_ex.columns:
-                        _t = _df_ex["dateTime"].max()
-                        _pkl_max_dt = _t if pd.notna(_t) else None
-                except Exception:
-                    pass
-
-            # Source 1: API
-            if _api_ready:
-                try:
-                    df_api = mask_accounts(normalize(download_trades(token, qid)), _acct_map)
-                    if df_api.empty:
-                        _log.append(
-                            "— API: 0 rows returned. In IBKR portal edit your Flex Query → "
-                            "set Period to **Last 365 Calendar Days** (not Custom Date Range)."
-                        )
-                    else:
-                        # Trim to 3 days before the pkl's latest date to skip old already-merged rows
-                        if _pkl_max_dt is not None and "dateTime" in df_api.columns:
-                            _cutoff = _pkl_max_dt - pd.Timedelta(days=3)
-                            df_api = df_api[df_api["dateTime"] >= _cutoff]
-                        _sources.append(df_api)
-                        _log.append(f"✓ API: {len(df_api):,} rows")
-                except Exception as _e:
-                    _log.append(f"✗ API: {_e}")
-            else:
-                _log.append("— API: skipped (TOKEN / TRADES_FLEXID not in .env)")
-
-            # Source 2: XML files
-            try:
-                raw = load_xml(_MASTER_DIR)
-                df_xml = mask_accounts(normalize(raw), _acct_map)
-                if not df_xml.empty:
-                    _n_xml = len(sorted(_MASTER_DIR.glob("*.xml")))
-                    _sources.append(df_xml)
-                    _log.append(f"✓ XML: {len(df_xml):,} rows from {_n_xml} file(s)")
-            except FileNotFoundError:
-                _log.append("— XML: no flex_*.xml files in data/master/")
-            except Exception as _e:
-                _log.append(f"✗ XML: {_e}")
-
-            # ── Cash transactions (same query — CashTransaction section must be enabled) ──
-            _cash_sources: list[pd.DataFrame] = []
-            if _api_ready:
-                try:
-                    _df_cash_api = mask_accounts(
-                        normalize_cash(download_cash_transactions(token, qid)), _acct_map
-                    )
-                    if not _df_cash_api.empty:
-                        _cash_sources.append(_df_cash_api)
-                        _log.append(f"✓ Cash API: {len(_df_cash_api):,} rows")
-                    else:
-                        _log.append(
-                            "— Cash API: 0 rows (add 'Cash Transactions' section to your "
-                            "Flex Query in IBKR portal → Reports → Flex Queries → edit → Sections)"
-                        )
-                except Exception as _ce:
-                    _log.append(f"✗ Cash API: {_ce}")
-            try:
-                _df_cash_xml = mask_accounts(
-                    normalize_cash(load_cash_xml(_MASTER_DIR)), _acct_map
-                )
-                if not _df_cash_xml.empty:
-                    _cash_sources.append(_df_cash_xml)
-                    _log.append(f"✓ Cash XML: {len(_df_cash_xml):,} rows")
-            except Exception:
-                pass
-            if _cash_sources:
-                merge_cash_into_pickle(
-                    pd.concat(_cash_sources, ignore_index=True), cash_path
-                )
-
-            # ── Daily consolidated NAV (EquitySummaryByReportDateInBase) ──────
-            try:
-                _df_nav_new = load_nav_xml(_MASTER_DIR)
-                if not _df_nav_new.empty:
-                    merge_nav_into_pickle(_df_nav_new, nav_path)
-                    _log.append(f"✓ NAV: {len(_df_nav_new):,} daily rows")
-                else:
-                    _log.append(
-                        "— NAV: no EquitySummaryByReportDateInBase data in XMLs "
-                        "(add 'Equity Summary by Report Date in Base Currency' section to your Flex Query)"
-                    )
-            except Exception as _ne:
-                _log.append(f"✗ NAV: {_ne}")
-
-            if _sources:
-                _before = len(pd.read_pickle(flex_path)) if flex_path.exists() else 0
-                df_combined = pd.concat(_sources, ignore_index=True)
-                df_merged = merge_into_pickle(df_combined, flex_path)
-                if _acct_map:
-                    df_merged = mask_accounts(df_merged, _acct_map)
-                    df_merged.to_pickle(flex_path)
-                _added = len(df_merged) - _before
-                st.success(
-                    f"Updated — **{len(df_merged):,}** rows total (**{_added:+,}** new).\n\n"
-                    + "  \n".join(_log)
-                )
-                st.session_state.pop("llm_hist_cache", None)
-            else:
-                st.warning("No data found from any source.")
-                for _msg in _log:
-                    st.caption(_msg)
-                st.info(
-                    "**Option A — API (routine updates, no file download):**\n"
-                    "1. IBKR Portal → Reports → Flex Queries → find `TradeHistory`\n"
-                    "2. Edit → set **Period** to `Last 365 Calendar Days` → Save\n"
-                    "3. Add TOKEN + TRADES_FLEXID to `.env`\n\n"
-                    "**Option B — Manual XML (one-time or gap fills):**\n"
-                    "1. Portal → run query, Period = Custom Date Range, Format = XML\n"
-                    "2. Save as `data/master/2024.xml`, `2025.xml`, etc. (one file per year)\n"
-                    "3. Click **🔄 Update Trades** again"
-                )
-
-    _warn = []
-    if not _api_ready:
-        _warn.append("⚠ TOKEN / TRADES_FLEXID not set — API disabled")
-    st.caption("  ".join(_warn) if _warn else f"flex_trades.pkl — {_pkl_age('', path=flex_path)}")
-
-    if not flex_path.exists():
-        st.info("No trade data yet — click **🔄 Update Trades** above.")
-        return
-
-    df_all = pd.read_pickle(flex_path)
-    if df_all.empty:
-        st.warning("Flex data file is empty.")
-        return
-    _needs_normalize = "pnl" not in df_all.columns
-    _has_raw_ids = (
-        _acct_map
-        and "accountId" in df_all.columns
-        and df_all["accountId"].isin(set(_acct_map.keys())).any()
-    )
-    if _needs_normalize:
-        df_all = normalize(df_all)
-    if _has_raw_ids:
-        df_all = mask_accounts(df_all, _acct_map)
-    if _needs_normalize or _has_raw_ids:
-        df_all.to_pickle(flex_path)
-
-    # ── Enrich perf table with live price/IV/HV/position/margin ─────────────
-    perf = symbol_performance(df_all)
-    _unds_path = _DATA_DIR / "df_unds.pkl"
-    _unds = pd.read_pickle(_unds_path).set_index("symbol") if _unds_path.exists() else pd.DataFrame()
-
-    _snap = client.snapshot()
-    _pos_df = _filter_positions(_snap.positions, _selected_account())
-
-    # Build per-underlying position summary: {sym: "STK +100  P -2"}
-    _pos_map: dict[str, str] = {}
-    if not _pos_df.empty:
-        for _sym, _grp in _pos_df.groupby("symbol"):
-            _parts = []
-            _stk = _grp[_grp["secType"] == "STK"]
-            if not _stk.empty:
-                _qty = int(_stk["position"].sum())
-                _parts.append(f"STK {_qty:+d}")
-            _opt = _grp[_grp["secType"] == "OPT"]
-            for _, _orow in _opt.iterrows():
-                _r = _orow.get("right", "?")
-                _q = int(_orow["position"])
-                _parts.append(f"{_r} {_q:+d}")
-            if _parts:
-                _pos_map[str(_sym)] = "  ".join(_parts)
-
-    # Get NLV for quantity suggestion
-    _av = _select_account_values(_snap, _selected_account())
-    _nlv = float(_av.get("nlv", 0)) if _av else 0.0
-    _qty_mult = st.session_state.get("cfg_virgin_qty_mult", 0.055)
-
-    if not perf.empty:
-        # Merge live data columns into perf (after symbol, before trades)
-        _extra: list[dict] = []
-        for _sym in perf["symbol"]:
-            _u = _unds.loc[_sym] if _sym in _unds.index else None
-            _extra.append({
-                "current_price": round(float(_u["price"]), 2) if _u is not None else None,
-                "hv":  round(float(_u["hv"]) * 100, 1)  if _u is not None else None,
-                "iv":  round(float(_u["iv"]) * 100, 1)  if _u is not None else None,
-                "position": _pos_map.get(_sym, ""),
-                "margin": round(float(_u["margin"]), 0) if _u is not None else None,
-            })
-        _extra_df = pd.DataFrame(_extra)
-        # Insert new cols right after "symbol" column
-        _sym_idx = perf.columns.get_loc("symbol") + 1
-        for _col in reversed(["current_price", "hv", "iv", "position", "margin"]):
-            perf.insert(_sym_idx, _col, _extra_df[_col].values)
-
-    _vd = {"DEPLOY": "🟢", "REFINE": "🟡", "ABANDON": "🔴"}
-
-    # ── Twistie 1 — Options P&L by Underlying ────────────────────────────────
-    with st.expander("📊 Options P&L by Underlying", expanded=False):
-        if perf.empty:
-            st.info("No closed options trades in the Flex data.")
-        else:
-            st.dataframe(
-                _banded(perf).format({
-                    "current_price": "${:,.2f}",
-                    "hv":  "{:.1f}%",
-                    "iv":  "{:.1f}%",
-                    "margin":        "${:,.0f}",
-                    "win_rate":      "{:.0%}",
-                    "profit_factor": "{:.2f}",
-                    "avg_win":       "${:,.0f}",
-                    "avg_loss":      "${:,.0f}",
-                    "total_pnl":     "${:,.0f}",
-                }, na_rep="—"),
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "symbol":        st.column_config.TextColumn("Symbol",        help="Underlying ticker"),
-                    "current_price": st.column_config.NumberColumn("Price",       help="Last close from df_unds (yfinance)"),
-                    "hv":            st.column_config.TextColumn("HV %",          help="20-day historical volatility (annualised) from df_unds"),
-                    "iv":            st.column_config.TextColumn("IV %",          help="Implied volatility from df_unds"),
-                    "position":      st.column_config.TextColumn("Position",      help="Current live position: STK ±shares, P/C ±contracts"),
-                    "margin":        st.column_config.TextColumn("Margin",        help="Estimated margin per contract from df_unds"),
-                    "trades":        st.column_config.NumberColumn("Trades",      help="Closed option contracts"),
-                    "win_rate":      st.column_config.TextColumn("Win %",         help="% of closed trades with positive P&L"),
-                    "profit_factor": st.column_config.TextColumn("PF",            help="Gross profit ÷ gross loss. ≥1.5 = strong edge"),
-                    "avg_win":       st.column_config.TextColumn("Avg Win",       help="Average P&L on winning trades"),
-                    "avg_loss":      st.column_config.TextColumn("Avg Loss",      help="Average P&L on losing trades (negative)"),
-                    "total_pnl":     st.column_config.TextColumn("Total P&L",     help="Sum of all realised P&L for this symbol"),
-                },
-            )
-
-    # ── Twistie 2 — Symbol Deep-Dive ─────────────────────────────────────────
-    with st.expander("🔍 Symbol Deep-Dive", expanded=False):
-        if perf.empty:
-            st.info("No data.")
-        else:
-            _sym_list = perf["symbol"].tolist()
-            _dc1, _dc2 = st.columns([1, 3])
-            with _dc1:
-                _sel = st.selectbox("Symbol", _sym_list, key="hist_sym")
-            dte_df = dte_distribution(df_all)
-            rec = strategy_recommendation(perf, dte_df, _sel)
-            # Append quantity suggestion using VIRGIN_QTY_MULT
-            _sel_margin = (
-                float(_unds.loc[_sel, "margin"])
-                if not _unds.empty and _sel in _unds.index
-                else 0.0
-            )
-            if _nlv > 0 and _sel_margin > 0 and _qty_mult > 0:
-                _suggested_qty = max(1, int(_qty_mult * _nlv / _sel_margin))
-                rec += (
-                    f"\nSuggested qty: {_suggested_qty} contract(s)"
-                    f"  (VIRGIN_QTY_MULT {_qty_mult} × NLV ${_nlv:,.0f} ÷ margin ${_sel_margin:,.0f})"
-                )
-            with _dc2:
-                st.code(rec)
-
-            _score = score_from_trades(df_all, _sel)
-            _s1, _s2, _s3, _s4, _s5 = st.columns(5)
-            _s1.metric("Score", f"{_score.composite:.0f}/100",
-                       f"{_vd.get(_score.verdict, '')} {_score.verdict}",
-                       help="Composite backtest quality 0–100. DEPLOY ≥70, REFINE 40–69, ABANDON <40.")
-            _s2.metric("Trades", _score.total_trades,
-                       help="Closed option contracts used in the backtest.")
-            _s3.metric("Win Rate", f"{_score.win_rate:.0%}",
-                       help="Percentage of closed trades with positive realised P&L.")
-            _s4.metric("Profit Factor", f"{_score.profit_factor:.2f}",
-                       help="Gross profit ÷ gross loss. <1.0 = losing edge, 1.5+ = strong edge.")
-            _s5.metric("Years Tested", f"{_score.years_tested:.1f}",
-                       help="Date span of trade history used. <3 years = insufficient for robust scoring.")
+# (render_history removed — all content moved to render_analysis)
 
 
 # ---------------------------------------------------------------------------
@@ -3627,7 +3882,7 @@ with _hdr_c:
 with _nav_c1:
     nav = st.radio(
         "Navigation",
-        ["Analysis", "Orders", "History", "Diagnostics"],
+        ["Analysis", "Orders", "Diagnostics"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -3641,7 +3896,13 @@ with _acct_c:
         )
     elif _REAL_ACCOUNTS:
         st.caption(next(iter(_REAL_ACCOUNTS)))
-# _spacer_c intentionally empty — preserves right-side gap for native Streamlit controls
+with _spacer_c:
+    _tc, _rc = st.columns([3, 2])
+    with _tc:
+        _nav_time()
+    with _rc:
+        if st.button("↺ Refresh", key="btn_nav_refresh", help="Reload all dashboard data"):
+            st.rerun()
 
 # Second fixed band: KPI table on top, Ask AI below — stacked in one full-width column.
 # A hidden marker div lets JS locate the outer stHorizontalBlock to pin.
@@ -3705,7 +3966,5 @@ elif nav == "Orders":
         render_orders()
     with _cfg_col:
         render_config_panel()
-elif nav == "History":
-    render_history()
 elif nav == "Diagnostics":
     render_diagnostics()

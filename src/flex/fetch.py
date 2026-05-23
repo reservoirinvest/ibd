@@ -235,6 +235,19 @@ def _load_nav_from_report(report: FlexReport) -> pd.DataFrame:
     return df if (df is not None and not df.empty) else pd.DataFrame()
 
 
+def _normalize_nav_report(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a raw EquitySummaryByReportDateInBase DataFrame → [reportDate, total]."""
+    df = df[["reportDate", "total"]].copy()
+    df["reportDate"] = pd.to_datetime(
+        df["reportDate"].astype(str), format="%Y%m%d", errors="coerce"
+    )
+    df["total"] = pd.to_numeric(df["total"], errors="coerce")
+    df = df[df["total"].notna() & (df["total"] != 0)]
+    if df.empty:
+        return df
+    return df.groupby("reportDate")["total"].sum().reset_index()
+
+
 def load_nav_xml(xml_dir: Path) -> pd.DataFrame:
     """Load daily consolidated NAV from all *.xml files in xml_dir.
 
@@ -248,27 +261,18 @@ def load_nav_xml(xml_dir: Path) -> pd.DataFrame:
     file_navs: list[pd.DataFrame] = []
     for f in sorted(xml_dir.glob("*.xml")):
         try:
-            df = _load_nav_from_report(FlexReport(path=str(f)))
-            if df.empty:
+            raw = _load_nav_from_report(FlexReport(path=str(f)))
+            if raw.empty:
                 continue
-            df = df[["reportDate", "total"]].copy()
-            df["reportDate"] = pd.to_datetime(
-                df["reportDate"].astype(str), format="%Y%m%d", errors="coerce"
-            )
-            df["total"] = pd.to_numeric(df["total"], errors="coerce")
-            df = df[df["total"].notna() & (df["total"] != 0)]
-            if df.empty:
-                continue
-            # Step 1 — sum per-account rows within this file
-            daily = df.groupby("reportDate")["total"].sum().reset_index()
-            file_navs.append(daily)
+            daily = _normalize_nav_report(raw)
+            if not daily.empty:
+                file_navs.append(daily)
         except Exception as e:
             logger.warning("NAV XML {}: {}", f.name, e)
 
     if not file_navs:
         return pd.DataFrame()
 
-    # Step 2 — dedup across files by date (overlap boundary dates contain identical values)
     nav_daily = (
         pd.concat(file_navs, ignore_index=True)
         .sort_values("reportDate")
@@ -277,6 +281,44 @@ def load_nav_xml(xml_dir: Path) -> pd.DataFrame:
     )
     logger.info("NAV: {} daily rows from {} file(s)", len(nav_daily), len(file_navs))
     return nav_daily
+
+
+def download_nav(
+    token: str,
+    query_ids: str,
+    inter_query_delay: float = 2.0,
+) -> pd.DataFrame:
+    """Download daily consolidated NAV via Flex Web Service API (same query IDs as trades).
+
+    Returns DataFrame with columns [reportDate (Timestamp), total (float)].
+    Returns empty DataFrame if the Flex Query has no EquitySummaryByReportDateInBase section.
+    """
+    ids = [q.strip() for q in query_ids.split(",") if q.strip()]
+    frames: list[pd.DataFrame] = []
+    for i, qid in enumerate(ids):
+        if i > 0:
+            time.sleep(inter_query_delay)
+        try:
+            raw = _load_nav_from_report(FlexReport(token=token, queryId=qid))
+            if raw.empty:
+                logger.info("query_id={} has no EquitySummaryByReportDateInBase section or returned 0 rows", qid)
+                continue
+            daily = _normalize_nav_report(raw)
+            if not daily.empty:
+                frames.append(daily)
+                logger.info("NAV API query_id={} rows={}", qid, len(daily))
+        except Exception as e:
+            logger.warning("NAV API query_id={} failed: {}", qid, e)
+
+    if not frames:
+        return pd.DataFrame()
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .sort_values("reportDate")
+        .drop_duplicates(subset=["reportDate"], keep="last")
+        .reset_index(drop=True)
+    )
 
 
 def merge_nav_into_pickle(new_df: pd.DataFrame, pkl_path: Path) -> pd.DataFrame:

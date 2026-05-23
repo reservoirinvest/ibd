@@ -26,7 +26,8 @@
       "Bash(uv run ruff check *)",
       "Bash(uv run ruff format --check *)",
       "Bash(uv sync)",
-      "Bash(uv lock *)"
+      "Bash(uv lock *)",
+      "Bash(python *)"
     ]
   }
 }
