@@ -24,14 +24,7 @@ import pandas as pd
 import pytest
 
 import src.dashboard.ib_client as ibc
-from src.dashboard.ib_client import (
-    IBClient,
-    Snapshot,
-    TickerSnap,
-    _BOOTSTRAP_SETTLE_SECS,
-    _CB_FAILURE_THRESHOLD,
-    get_client,
-)
+from src.dashboard.ib_client import IBClient
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +660,9 @@ class TestEdgeCasesErrors:
         """
         class _Event:
             def __init__(self): self.handlers: list = []
-            def __iadd__(self, h): self.handlers.append(h); return self
+            def __iadd__(self, h):
+                self.handlers.append(h)
+                return self
 
         mock_ib = Mock()
         for attr in (

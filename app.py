@@ -6,6 +6,7 @@ Run:
 
 from __future__ import annotations
 
+import logging as _logging
 import os
 import pickle
 import re
@@ -54,6 +55,15 @@ _LOG_DIR.mkdir(exist_ok=True)
 logger.remove()
 logger.add(sys.stderr, level="WARNING", colorize=True, format="{time:HH:mm:ss} | {level} | {message}")
 logger.add(str(_LOG_DIR / "app.log"), level="DEBUG", encoding="utf-8", rotation="50 MB", retention=3)
+
+# Suppress Streamlit's "fragment does not exist anymore" terminal warnings.
+# These fire when a run_every fragment's timer triggers while the user is on another tab.
+class _SuppressFragmentMissing(_logging.Filter):
+    def filter(self, record: _logging.LogRecord) -> bool:
+        return "does not exist anymore" not in record.getMessage()
+
+for _ln in ("streamlit", "streamlit.runtime", "streamlit.runtime.scriptrunner"):
+    _logging.getLogger(_ln).addFilter(_SuppressFragmentMissing())
 
 st.set_page_config(
     page_title="IB Monitor",
@@ -326,6 +336,7 @@ _CFG_KEYS: list[tuple[str, str, type, object]] = [
     ("cfg_minreapdte",       "MINREAPDTE",            int,   1),
     ("cfg_max_dte",          "MAX_DTE",               int,   50),
     ("cfg_mincushion",       "MINCUSHION",            float, 0.2),
+    ("cfg_max_file_age",     "MAX_FILE_AGE",          int,   1),
 ]
 
 
@@ -427,13 +438,18 @@ def _sub_env() -> dict[str, str]:
 
 
 def _derive_progress() -> tuple[float, str, list[str]]:
-    """Parse derive_progress.log → (progress 0–1, phase label, last 4 output lines)."""
+    """Parse derive_progress.log → (progress 0–1, phase label, last 4 output lines).
+
+    Scans the full log for phase markers (not just tail) so early markers
+    aren't lost when the log grows large during long qualification loops.
+    """
     if not _DERIVE_LOG.exists():
         return 0.0, "Initialising…", []
     try:
-        lines = _DERIVE_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+        text = _DERIVE_LOG.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return 0.0, "", []
+    lines = text.splitlines()
     pct = 0
     label = "Initialising…"
     for marker, p in _DERIVE_PHASES:
@@ -444,8 +460,9 @@ def _derive_progress() -> tuple[float, str, list[str]]:
     return pct / 100.0, label, tail
 
 
-_TQDM_BAR_RE = re.compile(r"^(.+?):\s+\d+%\|")
-_TQDM_PCT_RE = re.compile(r":\s+(\d+)%\|")
+_TQDM_BAR_RE  = re.compile(r"^(.+?):\s+\d+%\|")
+_TQDM_PCT_RE  = re.compile(r":\s+(\d+)%\|")
+_RICH_PROG_RE = re.compile(r"^(.+?)\s+[━─\-]{3,}\s+(\d+)%")
 _ANSI_RE     = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
 
 
@@ -493,18 +510,47 @@ def _ohlc_log_lines(n: int = 30) -> list[str]:
 
 
 def _ohlc_progress() -> tuple[float, str]:
-    """Parse ohlc_progress.log tqdm lines → (progress 0–1, latest bar label)."""
+    """Parse ohlc_progress.log → (progress 0–1, latest bar label).
+
+    Handles both rich non-TTY format ("desc ━━━ 87% SYM") and
+    keyword milestones written directly by ohlc.py.
+    """
     lines = _ohlc_log_lines(30)
     if not lines:
         return 0.01, "Initialising…"
+    full = "\n".join(lines)
+    if "OHLC UPDATE COMPLETE" in full:
+        return 1.0, "OHLC update complete"
     last_pct = 0.0
     last_label = ""
     for ln in lines:
-        m_label = _TQDM_BAR_RE.match(_strip_ansi(ln))
-        m_pct   = _TQDM_PCT_RE.search(_strip_ansi(ln))
+        stripped = _strip_ansi(ln)
+        # Rich non-TTY format: "Fetching OHLC (yfinance) ━━━━━━━━━━ 87% IWDA"
+        m = _RICH_PROG_RE.search(stripped)
+        if m:
+            last_label = m.group(1).strip()
+            last_pct = int(m.group(2)) / 100.0
+            continue
+        # tqdm format (legacy fallback)
+        m_label = _TQDM_BAR_RE.match(stripped)
+        m_pct   = _TQDM_PCT_RE.search(stripped)
         if m_label and m_pct:
             last_label = m_label.group(1).strip()
             last_pct   = int(m_pct.group(1)) / 100.0
+            continue
+        # Keyword milestones from ohlc.py log_fh.write() calls
+        if "yfinance:" in stripped and "OK," in stripped:
+            last_pct = max(last_pct, 0.70)
+        elif "After .L retry:" in stripped:
+            last_pct = max(last_pct, 0.75)
+        elif "IBKR fallback needed:" in stripped:
+            last_pct = max(last_pct, 0.80)
+        elif "Date range :" in stripped:
+            last_pct = max(last_pct, 0.10)
+        elif "Symbols :" in stripped:
+            last_pct = max(last_pct, 0.05)
+    if not last_pct and any(ln.strip() for ln in lines):
+        last_pct = 0.30
     return max(last_pct, 0.01), last_label or "Fetching OHLCs…"
 
 
@@ -556,7 +602,7 @@ def _drop_withstand(excess: float, delta_abs: float) -> str:
     return f"{v:.1f}%" if v < 200 else ">200%"
 
 
-@st.fragment(run_every=2.0)
+@st.fragment(run_every=30)
 def header() -> None:
     """Compact status bar — rendered in the nav row (left of tabs)."""
     snap = client.snapshot()
@@ -585,29 +631,27 @@ def header() -> None:
     )
 
 
-@st.fragment(run_every=5)
+@st.fragment(run_every=30)
 def _nav_time() -> None:
-    """Live local clock + data-age shown next to the Refresh button."""
+    """Clock + snapshot age, refreshed every 30 s."""
     snap = client.snapshot()
     _now_str = datetime.now().strftime("%H:%M:%S")
-
     _ago_str = "—"
     if snap.as_of:
         _elapsed_s = max(0, int((datetime.now().astimezone() - snap.as_of.astimezone()).total_seconds()))
         _h, _rem = divmod(_elapsed_s, 3600)
         _m, _s   = divmod(_rem, 60)
         _ago_str = f"{_h}:{_m:02d}:{_s:02d}"
-
     st.markdown(
         f'<div class="hdr-bar" style="text-align:right;">'
         f'<span class="hdr-item">{_now_str}</span><br>'
-        f'<span class="hdr-item" style="font-size:0.65rem;opacity:0.7;">Refreshed {_ago_str} before</span>'
+        f'<span class="hdr-item" style="font-size:0.65rem;opacity:0.7;">data {_ago_str} old</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
 
 
-@st.fragment(run_every=10)
+@st.fragment(run_every=30)
 def kpi_strip() -> None:
     snap = client.snapshot()
     acct = _selected_account()
@@ -724,7 +768,7 @@ def kpi_strip() -> None:
         st.caption(f"{_n_ohlc} symbols in OHLC store — {_n_weekly} weekly S&P 500")
 
 
-@st.fragment(run_every=10)
+@st.fragment(run_every=60)
 def render_orders() -> None:
     snap = client.snapshot()
     acct = _selected_account()
@@ -779,7 +823,7 @@ def render_orders() -> None:
             )
             st.session_state["derive_proc"] = new_proc
             logger.info("derive.py started pid={}", new_proc.pid)
-            # No st.rerun() — fragment run_every=10 picks up frozen state automatically
+            # No st.rerun() — fragment run_every=60 picks up frozen state automatically
         # Last-derive timestamp sits right under the button
         if "_derive_exit" not in st.session_state and not frozen:
             ages = [_pkl_age(n) for n in ["df_cov.pkl", "df_nkd.pkl", "df_reap.pkl"]]
@@ -884,7 +928,7 @@ def render_orders() -> None:
                     f"⚠️ {', '.join(_locked)} still in use — retry in a moment",
                     icon="⚠️",
                 )
-            # No st.rerun() here — fragment auto-refreshes every 10 s via run_every.
+            # No st.rerun() here — fragment auto-refreshes via run_every.
             # Calling st.rerun() from inside a fragment triggers a full-page rerun
             # which can race with the IBKR connection and produce error 326.
         st.caption("Keeps OHLC store.")
@@ -936,6 +980,26 @@ def render_orders() -> None:
         _render_log_expander("📋 execute.py log", _EXECUTE_LOG, expanded=rc != 0)
 
     st.divider()
+
+    # ── Auto-delete stale order pickles (MAX_FILE_AGE check) ──────────────────
+    try:
+        _yml = yaml.safe_load(_CFG_PATH.read_text(encoding="utf-8")) or {}
+        _max_age_days: int = int(_yml.get("MAX_FILE_AGE", 1))
+    except Exception:
+        _max_age_days = 1
+    if _max_age_days > 0:
+        _max_age_secs = _max_age_days * 86400
+        for _stale_name in ("df_cov.pkl", "df_nkd.pkl", "df_reap.pkl", "df_protect.pkl"):
+            _stale_p = _DATA_DIR / _stale_name
+            if _stale_p.exists():
+                _age_secs = (datetime.now() - datetime.fromtimestamp(_stale_p.stat().st_mtime)).total_seconds()
+                if _age_secs > _max_age_secs:
+                    try:
+                        _stale_p.unlink()
+                        logger.info("Auto-deleted stale {} (age {:.1f}h > {}d)",
+                                    _stale_name, _age_secs / 3600, _max_age_days)
+                    except Exception:
+                        pass
 
     # ── Load all suggested-order DataFrames upfront (needed before filter bar) ─
     def _exp_premium(df: pd.DataFrame) -> float:
@@ -1228,10 +1292,60 @@ def render_config_panel() -> None:
                     key="cfg_max_dte",
                     help="Maximum days to expiry for new option entries")
 
+    # ── FILE AGE / AUTO-EXPIRE ──────────────────────────────────────────────
+    st.number_input(
+        "MAX_FILE_AGE (days)",
+        min_value=0, step=1,
+        key="cfg_max_file_age",
+        help="Order pickles older than this many days are auto-deleted on next dashboard load. "
+             "0 = never auto-delete.",
+    )
+    _age_pkls = [
+        ("df_cov.pkl",     "Cover"),
+        ("df_nkd.pkl",     "Nakeds"),
+        ("df_protect.pkl", "Protect"),
+        ("df_reap.pkl",    "Reap"),
+    ]
+    _age_parts = [f"{lbl}: {_pkl_age(f)}" for f, lbl in _age_pkls]
+    st.caption("File ages — " + "  |  ".join(_age_parts))
+
     st.divider()
 
+    # ── DELETE helpers (dialog shown on confirmation button click) ──────────
+    def _delete_pkl(fname: str, key: str) -> None:
+        """Delete a single order pickle and toast the result."""
+        p = _DATA_DIR / fname
+        try:
+            p.unlink(missing_ok=True)
+            st.session_state[key] = True
+            st.toast(f"Deleted {fname}")
+        except Exception as exc:
+            st.toast(f"Could not delete {fname}: {exc}", icon="⚠️")
+
+    @st.dialog("⚠️ Confirm Delete", width="small")
+    def _confirm_delete(fname: str, label: str, session_key: str) -> None:
+        st.markdown(f"Delete **`data/{fname}`** ({label} orders from last derive run)?")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🗑️ Delete", width="stretch"):
+                _delete_pkl(fname, session_key)
+                st.rerun()
+        with c2:
+            if st.button("❌ Cancel", width="stretch"):
+                st.rerun()
+
     # ── COVER ──────────────────────────────────────────────────────────────
-    st.toggle("COVER_ME", key="cfg_cover_me")
+    _cov_col, _del_cov_col = st.columns([3, 1])
+    with _cov_col:
+        st.toggle("COVER_ME", key="cfg_cover_me")
+    with _del_cov_col:
+        if (_DATA_DIR / "df_cov.pkl").exists():
+            if st.button("🗑 DELETE_COV", key="btn_del_cov", width="stretch",
+                         help="Delete residual df_cov.pkl from last derive run"):
+                _confirm_delete("df_cov.pkl", "Cover", "_del_cov_done")
+    if st.session_state.pop("_del_cov_done", False):
+        pass  # toast was already shown; no rerun needed
+
     if st.session_state["cfg_cover_me"]:
         st.number_input("COVER_MIN_DTE", min_value=0, step=1,
                         key="cfg_cover_min_dte",
@@ -1246,7 +1360,16 @@ def render_config_panel() -> None:
     st.divider()
 
     # ── SOW ────────────────────────────────────────────────────────────────
-    st.toggle("SOW_NAKEDS", key="cfg_sow_nakeds")
+    _sow_col, _del_sow_col = st.columns([3, 1])
+    with _sow_col:
+        st.toggle("SOW_NAKEDS", key="cfg_sow_nakeds")
+    with _del_sow_col:
+        if (_DATA_DIR / "df_nkd.pkl").exists():
+            if st.button("🗑 DELETE_NKD", key="btn_del_nkd", width="stretch",
+                         help="Delete residual df_nkd.pkl from last derive run"):
+                _confirm_delete("df_nkd.pkl", "Nakeds", "_del_nkd_done")
+    st.session_state.pop("_del_nkd_done", None)
+
     if st.session_state["cfg_sow_nakeds"]:
         st.number_input("VIRGIN_DTE", min_value=0, step=1,
                         key="cfg_virgin_dte",
@@ -1270,7 +1393,16 @@ def render_config_panel() -> None:
     st.divider()
 
     # ── PROTECT ────────────────────────────────────────────────────────────
-    st.toggle("PROTECT_ME", key="cfg_protect_me")
+    _prot_col, _del_prot_col = st.columns([3, 1])
+    with _prot_col:
+        st.toggle("PROTECT_ME", key="cfg_protect_me")
+    with _del_prot_col:
+        if (_DATA_DIR / "df_protect.pkl").exists():
+            if st.button("🗑 DELETE_PROT", key="btn_del_prot", width="stretch",
+                         help="Delete residual df_protect.pkl from last derive run"):
+                _confirm_delete("df_protect.pkl", "Protect", "_del_prot_done")
+    st.session_state.pop("_del_prot_done", None)
+
     if st.session_state["cfg_protect_me"]:
         st.number_input("PROTECT_DTE", min_value=0, step=1,
                         key="cfg_protect_dte",
@@ -1282,7 +1414,16 @@ def render_config_panel() -> None:
     st.divider()
 
     # ── REAP ───────────────────────────────────────────────────────────────
-    st.toggle("REAP_ME", key="cfg_reap_me")
+    _reap_col, _del_reap_col = st.columns([3, 1])
+    with _reap_col:
+        st.toggle("REAP_ME", key="cfg_reap_me")
+    with _del_reap_col:
+        if (_DATA_DIR / "df_reap.pkl").exists():
+            if st.button("🗑 DELETE_REAP", key="btn_del_reap", width="stretch",
+                         help="Delete residual df_reap.pkl from last derive run"):
+                _confirm_delete("df_reap.pkl", "Reap", "_del_reap_done")
+    st.session_state.pop("_del_reap_done", None)
+
     if st.session_state["cfg_reap_me"]:
         st.number_input("REAPRATIO", min_value=0.001, step=0.005, format="%.3f",
                         key="cfg_reapratio",
@@ -1302,7 +1443,7 @@ def render_config_panel() -> None:
             st.error(f"Save failed: {e}")
 
 
-@st.fragment(run_every=30)
+@st.fragment(run_every=60)
 def render_diagnostics() -> None:
     snap = client.snapshot()
     acct = _selected_account()
@@ -1389,9 +1530,9 @@ def render_diagnostics() -> None:
 # Analysis tab
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def _cached_ohlc() -> dict:
-    """Load the OHLC pickle store, cached for 120 s to avoid re-reading on every 60 s tick."""
+    """Load the OHLC pickle store, cached for 10 min — OHLC data is daily, no need to reload often."""
     from src.dashboard.ohlc import load_ohlc  # noqa: PLC0415
     return load_ohlc()
 
@@ -1418,7 +1559,7 @@ def _cached_ohlc_stats() -> tuple[int, int]:
 
 
 
-@st.fragment
+@st.fragment(run_every=30)
 def render_analysis() -> None:
     """Cover/Protect gaps + OHLC chart browser."""
     from src.backtest.score import score_from_trades
@@ -3016,26 +3157,39 @@ def _render_perf_chart(
         # Consecutive NAV changes adjusted for any USD cash flows in the interval.
         # SGD deposits are not converted (no FX rates) and remain in the raw NAV.
         def _compute_twr(nav_s: pd.Series, cf: pd.Series, start_ts, end_ts) -> pd.Series:
+            import numpy as np  # app.py has no module-level numpy import
             nav = nav_s[(nav_s.index >= start_ts) & (nav_s.index <= end_ts)]
             if len(nav) < 2:
                 return pd.Series(dtype=float)
+
+            # Vectorised cash-flow alignment via numpy searchsorted (O(N log M)).
+            cf_sorted = cf.sort_index() if not cf.empty else pd.Series(dtype=float)
+            cf_dates  = cf_sorted.index.values
+            cf_values = cf_sorted.values
+            cf_cumsum = np.cumsum(cf_values) if len(cf_values) else np.array([], dtype=float)
+
+            nav_dates  = nav.index.values
+            nav_values = nav.values.astype(float)
+
+            cf_cum_at_nav = np.zeros(len(nav_dates))
+            if len(cf_cumsum):
+                cf_idx = np.searchsorted(cf_dates, nav_dates, side="right")
+                valid  = cf_idx > 0
+                cf_cum_at_nav[valid] = cf_cumsum[cf_idx[valid] - 1]
+            cf_in_periods = cf_cum_at_nav[1:] - cf_cum_at_nav[:-1]
+
+            n = len(nav_values)
+            cum_perf   = np.zeros(n)
             cumulative = 1.0
-            prev_val  = float(nav.iloc[0])
-            prev_date = nav.index[0]
-            result: dict = {prev_date: 0.0}
-            for date in nav.index[1:]:
-                # Sum any USD flows that settled between prev_date and this NAV date
-                cf_in_period = float(
-                    cf[(cf.index > prev_date) & (cf.index <= date)].sum()
-                    if not cf.empty else 0.0
-                )
-                curr_val = float(nav.loc[date])
-                denom = prev_val + cf_in_period
-                cumulative *= curr_val / denom if denom > 0 else 1.0
-                result[date] = (cumulative - 1.0) * 100.0
-                prev_val  = curr_val
-                prev_date = date
-            s = pd.Series(result)
+            prev_val   = nav_values[0]
+            for i in range(1, n):
+                denom = prev_val + cf_in_periods[i - 1]
+                if denom > 0:
+                    cumulative *= nav_values[i] / denom
+                cum_perf[i] = (cumulative - 1.0) * 100.0
+                prev_val = nav_values[i]
+
+            s = pd.Series(cum_perf, index=nav.index)
             return s.reindex(pd.bdate_range(start_ts, end_ts), method="ffill").dropna()
 
         # ── Clip & rebase (for OPT P&L, SPY, QQQ — no deposit adjustment) ─
@@ -3174,48 +3328,44 @@ def _render_perf_chart(
                 hoverinfo="skip",
             ))
 
-        # All % lines on SECONDARY (right) axis
+        # All % lines on SECONDARY (right) axis — hover formatted natively by Plotly
         if _have_nav and not nav_index.empty:
-            _nav_text  = [f"{v:+.2f}%" for v in nav_index.values]
             _nav_equiv = _nav_display.reindex(nav_index.index, method="ffill").values
             fig.add_trace(go.Scatter(
                 x=nav_index.index, y=nav_index.values,
-                customdata=_nav_equiv, text=_nav_text,
+                customdata=_nav_equiv,
                 name="Consolidated", yaxis="y2",
                 line=dict(color="#a78bfa", width=2.5),
-                hovertemplate="%{text}  $%{customdata:,.0f}<extra>Consolidated</extra>",
+                hovertemplate="%{y:+.2f}%  $%{customdata:,.0f}<extra>Consolidated</extra>",
             ))
 
         if not opt_index.empty:
-            _opt_text  = [f"{v:+.2f}%" for v in opt_index.values]
             _opt_equiv = _opt_display.reindex(opt_index.index, method="ffill").values
             fig.add_trace(go.Scatter(
                 x=opt_index.index, y=opt_index.values,
-                customdata=_opt_equiv, text=_opt_text,
+                customdata=_opt_equiv,
                 name="OPT P&L", yaxis="y2",
                 line=dict(color="#60a5fa", width=1.5, dash="dash" if _have_nav else "solid"),
-                hovertemplate="%{text}  $%{customdata:,.0f}<extra>OPT P&L</extra>",
+                hovertemplate="%{y:+.2f}%  $%{customdata:,.0f}<extra>OPT P&L</extra>",
             ))
 
         if not spy_index.empty:
-            _spy_text  = [f"{v:+.2f}%" for v in spy_index.values]
-            spy_equiv  = ((spy_index / 100.0 + 1.0) * starting_capital).values
+            spy_equiv = ((spy_index / 100.0 + 1.0) * starting_capital).values
             fig.add_trace(go.Scatter(
                 x=spy_index.index, y=spy_index.values,
-                customdata=spy_equiv, text=_spy_text,
+                customdata=spy_equiv,
                 name="SPY", yaxis="y2",
                 line=dict(color="#34d399", width=1.5),
-                hovertemplate="%{text}  $%{customdata:,.0f}<extra>SPY</extra>",
+                hovertemplate="%{y:+.2f}%  $%{customdata:,.0f}<extra>SPY</extra>",
             ))
         if not qqq_index.empty:
-            _qqq_text  = [f"{v:+.2f}%" for v in qqq_index.values]
-            qqq_equiv  = ((qqq_index / 100.0 + 1.0) * starting_capital).values
+            qqq_equiv = ((qqq_index / 100.0 + 1.0) * starting_capital).values
             fig.add_trace(go.Scatter(
                 x=qqq_index.index, y=qqq_index.values,
-                customdata=qqq_equiv, text=_qqq_text,
+                customdata=qqq_equiv,
                 name="QQQ", yaxis="y2",
                 line=dict(color="#fbbf24", width=1.5, dash="dot"),
-                hovertemplate="%{text}  $%{customdata:,.0f}<extra>QQQ</extra>",
+                hovertemplate="%{y:+.2f}%  $%{customdata:,.0f}<extra>QQQ</extra>",
             ))
 
         # Cash markers on secondary % axis (at 0%) — full history so they show when zoomed out

@@ -508,8 +508,27 @@ class IBClient:
         except Exception as e:  # noqa: BLE001
             logger.debug("reqPositionsAsync() skipped: {}", e)
 
-        # let TWS push portfolio/account-value events
-        await asyncio.sleep(_BOOTSTRAP_SETTLE_SECS)
+        # Reactive settle: poll until portfolio/account data arrives or timeout.
+        # Replaces the old static sleep(_BOOTSTRAP_SETTLE_SECS) with a loop that
+        # exits as soon as TWS has pushed initial events (typically <0.3 s).
+        _settle_start = time.perf_counter()
+        _settle_timeout = 2.0
+        _settle_interval = 0.1
+        while time.perf_counter() - _settle_start < _settle_timeout:
+            with self._snap_lock:
+                _has_data = (
+                    not self._snap.positions.empty
+                    or len(self._snap.account_values) > 0
+                )
+            if _has_data:
+                logger.info(
+                    "Bootstrap settled in {:.2f}s",
+                    time.perf_counter() - _settle_start,
+                )
+                break
+            await asyncio.sleep(_settle_interval)
+        else:
+            logger.warning("Bootstrap settle timeout reached without data events — continuing")
 
         # force one immediate portfolio pull (in case events were missed)
         for acct in managed or [""]:

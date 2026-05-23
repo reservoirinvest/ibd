@@ -45,62 +45,68 @@ def find_chain_failures(contracts: Sequence, batch_size: int | None = None):
             local_batch = min(effective_batch, len(subset_list))
 
             if subset_list:
-                pbar.update(task_id, description=f"Checking {subset_list[0].symbol} ... {subset_list[-1].symbol}")
+                pbar.update(
+                    task_id,
+                    description=f"Checking {subset_list[0].symbol} ... {subset_list[-1].symbol}",
+                )
 
-        try:
-            df = get_option_chains(subset_list, market="SNP", batch_size=local_batch)
-        except Exception as exc:  # pragma: no cover - diagnostic script
+            try:
+                df = get_option_chains(subset_list, market="SNP", batch_size=local_batch)
+            except Exception as exc:  # pragma: no cover - diagnostic script
+                if len(subset_list) == 1:
+                    failures.append({"symbol": subset_list[0].symbol, "error": str(exc)})
+                    pbar.advance(task_id, 1)
+                else:
+                    mid = len(subset_list) // 2
+                    drill_down(subset_list[:mid])
+                    drill_down(subset_list[mid:])
+                return
+
+            missing = _missing_symbols(subset_list, df)
+            processed = len(subset_list) - len(missing)
+            if processed:
+                pbar.advance(task_id, processed)
+
+            if not missing:
+                return
+
             if len(subset_list) == 1:
-                failures.append({"symbol": subset_list[0].symbol, "error": str(exc)})
-                pbar.advance(task_id, 1)
-            else:
+                failures.append(
+                    {"symbol": subset_list[0].symbol, "error": "No option chain data returned"}
+                )
+                return
+
+            if len(missing) == len(subset_list):
                 mid = len(subset_list) // 2
                 drill_down(subset_list[:mid])
                 drill_down(subset_list[mid:])
-            return
+                return
 
-        missing = _missing_symbols(subset_list, df)
-        processed = len(subset_list) - len(missing)
-        if processed:
-            pbar.advance(task_id, processed)
-
-        if not missing:
-            return
-
-        if len(subset_list) == 1:
-            failures.append(
-                {"symbol": subset_list[0].symbol, "error": "No option chain data returned"}
-            )
-            return
-
-        if len(missing) == len(subset_list):
-            mid = len(subset_list) // 2
-            drill_down(subset_list[:mid])
-            drill_down(subset_list[mid:])
-            return
-
-        drill_down([contract for contract in subset_list if contract.symbol in missing])
+            drill_down([c for c in subset_list if c.symbol in missing])
 
         # Phase 1: sweep through batches quickly to identify suspect chunks
         for start in range(0, len(contracts_list), effective_batch):
             chunk = contracts_list[start : start + effective_batch]
 
             if chunk:
-                pbar.update(task_id, description=f"Checking {chunk[0].symbol} ... {chunk[-1].symbol}")
+                pbar.update(
+                    task_id,
+                    description=f"Checking {chunk[0].symbol} ... {chunk[-1].symbol}",
+                )
 
-        try:
-            df = get_option_chains(chunk, market="SNP", batch_size=len(chunk))
-        except Exception:
-            suspects.append(chunk)
-            continue
+            try:
+                df = get_option_chains(chunk, market="SNP", batch_size=len(chunk))
+            except Exception:
+                suspects.append(chunk)
+                continue
 
-        missing = _missing_symbols(chunk, df)
-        processed = len(chunk) - len(missing)
-        if processed:
-            pbar.advance(task_id, processed)
+            missing = _missing_symbols(chunk, df)
+            processed = len(chunk) - len(missing)
+            if processed:
+                pbar.advance(task_id, processed)
 
-        if missing:
-            suspects.append([contract for contract in chunk if contract.symbol in missing])
+            if missing:
+                suspects.append([c for c in chunk if c.symbol in missing])
 
         # Phase 2: targeted drill-down on problematic chunks
         for suspect in suspects:

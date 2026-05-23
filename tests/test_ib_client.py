@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
-from src.dashboard.ib_client import IBClient, Snapshot, TickerSnap, get_client
+from src.dashboard.ib_client import IBClient, get_client
 
 
 # ---------------------------------------------------------------------------
@@ -970,8 +970,6 @@ class TestCircuitBreaker:
         assert IBClient().circuit_state == "closed"
 
     def test_opens_after_threshold_failures(self):
-        import src.dashboard.ib_client as ibc
-
         client = self._make_client_with_settings()
 
         async def run():
