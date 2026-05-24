@@ -79,10 +79,12 @@ st.markdown(
     /* Hide Deploy button only; keep hamburger (dark-mode toggle lives inside it) */
     [data-testid="stAppDeployButton"] { display: none !important; }
 
-    /* Nav row (header + radio + account selector) — fixed at top.
-       right: 3.5rem leaves space for the hamburger menu icon at the far right.
+    /* Outer nav bar — identified by #nav-outer-marker in the header column.
+       Using the marker (not :has([stRadio])) avoids applying position:fixed to the
+       inner sub-row that also contains the radio.
+       right: 3.5rem leaves space for the hamburger icon.
        :has() is supported Chrome 105+, Safari 15.4+, Firefox 121+, Edge 105+. */
-    [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) {
+    [data-testid="stHorizontalBlock"]:has(#nav-outer-marker) {
         position: fixed !important;
         top: 0 !important;
         left: 0 !important;
@@ -91,6 +93,10 @@ st.markdown(
         background-color: var(--background-color) !important;
         padding: 0 0.5rem !important;
         margin: 0 !important;
+        align-items: center !important;
+    }
+    /* Inner sub-row (radio + selector + ↺): vertical centre alignment only */
+    [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) {
         align-items: center !important;
     }
     /* Style radio as tab pills */
@@ -165,7 +171,11 @@ st.markdown(
     .kpi-row { display: flex; flex-wrap: wrap; padding: 3px 4px; align-items: center; }
     .kpi-row-a { background-color: rgba(128,128,128,0.04); }
     .kpi-row-b { background-color: rgba(128,128,128,0.1); }
-    .kpi-cell { display: flex; align-items: center; gap: 5px; flex: 1 1 22%; min-width: 130px; padding: 1px 10px 1px 0; }
+    .kpi-cell { display: flex; align-items: center; gap: 5px; flex: 1 1 22%; min-width: 130px; padding: 1px 10px 1px 0; overflow: hidden; }
+    /* Medium viewports: 2 NLV cells per row prevents label overflow */
+    @media (min-width: 641px) and (max-width: 900px) {
+        .kpi-cell { flex: 1 1 45%; }
+    }
     .kpi-lbl-stack { display: flex; flex-direction: column; line-height: 1.2; }
     .kpi-lbl { opacity: 0.6; font-size: 1.48rem; white-space: nowrap; }
     .kpi-sub { font-size: 0.74rem; opacity: 0.55; white-space: nowrap; }
@@ -182,6 +192,89 @@ st.markdown(
         width: 1.1em; height: 1.1em;
         border: 1px solid currentColor; border-radius: 50%;
         margin-left: 3px; vertical-align: middle;
+    }
+    /* ── Mobile adjustments (≤ 640 px) ─────────────────────────────────── */
+    @media (max-width: 640px) {
+        /* Nav bar: display as a CSS grid with 3 rows.
+           Col 1 is the main content (1fr), Col 2 is the refresh button (auto). */
+        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) {
+            display: grid !important;
+            grid-template-columns: 1fr auto !important;
+            grid-template-rows: auto auto auto !important;
+            gap: 0 0.5rem !important;
+            align-items: center !important;
+            padding: 0.5rem !important;
+            flex-wrap: nowrap !important;
+            overflow: visible !important;
+            background-color: var(--background-color) !important;
+            height: auto !important;
+            min-height: fit-content !important;
+        }
+
+        /* Set default Column behavior under Grid */
+        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) > [data-testid="stColumn"] {
+            width: auto !important;
+            min-width: 0 !important;
+            margin: 0 !important;
+            padding: 0.2rem 0 !important;
+            background-color: var(--background-color) !important;
+        }
+
+        /* Row 1: Header (Column 1) - spans the entire width */
+        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) > [data-testid="stColumn"]:nth-child(1) {
+            display: block !important;
+            grid-column: 1 / span 2 !important;
+            grid-row: 1 !important;
+        }
+
+        /* Row 2: Radio buttons (Column 2) - spans the entire width */
+        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) > [data-testid="stColumn"]:nth-child(2) {
+            display: block !important;
+            grid-column: 1 / span 2 !important;
+            grid-row: 2 !important;
+        }
+
+        /* Row 3: Account Selector (Column 3) on the left, Refresh (Column 5) on the right */
+        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) > [data-testid="stColumn"]:nth-child(3) {
+            display: block !important;
+            grid-column: 1 !important;
+            grid-row: 3 !important;
+        }
+        
+        /* Hide Clock/Nav Time (Column 4) on mobile */
+        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) > [data-testid="stColumn"]:nth-child(4) {
+            display: none !important;
+        }
+
+        /* Refresh Button (Column 5) */
+        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) > [data-testid="stColumn"]:nth-child(5) {
+            display: block !important;
+            grid-column: 2 !important;
+            grid-row: 3 !important;
+            justify-self: end !important;
+        }
+
+        /* Account selector selectbox styling overrides */
+        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"])
+          > [data-testid="stColumn"]:nth-child(3) * {
+            min-width: 0 !important;
+        }
+        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"])
+          > [data-testid="stColumn"]:nth-child(3) [data-baseweb="select"] {
+            width: 100% !important;
+        }
+
+        /* NLV table: 2-per-row with label stacked above value */
+        .kpi-cell {
+            flex: 1 1 45%;
+            min-width: 0;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 0;
+            padding: 2px 4px 2px 0;
+        }
+        .kpi-lbl { font-size: 1.1rem; }
+        .kpi-val { font-size: 1.35rem; }
     }
     </style>
     """,
@@ -602,9 +695,16 @@ def _drop_withstand(excess: float, delta_abs: float) -> str:
     return f"{v:.1f}%" if v < 200 else ">200%"
 
 
-@st.fragment(run_every=30)
+@st.fragment(run_every=2)
 def header() -> None:
     """Compact status bar — rendered in the nav row (left of tabs)."""
+    # Trigger a rerun of the main app once bootstrap completes or restarts after disconnect
+    if not client._bootstrapped:
+        st.session_state["_bootstrapped_rerun_done"] = False
+    elif not st.session_state.get("_bootstrapped_rerun_done"):
+        st.session_state["_bootstrapped_rerun_done"] = True
+        st.rerun(scope="app")
+
     snap = client.snapshot()
     acct = _selected_account()
     positions_filt = _filter_positions(snap.positions, acct)
@@ -619,7 +719,7 @@ def header() -> None:
     pos_n = len(positions_filt)
 
     st.markdown(
-        f'<div class="hdr-bar">'
+        f'<div class="hdr-bar" id="nav-outer-marker">'
         f'<span class="hdr-title">IB Monitor</span>'
         f'&nbsp;&nbsp;{st_html}&nbsp;&nbsp;'
         f'<span class="hdr-cur">{settings.currency}</span>'
@@ -631,7 +731,7 @@ def header() -> None:
     )
 
 
-@st.fragment(run_every=30)
+@st.fragment(run_every=5)
 def _nav_time() -> None:
     """Clock + snapshot age, refreshed every 30 s."""
     snap = client.snapshot()
@@ -651,7 +751,7 @@ def _nav_time() -> None:
     )
 
 
-@st.fragment(run_every=30)
+@st.fragment(run_every=10)
 def kpi_strip() -> None:
     snap = client.snapshot()
     acct = _selected_account()
@@ -767,8 +867,21 @@ def kpi_strip() -> None:
     if _n_ohlc:
         st.caption(f"{_n_ohlc} symbols in OHLC store — {_n_weekly} weekly S&P 500")
 
+    # Detect OHLC / auto-trades subprocess completion from a ticking fragment so
+    # render_analysis (no run_every) doesn't need user interaction to show status.
+    _kpi_ohlc_p = st.session_state.get("ohlc_proc")
+    if _kpi_ohlc_p is not None and _kpi_ohlc_p.poll() is not None:
+        _capture_exit(_kpi_ohlc_p, "_ohlc_exit")
+        st.session_state.pop("ohlc_proc", None)
+        st.rerun(scope="app")
+    _kpi_trades_p = st.session_state.get("trades_proc")
+    if _kpi_trades_p is not None and _kpi_trades_p.poll() is not None:
+        _capture_exit(_kpi_trades_p, "_trades_exit")
+        st.session_state.pop("trades_proc", None)
+        st.rerun(scope="app")
 
-@st.fragment(run_every=60)
+
+@st.fragment(run_every=10)
 def render_orders() -> None:
     snap = client.snapshot()
     acct = _selected_account()
@@ -793,191 +906,223 @@ def render_orders() -> None:
     _auto_unfreeze("derive",  "derive_proc")
     _auto_unfreeze("execute", "execute_proc")
 
+    # Fallback: if log shows RECOMMENDATIONS COMPLETE but derive.py hasn't exited in 60s, kill it.
+    # Handles cases where derive.py hangs on ib.disconnect() or other cleanup after logging done.
+    if frozen and frozen_for == "derive" and proc is not None and proc.poll() is None:
+        _pct_chk, _, _ = _derive_progress()
+        if _pct_chk >= 1.0:
+            _since = st.session_state.get("_derive_complete_since")
+            if _since is None:
+                st.session_state["_derive_complete_since"] = time.monotonic()
+            elif time.monotonic() - _since > 60.0:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    _kill_rc = proc.wait(timeout=3)
+                except Exception:
+                    _kill_rc = 1
+                st.session_state["_derive_exit"] = _kill_rc
+                client.unfreeze()
+                st.session_state["derive_proc"] = None
+                st.session_state.pop("frozen_for", None)
+                st.session_state.pop("_derive_complete_since", None)
+                st.rerun()
+    else:
+        st.session_state.pop("_derive_complete_since", None)
+
     # Capture exit codes the moment each process ends
     _capture_exit(proc,      "_derive_exit")
     _capture_exit(exec_proc, "_execute_exit")
 
-    # ── Action buttons — single row: generate/execute/clear ──────────────────
-    gen_col, exec_col, clr_col, _btn_spacer = st.columns([2, 2, 2, 4])
+    # ── Order Actions expander ────────────────────────────────────────────────
+    with st.expander("⚙️ Order Actions", expanded=True, key="exp_ord_actions"):
+        gen_col, exec_col, clr_col, _btn_spacer = st.columns([2, 2, 2, 4])
 
-    # ── Generate Orders ────────────────────────────────────────────────────────
-    with gen_col:
-        if st.button(
-            "⚙️ Generate Orders",
-            disabled=frozen,
-            width="stretch",
-            help="Freezes the dashboard (releases CID), runs derive.py, then reconnects. "
-                 "Takes 2–5 min. Last-known data stays visible during the freeze.",
-        ):
-            _DERIVE_LOG.parent.mkdir(parents=True, exist_ok=True)
-            log_fh = open(_DERIVE_LOG, "w", encoding="utf-8")  # noqa: SIM115
-            _env = _sub_env()
-            st.session_state.pop("_derive_exit", None)
-            st.session_state["frozen_for"] = "derive"
-            client.freeze()          # freeze BEFORE Popen so derive.py can claim CID=10
-            new_proc = subprocess.Popen(
-                [sys.executable, str(_here() / "src" / "derive.py")],
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                env=_env,
-            )
-            st.session_state["derive_proc"] = new_proc
-            logger.info("derive.py started pid={}", new_proc.pid)
-            # No st.rerun() — fragment run_every=60 picks up frozen state automatically
-        # Last-derive timestamp sits right under the button
-        if "_derive_exit" not in st.session_state and not frozen:
-            ages = [_pkl_age(n) for n in ["df_cov.pkl", "df_nkd.pkl", "df_reap.pkl"]]
-            age_str = ages[0] if len(set(ages)) == 1 else " | ".join(ages)
-            st.caption(f"Last: {age_str}")
-
-    # ── Execute Orders ────────────────────────────────────────────────────────
-    with exec_col:
-        # Execute Orders button with confirmation dialog
-        @st.dialog("⚠️ Confirm Order Execution", width="small")
-        def _confirm_execute():
-            st.markdown(
-                "This will execute all orders from the Suggested Orders section. "
-                "**This action is irreversible.** Are you sure?"
-            )
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("✅ Execute", width="stretch"):
-                    st.session_state["_exec_confirmed"] = True
-                    st.rerun()
-            with col2:
-                if st.button("❌ Cancel", width="stretch"):
-                    st.session_state.pop("_execute_exit", None)
-                    st.session_state.pop("_exec_confirmed", None)
-                    st.rerun()
-
-        if st.button(
-            "▶️ Execute Orders",
-            disabled=frozen,
-            width="stretch",
-            help="Execute all orders from the Suggested Orders section. "
-                 "Freezes the dashboard, runs execute.py, then reconnects. "
-                 "⚠️ This is IRREVERSIBLE.",
-        ):
-            _confirm_execute()
-
-        # Check if user confirmed and execute
-        if st.session_state.get("_exec_confirmed"):
-            st.session_state.pop("_exec_confirmed", None)
-            _EXECUTE_LOG.parent.mkdir(parents=True, exist_ok=True)
-            log_fh = open(_EXECUTE_LOG, "w", encoding="utf-8")  # noqa: SIM115
-            _env = _sub_env()
-            st.session_state.pop("_execute_exit", None)
-            st.session_state["frozen_for"] = "execute"
-            client.freeze()
-            exec_proc = subprocess.Popen(
-                [sys.executable, str(_here() / "src" / "execute.py")],
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                env=_env,
-            )
-            st.session_state["execute_proc"] = exec_proc
-            logger.info("execute.py started pid={}", exec_proc.pid)
-
-    # ── Clear Data ─────────────────────────────────────────────────────────────
-    with clr_col:
-        @st.dialog("⚠️ Confirm Clear Data", width="small")
-        def _confirm_clear(files: list[str]):
-            st.markdown(
-                "The following files in `data/` will be **permanently deleted** "
-                "(`data/master/` is kept):"
-            )
-            st.markdown("\n".join(f"- `{f}`" for f in files))
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("🗑️ Delete", width="stretch"):
-                    st.session_state["_clear_confirmed"] = True
-                    st.rerun()
-            with col2:
-                if st.button("❌ Cancel", width="stretch"):
-                    st.rerun()
-
-        if st.button(
-            "🗑️ Clear Data",
-            width="stretch",
-            help="Delete all top-level files in data/ (pickles, JSONs). "
-                 "data/master/ (OHLC store) is never deleted.",
-        ):
-            _files_to_clear = sorted(
-                p.name for p in _DATA_DIR.iterdir() if p.is_file()
-            )
-            if _files_to_clear:
-                _confirm_clear(_files_to_clear)
-            else:
-                st.toast("No files to clear.")
-
-        if st.session_state.get("_clear_confirmed"):
-            st.session_state.pop("_clear_confirmed", None)
-            _cleared, _locked = [], []
-            for _p in sorted(_DATA_DIR.iterdir()):
-                if not _p.is_file():
-                    continue
-                try:
-                    _p.unlink()
-                    _cleared.append(_p.name)
-                except PermissionError:
-                    _locked.append(_p.name)
-            if _cleared:
-                st.toast(f"Cleared {len(_cleared)} file(s): {', '.join(_cleared)}")
-            if _locked:
-                st.toast(
-                    f"⚠️ {', '.join(_locked)} still in use — retry in a moment",
-                    icon="⚠️",
+        # Generate Orders
+        with gen_col:
+            if st.button(
+                "⚙️ Generate Orders",
+                type="primary" if frozen else "secondary",
+                width="stretch",
+                help="Freezes the dashboard (releases CID), runs derive.py, then reconnects. "
+                     "Takes 2–5 min. Last-known data stays visible during the freeze.",
+            ) and not frozen:
+                _DERIVE_LOG.parent.mkdir(parents=True, exist_ok=True)
+                log_fh = open(_DERIVE_LOG, "w", encoding="utf-8")  # noqa: SIM115
+                _env = _sub_env()
+                st.session_state.pop("_derive_exit", None)
+                st.session_state["frozen_for"] = "derive"
+                client.freeze()
+                new_proc = subprocess.Popen(
+                    [sys.executable, str(_here() / "src" / "derive.py")],
+                    stdout=log_fh,
+                    stderr=None,
+                    env=_env,
                 )
-            # No st.rerun() here — fragment auto-refreshes via run_every.
-            # Calling st.rerun() from inside a fragment triggers a full-page rerun
-            # which can race with the IBKR connection and produce error 326.
-        st.caption("Keeps OHLC store.")
+                st.session_state["derive_proc"] = new_proc
+                logger.info("derive.py started pid={}", new_proc.pid)
+                st.rerun()
+            if "_derive_exit" not in st.session_state and not frozen:
+                ages = [_pkl_age(n) for n in ["df_cov.pkl", "df_nkd.pkl", "df_reap.pkl"]]
+                age_str = ages[0] if len(set(ages)) == 1 else " | ".join(ages)
+                st.caption(f"Last: {age_str}")
 
-    # ── Status row (derive + execute) ────────────────────────────────────────
-    if frozen or "_derive_exit" in st.session_state or "_execute_exit" in st.session_state:
-        gen_status_col, exec_status_col, _st_spacer = st.columns([2.5, 2.5, 5])
-        with gen_status_col:
-            if frozen and frozen_for == "derive":
-                _pct, phase, _ = _derive_progress()
-                st.progress(max(_pct, 0.01), text=f"⏳ {phase}")
-            elif "_derive_exit" in st.session_state:
-                rc = st.session_state["_derive_exit"]
-                if rc == 0:
-                    st.success("✅ Orders generated")
+        # Execute Orders
+        with exec_col:
+            @st.dialog("⚠️ Confirm Order Execution", width="small")
+            def _confirm_execute():
+                st.markdown(
+                    "This will execute all orders from the Suggested Orders section. "
+                    "**This action is irreversible.** Are you sure?"
+                )
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("✅ Execute", width="stretch"):
+                        st.session_state["_exec_confirmed"] = True
+                        st.rerun()
+                with col2:
+                    if st.button("❌ Cancel", width="stretch"):
+                        st.session_state.pop("_execute_exit", None)
+                        st.session_state.pop("_exec_confirmed", None)
+                        st.rerun()
+
+            if st.button(
+                "▶️ Execute Orders",
+                type="primary" if (frozen and frozen_for == "execute") else "secondary",
+                width="stretch",
+                help="Execute all orders from the Suggested Orders section. "
+                     "Freezes the dashboard, runs execute.py, then reconnects. "
+                     "⚠️ This is IRREVERSIBLE.",
+            ) and not frozen:
+                _confirm_execute()
+
+            if st.session_state.get("_exec_confirmed"):
+                st.session_state.pop("_exec_confirmed", None)
+                _EXECUTE_LOG.parent.mkdir(parents=True, exist_ok=True)
+                log_fh = open(_EXECUTE_LOG, "w", encoding="utf-8")  # noqa: SIM115
+                _env = _sub_env()
+                st.session_state.pop("_execute_exit", None)
+                st.session_state["frozen_for"] = "execute"
+                client.freeze()
+                exec_proc = subprocess.Popen(
+                    [sys.executable, str(_here() / "src" / "execute.py")],
+                    stdout=log_fh,
+                    stderr=None,  # tqdm progress bars flow to terminal; stdout (counts/errors) to log
+                    env=_env,
+                )
+                st.session_state["execute_proc"] = exec_proc
+                logger.info("execute.py started pid={}", exec_proc.pid)
+
+        # Clear Data
+        with clr_col:
+            @st.dialog("⚠️ Confirm Clear Data", width="small")
+            def _confirm_clear(files: list[str]):
+                st.markdown(
+                    "The following files in `data/` will be **permanently deleted** "
+                    "(`data/master/` is kept):"
+                )
+                st.markdown("\n".join(f"- `{f}`" for f in files))
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("🗑️ Delete", width="stretch"):
+                        st.session_state["_clear_confirmed"] = True
+                        st.rerun()
+                with col2:
+                    if st.button("❌ Cancel", width="stretch"):
+                        st.rerun()
+
+            if st.button(
+                "🗑️ Clear Data",
+                width="stretch",
+                type="secondary",
+                help="Delete all top-level files in data/ (pickles, JSONs). "
+                     "data/master/ (OHLC store) is never deleted.",
+            ):
+                _files_to_clear = sorted(p.name for p in _DATA_DIR.iterdir() if p.is_file())
+                if _files_to_clear:
+                    _confirm_clear(_files_to_clear)
                 else:
-                    st.error(f"❌ Generate Orders failed (exit {rc})")
-        with exec_status_col:
-            if frozen and frozen_for == "execute":
-                st.progress(0.5, text="⏳ Executing orders…")
-            elif "_execute_exit" in st.session_state:
-                rc = st.session_state["_execute_exit"]
-                if rc == 0:
-                    st.success("✅ Orders executed")
-                else:
-                    st.error(f"❌ Order execution failed (exit {rc})")
+                    st.toast("No files to clear.")
 
-    # ── Scrollable log (live during run; collapsible after) ───────────────────
-    if frozen and frozen_for == "execute":
-        _exec_log = _here() / "log" / "execute.log"
-        if _exec_log.exists():
-            try:
-                _exec_live = _exec_log.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
-                if _exec_live:
-                    st.code("\n".join(_exec_live), language=None)
-            except Exception:
-                pass
-    elif frozen:
-        log_lines = _derive_log_lines(35)
-        if log_lines:
-            st.code("\n".join(_strip_ansi(ln) for ln in log_lines), language=None)
-    elif "_derive_exit" in st.session_state:
-        rc = st.session_state["_derive_exit"]
-        _render_log_expander("📋 derive.py log", _DERIVE_LOG, expanded=rc != 0)
+            if st.session_state.get("_clear_confirmed"):
+                st.session_state.pop("_clear_confirmed", None)
+                _cleared, _locked = [], []
+                for _p in sorted(_DATA_DIR.iterdir()):
+                    if not _p.is_file():
+                        continue
+                    try:
+                        _p.unlink()
+                        _cleared.append(_p.name)
+                    except PermissionError:
+                        _locked.append(_p.name)
+                if _cleared:
+                    st.toast(f"Cleared {len(_cleared)} file(s): {', '.join(_cleared)}")
+                if _locked:
+                    st.toast(
+                        f"⚠️ {', '.join(_locked)} still in use — retry in a moment",
+                        icon="⚠️",
+                    )
+            st.caption("Keeps OHLC store.")
 
-    # Post-run Execute log — collapsible after freeze ends
-    if "_execute_exit" in st.session_state:
-        rc = st.session_state["_execute_exit"]
-        _render_log_expander("📋 execute.py log", _EXECUTE_LOG, expanded=rc != 0)
+        # ── Status row (derive + execute) ─────────────────────────────────────
+        if frozen or "_derive_exit" in st.session_state or "_execute_exit" in st.session_state:
+            gen_status_col, exec_status_col, _st_spacer = st.columns([2.5, 2.5, 5])
+            with gen_status_col:
+                if frozen and frozen_for == "derive":
+                    _pct, phase, _ = _derive_progress()
+                    st.progress(max(_pct, 0.01), text=f"⏳ {phase}")
+                elif "_derive_exit" in st.session_state:
+                    rc = st.session_state["_derive_exit"]
+                    if rc == 0:
+                        _nc = len(_load_pkl("df_cov.pkl"))
+                        _nn = len(_load_pkl("df_nkd.pkl"))
+                        _nr = len(_load_pkl("df_reap.pkl"))
+                        _np = len(_load_pkl("df_protect.pkl"))
+                        _parts = (
+                            ([f"{_nc} covers"] if _nc else [])
+                            + ([f"{_nn} nakeds"] if _nn else [])
+                            + ([f"{_nr} reaps"] if _nr else [])
+                            + ([f"{_np} protects"] if _np else [])
+                        )
+                        if _parts:
+                            st.success(f"✅ {', '.join(_parts)}")
+                        else:
+                            st.warning("⚠️ derive.py ran OK — no orders generated (check log)")
+                    else:
+                        st.error(f"❌ Generate Orders failed (exit {rc})")
+            with exec_status_col:
+                if frozen and frozen_for == "execute":
+                    st.progress(0.5, text="⏳ Executing orders…")
+                elif "_execute_exit" in st.session_state:
+                    rc = st.session_state["_execute_exit"]
+                    if rc == 0:
+                        st.success("✅ Orders executed")
+                    else:
+                        st.error(f"❌ Order execution failed (exit {rc})")
+
+        # ── Live log (during run) and post-run log expander ───────────────────
+        if frozen and frozen_for == "execute":
+            _exec_log = _here() / "log" / "execute.log"
+            if _exec_log.exists():
+                try:
+                    _exec_live = _exec_log.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
+                    if _exec_live:
+                        st.code("\n".join(_exec_live), language=None)
+                except Exception:
+                    pass
+        elif frozen:
+            log_lines = _derive_log_lines(35)
+            if log_lines:
+                st.code("\n".join(_strip_ansi(ln) for ln in log_lines), language=None)
+        elif "_derive_exit" in st.session_state:
+            rc = st.session_state["_derive_exit"]
+            _render_log_expander("📋 derive.py log", _DERIVE_LOG, expanded=rc != 0)
+
+        if "_execute_exit" in st.session_state:
+            rc = st.session_state["_execute_exit"]
+            _render_log_expander("📋 execute.py log", _EXECUTE_LOG, expanded=rc != 0)
 
     st.divider()
 
@@ -1443,89 +1588,6 @@ def render_config_panel() -> None:
             st.error(f"Save failed: {e}")
 
 
-@st.fragment(run_every=60)
-def render_diagnostics() -> None:
-    snap = client.snapshot()
-    acct = _selected_account()
-
-    # ── Raw account values in collapsible twistie ─────────────────────────────
-    if snap.account_values:
-        all_av = snap.account_values
-
-        def _fmt_val(v) -> str:
-            try:
-                f = float(v)
-                if f == round(f, 0):
-                    return f"{int(round(f)):,}"
-                return str(v)
-            except (ValueError, TypeError):
-                return str(v)
-
-        _acct_labels = {v: lbl for lbl, v in _REAL_ACCOUNTS.items()}
-
-        def _av_rows(a: str, vals: dict) -> list[dict]:
-            return [
-                {"account": _acct_labels.get(a, "—"), "tag": k, "value": _fmt_val(v)}
-                for k, v in sorted(vals.items())
-                if float(v) not in (0.0, -1.0)
-            ]
-
-        if acct and acct in all_av:
-            raw_rows = _av_rows(acct, all_av[acct])
-        else:
-            raw_rows = [
-                row
-                for a, vals in sorted(all_av.items())
-                for row in _av_rows(a, vals)
-            ]
-        with st.expander("📋 All account tags (raw)", expanded=False):
-            st.dataframe(
-                _banded(pd.DataFrame(raw_rows)), hide_index=True, width="stretch", height=300,
-            )
-    else:
-        st.info("Waiting for account data…")
-
-    st.divider()
-
-    # ── Recent errors (IB + connection + log-file scan) ───────────────────────
-    st.markdown("##### Recent errors")
-
-    err_rows: list[dict] = []
-    # IB errors from snap (includes 326 via _on_error + connect-failure path)
-    for ts, code, msg in list(snap.errors)[-30:][::-1]:
-        err_rows.append({
-            "ts":     ts.strftime("%H:%M:%S"),
-            "source": "IB" if code != -1 else "conn",
-            "code":   code,
-            "msg":    msg,
-        })
-
-    # Scan OHLC + derive logs for error-level lines (yfinance failures, etc.)
-    _ERR_KW = ("error", "failed", "fatal", "exception", "traceback", "missing", "critical")
-    for log_path, label in [(_OHLC_LOG, "ohlc"), (_DERIVE_LOG, "derive"), (_DASHBOARD_LOG, "dashboard")]:
-        if log_path.exists():
-            try:
-                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-                for ln in lines[-200:]:
-                    if any(kw in ln.lower() for kw in _ERR_KW):
-                        err_rows.append({"ts": "log", "source": label, "code": 0, "msg": ln.strip()})
-            except Exception:
-                pass
-
-    if err_rows:
-        st.dataframe(
-            _banded(pd.DataFrame(err_rows[:50])),
-            hide_index=True,
-            width="stretch",
-            height=300,
-            column_config={
-                "code": st.column_config.NumberColumn("Code", format="%d"),
-            },
-        )
-    else:
-        st.success("No errors.")
-
-
 # ---------------------------------------------------------------------------
 # Analysis tab
 # ---------------------------------------------------------------------------
@@ -1540,16 +1602,13 @@ def _cached_ohlc() -> dict:
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_ohlc_stats() -> tuple[int, int]:
     """Return (total OHLC symbols, weekly-eligible S&P 500 symbols in OHLC store)."""
-    import pickle as _pkl
     ohlc = _cached_ohlc()
     total = len(ohlc)
     try:
-        sym_path = _DATA_DIR / "symbols.pkl"
-        if sym_path.exists():
-            with open(sym_path, "rb") as _f:
-                syms = _pkl.load(_f)
-            weekly_syms = {getattr(c, "symbol", None) for c in syms}
-            weekly_syms.discard(None)
+        cats_path = _MASTER_DIR / "symbol_categories.pkl"
+        if cats_path.exists():
+            cats = pd.read_pickle(cats_path)
+            weekly_syms = set(cats.loc[cats["is_weekly"], "symbol"])
             weekly_in_ohlc = sum(1 for s in ohlc if s in weekly_syms)
         else:
             weekly_in_ohlc = 0
@@ -1559,11 +1618,10 @@ def _cached_ohlc_stats() -> tuple[int, int]:
 
 
 
-@st.fragment(run_every=30)
+@st.fragment
 def render_analysis() -> None:
     """Cover/Protect gaps + OHLC chart browser."""
-    from src.backtest.score import score_from_trades
-    from src.flex.analyze import dte_distribution, strategy_recommendation, symbol_performance
+    from src.flex.analyze import symbol_performance
     from src.flex.fetch import (
         download_cash_transactions, download_nav, download_trades,
         load_cash_xml, load_nav_xml,
@@ -1584,20 +1642,18 @@ def render_analysis() -> None:
         ("pf_f_state",        "ALL"),
         ("pf_dte_sel",        "ALL"),
         ("pf_itm_only",       False),
+        ("pf_weekly_only",    False),
         ("scr_sym",           ""),
         ("scr_strat",         "ALL"),
         ("gap_needs_sel",     "ALL"),
-        ("deep_dive_sym",     None),
         ("analysis_chart_sym", None),
         ("perf_date_start",   None),
         ("perf_date_end",     None),
         ("exp_ana_actions",   False),
         ("exp_ana_positions", False),
-        ("exp_ana_screener",  False),
         ("exp_ana_cover",     False),
         ("exp_ana_treemap",   False),
         ("exp_ana_pnl",       False),
-        ("exp_ana_deep_dive", False),
         ("exp_ana_chart",     False),
         ("exp_ana_perf",      True),
     ]
@@ -1653,6 +1709,7 @@ def render_analysis() -> None:
     if _trades_proc is not None and _trades_proc.poll() is not None:
         st.session_state["_trades_exit"] = _trades_proc.poll()
         st.session_state["trades_proc"] = None
+        st.rerun()  # immediately replace "running" badge with success/error status
 
     # ── Actions twistie ───────────────────────────────────────────────────────
     with st.expander("🛠 Actions", expanded=False, key="exp_ana_actions"):
@@ -1660,19 +1717,25 @@ def render_analysis() -> None:
         if _clr_btn_col.button("✕ Clear", key="btn_actions_clear", width="stretch"):
             for _k in ("_ohlc_exit", "_weeklies_data", "_trades_exit", "llm_hist_cache"):
                 st.session_state.pop(_k, None)
+            # Also clear finished proc references so _capture_exit doesn't re-add the exit keys.
+            if not _ohlc_running:
+                st.session_state.pop("ohlc_proc", None)
+            _tr = st.session_state.get("trades_proc")
+            if _tr is not None and _tr.poll() is not None:
+                st.session_state.pop("trades_proc", None)
             st.rerun()
 
         # ── Generate OHLCs ────────────────────────────────────────────────────────
         with _ohlc_btn_col:
             if st.button(
                 "📊 Generate OHLCs",
-                disabled=_ohlc_running,
+                type="primary" if _ohlc_running else "secondary",
                 width="stretch",
                 help=(
                     "Fetch / update 1.5 yr daily OHLC for S&P500 weekly underlyings + "
                     "portfolio positions. Runs in background; Update Trades runs automatically after."
                 ),
-            ):
+            ) and not _ohlc_running:
                 sp500_specs = get_sp500_symbols()
                 seen: set[str] = {s["symbol"] for s in sp500_specs}
                 port_specs: list[dict[str, str]] = []
@@ -1702,13 +1765,16 @@ def render_analysis() -> None:
                 )
                 st.session_state["ohlc_proc"] = _ohlc_new_proc
                 logger.info("fetch_ohlc.py started pid={}", _ohlc_new_proc.pid)
+                st.rerun()  # immediately show running state / log window
             if not _ohlc_running and "_ohlc_exit" not in st.session_state:
                 st.caption(f"Last: {_pkl_age('', path=OHLC_PATH)}")
 
         # ── Update Trades ─────────────────────────────────────────────────────────
+        _ut_running = st.session_state.get("trades_proc") is not None
         if _trades_btn_col.button(
             "🔄 Update Trades",
             key="btn_flex_update",
+            type="primary" if _ut_running else "secondary",
             help=(
                 "Merges all available sources into flex_trades.pkl — never erases history.\n\n"
                 "Sources tried in order:\n"
@@ -1954,15 +2020,8 @@ def render_analysis() -> None:
                     },
                 )
 
-    # ── Cumulative Performance chart ──────────────────────────────────────────
-    _render_perf_chart(
-        flex_path=flex_path,
-        ohlc_path=_MASTER_DIR / "ohlc.pkl",
-        cash_path=cash_path,
-        nav_path=nav_path,
-    )
-
     # ── Positions table (live — with filters + ITM highlighting) ─────────────
+    _pos_data = pd.DataFrame()
     if not snap.positions.empty:
         _pos_data = classify_portfolio(_filter_positions(snap.positions, acct))
         _pos_data = _join_tickers(_pos_data, snap.tickers)
@@ -1983,7 +2042,13 @@ def render_analysis() -> None:
                 .reset_index(drop=True)
             )
 
-        with st.expander("📋 Positions", expanded=False, key="exp_ana_positions"):
+    # Render Positions expander unconditionally to avoid layout shifts at startup
+    with st.expander("📋 Positions", expanded=False, key="exp_ana_positions"):
+        if not client._bootstrapped:
+            st.info("Waiting for live positions to load (bootstrap in progress)...")
+        elif snap.positions.empty:
+            st.info("No positions held in the selected account.")
+        else:
             _pf_c1, _pf_c2, _pf_c3, _pf_c4, _pf_c5, _pf_c6 = st.columns([2.5, 1, 2, 1, 1, 1])
             _pf_sym = _pf_c1.text_input(
                 "Symbol", key="pf_sym", placeholder="exact, e.g. A"
@@ -2005,12 +2070,28 @@ def render_analysis() -> None:
             })
             _dte_opts = ["ALL"] + [str(d) for d in _dte_int_set]
             _pf_dte_sel = _pf_c4.selectbox("DTE", _dte_opts, key="pf_dte_sel")
-            _pf_itm_only = _pf_c5.checkbox("ITM only", key="pf_itm_only")
+            _pf_itm_only    = _pf_c5.checkbox("ITM only",    key="pf_itm_only")
+            _pf_weekly_only = _pf_c5.checkbox("Weekly only", key="pf_weekly_only")
             if _pf_c6.button("✕ Clear", key="pf_clear_filter", width="stretch"):
                 for _k in ("pf_sym", "pf_sectype", "pf_f_state", "pf_dte_sel"):
                     st.session_state.pop(_k, None)
                 st.session_state.pop("pf_itm_only", None)
+                st.session_state.pop("pf_weekly_only", None)
                 st.rerun()
+
+            # Load monthly-only list once for weekly filter
+            _monthly_only_set: set[str] = set()
+            if _pf_weekly_only:
+                _sc_pkl = _MASTER_DIR / "symbol_categories.pkl"
+                if _sc_pkl.exists():
+                    try:
+                        _sc_df = pd.read_pickle(_sc_pkl)
+                        if "symbol" in _sc_df.columns and "is_weekly" in _sc_df.columns:
+                            _monthly_only_set = set(
+                                _sc_df.loc[~_sc_df["is_weekly"], "symbol"].dropna()
+                            )
+                    except Exception:
+                        pass
 
             # Apply filters
             _pv = _pos_data.copy()
@@ -2028,6 +2109,8 @@ def render_analysis() -> None:
                 _pv = _pv[_dte_col.isna() | (_dte_col <= _dte_max_val)]
             if _pf_itm_only:
                 _pv = _pv[pd.Series(_itm_mask_vec(_pv), index=_pv.index)]
+            if _pf_weekly_only and _monthly_only_set and "symbol" in _pv.columns:
+                _pv = _pv[~_pv["symbol"].isin(_monthly_only_set)]
             _pv = _pv.reset_index(drop=True)
             _itm_arr = _itm_mask_vec(_pv)
 
@@ -2085,144 +2168,32 @@ def render_analysis() -> None:
                     },
                 )
 
-        # ── Option Strategy Screener ──────────────────────────────────────────
-        _scr_raw = (
-            pd.read_csv(_DATA_DIR / "screener_weekly.csv")
-            if (_DATA_DIR / "screener_weekly.csv").exists() else pd.DataFrame()
-        )
-        _oo_raw = (
-            pd.read_csv(_DATA_DIR / "option_orders.csv")
-            if (_DATA_DIR / "option_orders.csv").exists() else pd.DataFrame()
-        )
-        # Weeklies only + remove error/no-data rows
-        if not _scr_raw.empty:
-            if "is_weekly" in _scr_raw.columns:
-                _scr_raw = _scr_raw[_scr_raw["is_weekly"].astype(bool)]
-            if "strategy" in _scr_raw.columns:
-                _scr_raw = _scr_raw[~_scr_raw["strategy"].isin(["NO DATA", "ERROR", "SKIP"])]
-        # Remove illiquid / error order legs
-        if not _oo_raw.empty:
-            _illiq = _oo_raw["action"].isna()
-            if "note" in _oo_raw.columns:
-                _illiq = _illiq | _oo_raw["note"].fillna("").str.contains(
-                    "illiquid|no valid|no options|cannot determine", case=False, regex=True
-                )
-            _oo_raw = _oo_raw[~_illiq].reset_index(drop=True)
+    # ── Performance Dashboard ─────────────────────────────────────────────────
+    _render_perf_chart(
+        flex_path=flex_path,
+        ohlc_path=_MASTER_DIR / "ohlc.pkl",
+        cash_path=cash_path,
+        nav_path=nav_path,
+    )
 
-        _scr_n = f" — {len(_scr_raw)} signals · {len(_oo_raw)} legs" if not _scr_raw.empty else ""
-        with st.expander(f"📡 Option Screener{_scr_n}", expanded=False, key="exp_ana_screener"):
-            if _scr_raw.empty and _oo_raw.empty:
-                st.info(
-                    "No data — run `uv run python scripts/option_strategy_screener.py` "
-                    "then `uv run python scripts/option_orders.py`."
-                )
-            else:
-                # Common symbol + strategy filter
-                _all_syms = sorted(
-                    (set(_scr_raw["symbol"].dropna()) if "symbol" in _scr_raw.columns else set())
-                    | (set(_oo_raw["symbol"].dropna()) if "symbol" in _oo_raw.columns else set())
-                )
-                _all_strats = ["ALL"]
-                if "strategy" in _scr_raw.columns:
-                    _all_strats += sorted(_scr_raw["strategy"].dropna().unique().tolist())
-                _sf1, _sf2, _sf3 = st.columns([2, 2, 1])
-                _scr_sym  = _sf1.text_input("Symbol",   key="scr_sym",   placeholder="e.g. AAPL").strip().upper()
-                _scr_strat = _sf2.selectbox("Strategy", _all_strats, key="scr_strat")
-                if _sf3.button("✕ Clear", key="scr_clear", width="stretch"):
-                    for _k in ("scr_sym", "scr_strat"):
-                        st.session_state.pop(_k, None)
-                    st.rerun()
+    # ── Symbol Deep-Dive (fragment: symbol changes isolated here) ────────────
+    _render_symbol_deep_dive()
 
-                _scr_df = _scr_raw.copy()
-                _oo_df  = _oo_raw.copy()
-                if _scr_sym:
-                    if "symbol" in _scr_df.columns:
-                        _scr_df = _scr_df[_scr_df["symbol"].astype(str).str.upper() == _scr_sym]
-                    if "symbol" in _oo_df.columns:
-                        _oo_df = _oo_df[_oo_df["symbol"].astype(str).str.upper() == _scr_sym]
-                if _scr_strat != "ALL":
-                    if "strategy" in _scr_df.columns:
-                        _scr_df = _scr_df[_scr_df["strategy"] == _scr_strat]
-                    if "strategy" in _oo_df.columns:
-                        _oo_df = _oo_df[_oo_df["strategy"] == _scr_strat]
-                if "symbol" in _scr_df.columns:
-                    _scr_df = _scr_df.sort_values("symbol").reset_index(drop=True)
-                if "symbol" in _oo_df.columns:
-                    _oo_df = _oo_df.sort_values("symbol").reset_index(drop=True)
-
-                if not _scr_df.empty:
-                    st.caption("Screener signals")
-                    _scr_show_cols = [
-                        "symbol", "strategy", "score", "spot",
-                        "iv_pct", "hv_pct", "iv_hv", "rsi", "dte_earn",
-                        "rationale", "dte_target", "size_note",
-                    ]
-                    st.dataframe(
-                        _banded(_scr_df[[c for c in _scr_show_cols if c in _scr_df.columns]]),
-                        hide_index=True,
-                        width="stretch",
-                        column_config={
-                            "symbol":     st.column_config.TextColumn("Symbol",     help="Ticker symbol"),
-                            "strategy":   st.column_config.TextColumn("Strategy",   help="Suggested option strategy: CSP=cash-secured put, CC=covered call, etc."),
-                            "score":      st.column_config.NumberColumn("Score",     format="%.1f",   help="Composite screener score — higher is a stronger candidate"),
-                            "spot":       st.column_config.NumberColumn("Spot",      format="$%,.2f", help="Current underlying spot price"),
-                            "iv_pct":     st.column_config.NumberColumn("IV%",       format="%.1f",   help="Current implied volatility (annualised %)"),
-                            "hv_pct":     st.column_config.NumberColumn("HV%",       format="%.1f",   help="20-day realised historical volatility (annualised %)"),
-                            "iv_hv":      st.column_config.NumberColumn("IV/HV",     format="%.2f",   help="IV ÷ HV — >1 means options are expensive relative to realised vol"),
-                            "rsi":        st.column_config.NumberColumn("RSI",       format="%.1f",   help="14-day RSI: <30 oversold, >70 overbought"),
-                            "dte_earn":   st.column_config.NumberColumn("Earn DTE",  format="%.0f",   help="Calendar days until the next earnings announcement"),
-                            "rationale":  st.column_config.TextColumn("Rationale",   help="Brief explanation of why this symbol was selected"),
-                            "dte_target": st.column_config.NumberColumn("DTE Tgt",   format="%.0f",   help="Target days-to-expiration for the suggested trade"),
-                            "size_note":  st.column_config.TextColumn("Size",        help="Position sizing guidance"),
-                        },
-                    )
-
-                if not _oo_df.empty:
-                    # Max gain/loss for the filtered selection
-                    _mg = 0.0
-                    _ml = 0.0
-                    if {"cr_dr", "price", "qty"} <= set(_oo_df.columns):
-                        _cr = _oo_df["cr_dr"].astype(str).str.upper() == "CR"
-                        _dr = _oo_df["cr_dr"].astype(str).str.upper() == "DR"
-                        _px = _oo_df["price"].fillna(0).astype(float)
-                        _qt = _oo_df["qty"].fillna(0).astype(float).abs()
-                        _mg = float((_px[_cr] * _qt[_cr]).sum() - (_px[_dr] * _qt[_dr]).sum()) * 100
-                    if "max_loss" in _oo_df.columns:
-                        _ml = float(_oo_df["max_loss"].fillna(0).sum())
-                    st.caption(f"Order legs — max gain \\${_mg:,.0f} · max loss \\${abs(_ml):,.0f}")
-                    _oo_show_cols = [
-                        "symbol", "strategy", "spot", "action", "qty",
-                        "pc", "strike", "expiry", "cr_dr", "price", "max_loss", "note",
-                    ]
-                    st.dataframe(
-                        _banded(_oo_df[[c for c in _oo_show_cols if c in _oo_df.columns]]),
-                        hide_index=True,
-                        width="stretch",
-                        column_config={
-                            "symbol":   st.column_config.TextColumn("Symbol",    help="Ticker symbol"),
-                            "strategy": st.column_config.TextColumn("Strategy",  help="Option strategy this leg belongs to"),
-                            "spot":     st.column_config.NumberColumn("Spot",    format="$%,.2f", help="Current underlying spot price"),
-                            "action":   st.column_config.TextColumn("Action",    help="BUY or SELL"),
-                            "qty":      st.column_config.NumberColumn("Qty",     format="%d",     help="Number of contracts for this leg"),
-                            "pc":       st.column_config.TextColumn("P/C",       help="P=Put, C=Call"),
-                            "strike":   st.column_config.NumberColumn("Strike",  format="%.1f",   help="Option strike price"),
-                            "expiry":   st.column_config.TextColumn("Expiry",    help="Option expiration date"),
-                            "cr_dr":    st.column_config.TextColumn("CR/DR",     help="CR=credit received, DR=debit paid for this leg"),
-                            "price":    st.column_config.NumberColumn("Price",   format="$%.2f",  help="Expected execution price per contract"),
-                            "max_loss": st.column_config.NumberColumn("Max Loss", format="$%,.0f", help="Maximum possible loss for the full strategy (shown on the first leg only; 0 on subsequent legs)"),
-                            "note":     st.column_config.TextColumn("Note",      help="Additional notes from the screener"),
-                        },
-                    )
-
-        # ── Cover / Protect gaps ─────────────────────────────────────────────
-        # protect_me=True always so Protect Strike / Value Protected columns are present
-        gaps = cover_protect_gaps(
-            _pos_data, snap.tickers,
-            protect_me=True,
-            cover_std_mult=settings.cover_std_mult,
-            max_dte=settings.max_dte,
-        )
-        with st.expander(f"🔍 Cover/Protect gaps (PROTECT_ME={settings.protect_me})", expanded=False, key="exp_ana_cover"):
+    # ── Gaps ──────────────────────────────────────────────────────────────────
+    _prot_status = "enabled" if settings.protect_me else "disabled"
+    with st.expander(f"⚠️ Gaps [PROTECT {_prot_status}]", expanded=False, key="exp_ana_cover"):
+        if not client._bootstrapped:
+            st.info("Waiting for live positions to load (bootstrap in progress)...")
+        elif snap.positions.empty:
+            st.info("No positions held in the selected account.")
+        else:
+            # protect_me=True always so Protect Strike / Value Protected columns are present
+            gaps = cover_protect_gaps(
+                _pos_data, snap.tickers,
+                protect_me=True,
+                cover_std_mult=settings.cover_std_mult,
+                max_dte=settings.max_dte,
+            )
             if gaps.empty:
                 st.success("No gaps — all stocks covered and protected.")
             else:
@@ -2287,64 +2258,9 @@ def render_analysis() -> None:
                 }
                 st.dataframe(_banded(_gaps_show), hide_index=True, width="stretch", column_config=_gap_col_cfg)
 
-    # ── Load OHLC store ───────────────────────────────────────────────────────
-    ohlc_store = _cached_ohlc()
-    if not ohlc_store:
-        st.info(
-            "No OHLC data yet. Click **📊 Generate OHLCs** above "
-            "to build the store (requires data/symbols.pkl from build.py first)."
-        )
-        return
 
-    all_symbols = sorted(ohlc_store.keys())
 
-    # ── Portfolio Treemap ─────────────────────────────────────────────────────
-    with st.expander("🗺️ Portfolio Treemap", expanded=False, key="exp_ana_treemap"):
-        pos_df = _filter_positions(snap.positions, acct)
-        if not pos_df.empty:
-            df_tree = pos_df.copy()
-            if "margin_init" not in df_tree.columns:
-                df_tree["margin_est"] = position_margin_est(df_tree)
-                m_col = "margin_est"
-            else:
-                m_col = "margin_init"
-
-            if "unrealizedPNL" in df_tree.columns and m_col in df_tree.columns:
-                df_tree["unrealizedPNL"] = df_tree["unrealizedPNL"].fillna(0)
-                df_tree[m_col] = df_tree[m_col].fillna(0)
-
-                tree_agg = df_tree.groupby("symbol").agg({
-                    "unrealizedPNL": "sum",
-                    m_col: "sum",
-                }).reset_index()
-
-                tree_agg = tree_agg[tree_agg[m_col] > 0]
-                if not tree_agg.empty:
-                    fig_tree = px.treemap(
-                        tree_agg,
-                        path=["symbol"],
-                        values=m_col,
-                        color="unrealizedPNL",
-                        color_continuous_scale="RdYlGn",
-                        color_continuous_midpoint=0,
-                    )
-                    fig_tree.update_traces(
-                        marker=dict(line=dict(color='rgba(0,0,0,0)')),
-                        hovertemplate='<b>%{label}</b><br>Margin: $%{value:,.0f}<br>P&L: $%{color:,.0f}<extra></extra>'
-                    )
-                    fig_tree.update_layout(
-                        margin=dict(t=10, l=10, r=10, b=10),
-                        paper_bgcolor="rgba(0,0,0,0)",
-                        plot_bgcolor="rgba(0,0,0,0)",
-                        height=320,
-                    )
-                    st.plotly_chart(fig_tree, width="stretch")
-                else:
-                    st.info("No positions with margin > 0.")
-        else:
-            st.info("No positions to display.")
-
-    # ── Load flex trade data (needed for Options P&L + Symbol Deep-Dive) ─────
+    # ── Load flex trade data (needed for Options P&L by Underlying) ──────────
     _flex_loaded = flex_path.exists()
     if _flex_loaded:
         df_all = pd.read_pickle(flex_path)
@@ -2376,10 +2292,6 @@ def render_analysis() -> None:
                     _parts.append(f"{_r} {_q:+d}")
                 if _parts:
                     _pos_map[str(_sym_k)] = "  ".join(_parts)
-        _av2 = _select_account_values(snap, acct)
-        _nlv = float(_av2.get("NetLiquidation", 0)) if _av2 else 0.0
-        _qty_mult = st.session_state.get("cfg_virgin_qty_mult", 0.055)
-        _vd = {"DEPLOY": "🟢", "REFINE": "🟡", "ABANDON": "🔴"}
 
         if not perf.empty:
             _extra: list[dict] = []
@@ -2397,23 +2309,49 @@ def render_analysis() -> None:
             for _col in reversed(["current_price", "hv", "iv", "position", "margin"]):
                 perf.insert(_sym_idx, _col, _extra_df[_col].values)
 
+            # Backtest score + verdict — one call per symbol, fast (in-memory mask)
+            from src.backtest.score import score_from_trades as _score_fn  # noqa: PLC0415
+            _bt_scores: list[int | None] = []
+            _bt_verdicts: list[str | None] = []
+            for _sym in perf["symbol"]:
+                _bs = _score_fn(df_all, _sym)
+                if _bs.total_trades == 0:
+                    _bt_scores.append(None)
+                    _bt_verdicts.append(None)
+                else:
+                    _bt_scores.append(int(_bs.composite))
+                    _bt_verdicts.append(_bs.verdict)
+            _mg_idx = perf.columns.get_loc("margin") + 1
+            perf.insert(_mg_idx,     "score",   _bt_scores)
+            perf.insert(_mg_idx + 1, "verdict", _bt_verdicts)
+
         # ── Options P&L by Underlying ─────────────────────────────────────────
-        with st.expander("📊 Options P&L by Underlying", expanded=False, key="exp_ana_pnl"):
+        with st.expander("📊 Historical Trade P&L", expanded=False, key="exp_ana_pnl"):
             if perf.empty:
                 st.info("No closed options trades in the Flex data.")
             else:
                 st.dataframe(
-                    _banded(perf).format({
+                    _banded(perf)
+                    .format({
                         "current_price": "${:,.2f}",
                         "hv":  "{:.1f}%",
                         "iv":  "{:.1f}%",
                         "margin":        "${:,.0f}",
+                        "score":         "{:.0f}",
                         "win_rate":      "{:.0%}",
                         "profit_factor": "{:.2f}",
                         "avg_win":       "${:,.0f}",
                         "avg_loss":      "${:,.0f}",
                         "total_pnl":     "${:,.0f}",
-                    }, na_rep="—"),
+                    }, na_rep="—")
+                    .map(
+                        lambda v: (
+                            "color: #22c55e; font-weight: 600" if v == "DEPLOY" else
+                            "color: #f59e0b; font-weight: 600" if v == "REFINE" else
+                            "color: #ef4444; font-weight: 600" if v == "ABANDON" else ""
+                        ),
+                        subset=["verdict"],
+                    ),
                     width="stretch",
                     hide_index=True,
                     column_config={
@@ -2423,6 +2361,8 @@ def render_analysis() -> None:
                         "iv":            st.column_config.TextColumn("IV %",          help="Implied volatility from df_unds"),
                         "position":      st.column_config.TextColumn("Position",      help="Current live position: STK ±shares, P/C ±contracts"),
                         "margin":        st.column_config.TextColumn("Margin",        help="Estimated margin per contract from df_unds"),
+                        "score":         st.column_config.NumberColumn("Score /100",  help="BacktestExpert composite score 0–100 (win rate + profit factor + drawdown + duration)"),
+                        "verdict":       st.column_config.TextColumn("Rating",        help="DEPLOY ≥70 · REFINE 40–69 · ABANDON <40 or critical flag"),
                         "trades":        st.column_config.NumberColumn("Trades",      help="Closed option contracts"),
                         "win_rate":      st.column_config.TextColumn("Win %",         help="% of closed trades with positive P&L"),
                         "profit_factor": st.column_config.TextColumn("PF",            help="Gross profit ÷ gross loss. ≥1.5 = strong edge"),
@@ -2432,51 +2372,107 @@ def render_analysis() -> None:
                     },
                 )
 
-        # ── Symbol Deep-Dive ──────────────────────────────────────────────────
-        with st.expander("🔍 Symbol Deep-Dive", expanded=False, key="exp_ana_deep_dive"):
-            if perf.empty:
-                st.info("No data.")
-            else:
-                _sym_list = perf["symbol"].tolist()
-                _dc1, _dc2 = st.columns([1, 3])
-                with _dc1:
-                    _sel = st.selectbox("Symbol", _sym_list, key="deep_dive_sym")
-                dte_df = dte_distribution(df_all)
-                rec = strategy_recommendation(perf, dte_df, _sel)
-                _sel_margin = (
-                    float(_unds.loc[_sel, "margin"])
-                    if not _unds.empty and _sel in _unds.index
-                    else 0.0
-                )
-                if _nlv > 0 and _sel_margin > 0 and _qty_mult > 0:
-                    _suggested_qty = max(1, int(_qty_mult * _nlv / _sel_margin))
-                    rec += (
-                        f"\nSuggested qty: {_suggested_qty} contract(s)"
-                        f"  (VIRGIN_QTY_MULT {_qty_mult} × NLV ${_nlv:,.0f} ÷ margin ${_sel_margin:,.0f})"
-                    )
-                with _dc2:
-                    st.code(rec)
 
-                _score = score_from_trades(df_all, _sel)
-                _s1, _s2, _s3, _s4, _s5 = st.columns(5)
-                _s1.metric("Score", f"{_score.composite:.0f}/100",
-                           f"{_vd.get(_score.verdict, '')} {_score.verdict}",
-                           help="Composite backtest quality 0–100. DEPLOY ≥70, REFINE 40–69, ABANDON <40.")
-                _s2.metric("Trades", _score.total_trades,
-                           help="Closed option contracts used in the backtest.")
-                _s3.metric("Win Rate", f"{_score.win_rate:.0%}",
-                           help="Percentage of closed trades with positive realised P&L.")
-                _s4.metric("Profit Factor", f"{_score.profit_factor:.2f}",
-                           help="Gross profit ÷ gross loss. <1.0 = losing edge, 1.5+ = strong edge.")
-                _s5.metric("Years Tested", f"{_score.years_tested:.1f}",
-                           help="Date span of trade history used. <3 years = insufficient for robust scoring.")
 
-    # ── Chart & Positions ─────────────────────────────────────────────────────
-    with st.expander("📈 Single Symbol Chart with Position Table", expanded=False, key="exp_ana_chart"):
+@st.fragment
+def _render_symbol_deep_dive() -> None:
+    """Symbol Deep-Dive: backtest stats + OHLC chart + positions/orders table.
+
+    Single fragment so symbol changes don't rerender the surrounding analysis.
+    """
+    from src.backtest.score import score_from_trades as _sft  # noqa: PLC0415
+    from src.flex.analyze import (  # noqa: PLC0415
+        dte_distribution as _dte_dist,
+        strategy_recommendation as _strat_rec,
+        symbol_performance as _sym_perf,
+    )
+    from src.flex.parse import normalize as _norm  # noqa: PLC0415
+
+    ohlc_store = _cached_ohlc()
+    all_symbols = sorted(ohlc_store.keys())
+    snap = client.snapshot()
+    acct = _selected_account()
+
+    with st.expander("🔍 Deep-Dive", expanded=False, key="exp_ana_chart"):
         # Guard stale session_state (e.g. symbol removed from OHLC store after a refresh)
         _cur_sym = st.session_state.get("analysis_chart_sym")
         if _cur_sym not in all_symbols:
-            st.session_state["analysis_chart_sym"] = all_symbols[0] if all_symbols else None
+            _default_sym = "GOOG" if "GOOG" in all_symbols else (all_symbols[0] if all_symbols else None)
+            st.session_state["analysis_chart_sym"] = _default_sym
+
+        # ── Margin & P&L Map ──────────────────────────────────────────────────────
+        pos_df = _filter_positions(snap.positions, acct)
+        clicked_sym = None
+        if not pos_df.empty:
+            df_tree = pos_df.copy()
+            if "margin_init" not in df_tree.columns:
+                df_tree["margin_est"] = position_margin_est(df_tree)
+                m_col = "margin_est"
+            else:
+                m_col = "margin_init"
+
+            if "unrealizedPNL" in df_tree.columns and m_col in df_tree.columns:
+                df_tree["unrealizedPNL"] = df_tree["unrealizedPNL"].fillna(0)
+                df_tree[m_col] = df_tree[m_col].fillna(0)
+
+                tree_agg = df_tree.groupby("symbol").agg({
+                    "unrealizedPNL": "sum",
+                    m_col: "sum",
+                }).reset_index()
+
+                tree_agg = tree_agg[tree_agg[m_col] > 0]
+                if not tree_agg.empty:
+                    fig_tree = px.treemap(
+                        tree_agg,
+                        path=["symbol"],
+                        values=m_col,
+                        color="unrealizedPNL",
+                        color_continuous_scale="RdYlGn",
+                        color_continuous_midpoint=0,
+                        custom_data=["symbol"],
+                    )
+                    fig_tree.update_traces(
+                        marker=dict(line=dict(color='rgba(0,0,0,0)')),
+                        hovertemplate='<b>%{label}</b><br>Margin: $%{value:,.0f}<br>P&L: $%{color:,.0f}<extra></extra>'
+                    )
+                    fig_tree.update_layout(
+                        margin=dict(t=10, l=10, r=10, b=10),
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        height=320,
+                    )
+                    event = st.plotly_chart(fig_tree, on_select="rerun", key="treemap_pnl_map", width="stretch")
+                    if event and "selection" in event and event["selection"]["points"]:
+                        try:
+                            pt = event["selection"]["points"][0]
+                            candidate = pt.get("label")
+                            if not candidate or candidate not in all_symbols:
+                                cdata = pt.get("customdata")
+                                if cdata and isinstance(cdata, list) and len(cdata) > 0:
+                                    candidate = cdata[0]
+                            if not candidate or candidate not in all_symbols:
+                                pidx = pt.get("point_index")
+                                if pidx is not None and 0 <= pidx < len(tree_agg):
+                                    candidate = tree_agg.iloc[pidx]["symbol"]
+                            
+                            if candidate in all_symbols:
+                                clicked_sym = candidate
+                        except Exception as e:
+                            import logging
+                            logging.getLogger("ibd").warning(f"Error parsing treemap selection event: {e}, event={event}")
+                else:
+                    st.info("No positions with margin > 0.")
+        else:
+            st.info("No positions to display.")
+
+        # Check if selection changed to prevent feedback loop
+        last_clicked = st.session_state.get("last_treemap_clicked_sym")
+        if clicked_sym != last_clicked:
+            st.session_state["last_treemap_clicked_sym"] = clicked_sym
+            if clicked_sym and clicked_sym in all_symbols:
+                st.session_state["analysis_chart_sym"] = clicked_sym
+
+        st.divider()
 
         _sym_col, _ = st.columns([1, 9])
         with _sym_col:
@@ -2491,6 +2487,56 @@ def render_analysis() -> None:
         if not selected_sym or selected_sym not in ohlc_store:
             return
 
+        # ── Backtest stats from flex trade history ────────────────────────────
+        _flex_path = _MASTER_DIR / "flex_trades.pkl"
+        _unds_path = _DATA_DIR / "df_unds.pkl"
+        _vd = {"DEPLOY": "🟢", "REFINE": "🟡", "ABANDON": "🔴"}
+        if _flex_path.exists():
+            _df_all = pd.read_pickle(_flex_path)
+            if not _df_all.empty and "pnl" not in _df_all.columns:
+                _df_all = _norm(_df_all)
+            _perf = _sym_perf(_df_all)
+            _unds = pd.read_pickle(_unds_path).set_index("symbol") if _unds_path.exists() else pd.DataFrame()
+            _av = _select_account_values(snap, acct)
+            _nlv = float(_av.get("NetLiquidation", 0)) if _av else 0.0
+            _qty_mult = st.session_state.get("cfg_virgin_qty_mult", 0.055)
+
+            if not _perf.empty and selected_sym in _perf["symbol"].values:
+                _dte_df = _dte_dist(_df_all)
+                _rec = _strat_rec(_perf, _dte_df, selected_sym)
+                _sel_margin = (
+                    float(_unds.loc[selected_sym, "margin"])
+                    if not _unds.empty and selected_sym in _unds.index
+                    else 0.0
+                )
+                if _nlv > 0 and _sel_margin > 0 and _qty_mult > 0:
+                    _sug_qty = max(1, int(_qty_mult * _nlv / _sel_margin))
+                    _rec += (
+                        f"\nSuggested qty: {_sug_qty} contract(s)"
+                        f"  (VIRGIN_QTY_MULT {_qty_mult} × NLV ${_nlv:,.0f} ÷ margin ${_sel_margin:,.0f})"
+                    )
+                _, _rec_col = st.columns([1, 3])
+                with _rec_col:
+                    st.code(_rec)
+                _score = _sft(_df_all, selected_sym)
+                _s1, _s2, _s3, _s4, _s5 = st.columns(5)
+                _s1.metric("Score", f"{_score.composite:.0f}/100",
+                           f"{_vd.get(_score.verdict, '')} {_score.verdict}",
+                           help="Composite backtest quality 0–100. DEPLOY ≥70, REFINE 40–69, ABANDON <40.")
+                _s2.metric("Trades", _score.total_trades,
+                           help="Closed option contracts used in the backtest.")
+                _s3.metric("Win Rate", f"{_score.win_rate:.0%}",
+                           help="% of closed trades with positive realised P&L.")
+                _s4.metric("Profit Factor", f"{_score.profit_factor:.2f}",
+                           help="Gross profit ÷ gross loss. <1.0 = losing edge, 1.5+ = strong.")
+                _s5.metric("Years Tested", f"{_score.years_tested:.1f}",
+                           help="Date span of trade history. <3 years = insufficient for robust scoring.")
+            else:
+                st.caption(f"No trade history for {selected_sym} in flex_trades.pkl.")
+
+        st.divider()
+
+        # ── OHLC candlestick chart ────────────────────────────────────────────
         df_chart = ohlc_store[selected_sym].copy()
         if df_chart.empty or "Close" not in df_chart.columns:
             st.warning(f"No price data stored for {selected_sym}.")
@@ -2832,73 +2878,146 @@ def render_analysis() -> None:
 
         st.plotly_chart(fig, width="stretch")
 
-        # ── Per-symbol position detail table ──────────────────────────────────────
-        st.markdown(f"**{selected_sym} — positions**")
-        if sym_pos.empty:
-            st.caption(f"No positions held for {selected_sym}.")
-        else:
+        # ── Per-symbol combined table (Pf / Suggested Orders / Open Orders) ────────
+        import numpy as _np  # noqa: PLC0415
+
+        # Suggested-order rows from each strategy pickle
+        _SO_PICKLES = [
+            ("df_cov.pkl",     "SELL"),
+            ("df_nkd.pkl",     "SELL"),
+            ("df_reap.pkl",    "BUY"),
+            ("df_protect.pkl", "BUY"),
+        ]
+        _so_frames: list[pd.DataFrame] = []
+        for _pkl_name, _so_action in _SO_PICKLES:
+            _raw_so = _load_pkl(_pkl_name)
+            if _raw_so.empty or "symbol" not in _raw_so.columns:
+                continue
+            _fsym = _raw_so[_raw_so["symbol"] == selected_sym].copy()
+            if _fsym.empty:
+                continue
+            _fsym["source"] = "SOrd"
+            if "action" not in _fsym.columns:
+                _fsym["action"] = _so_action
+            if "secType" not in _fsym.columns:
+                _fsym["secType"] = "OPT"
+            # Use qty (contracts to trade) as position; df_reap has both qty and position
+            if "qty" in _fsym.columns:
+                _fsym["position"] = _fsym["qty"]
+            elif "position" not in _fsym.columns:
+                _fsym["position"] = 0
+            _fsym["lmt_px"] = _fsym["xPrice"] if "xPrice" in _fsym.columns else float("nan")
+            if "dte" not in _fsym.columns and "expiry" in _fsym.columns:
+                _fsym["dte"] = _dte_series(_fsym["expiry"]).fillna(0).astype(int)
+            if "margin" not in _fsym.columns:
+                _fsym["margin"] = _fsym["margin_init"] if "margin_init" in _fsym.columns else float("nan")
+            _so_frames.append(_fsym)
+
+        # Open-order rows from snap
+        _ord_frame: pd.DataFrame = pd.DataFrame()
+        if not snap.orders.empty and "symbol" in snap.orders.columns:
+            _o_sym = snap.orders[snap.orders["symbol"] == selected_sym].copy()
+            if not _o_sym.empty:
+                _o_sym["source"] = "Ord"
+                _o_sym["position"] = _o_sym["remaining"] if "remaining" in _o_sym.columns else 0
+                _o_sym["lmt_px"] = _o_sym["lmtPrice"] if "lmtPrice" in _o_sym.columns else float("nan")
+                _o_sym["pf_state"] = ""
+                _o_sym["margin"] = float("nan")
+                if "dte" not in _o_sym.columns and "expiry" in _o_sym.columns:
+                    _o_sym["dte"] = _dte_series(_o_sym["expiry"]).fillna(0).astype(int)
+                _ord_frame = _o_sym
+
+        # Portfolio rows
+        _pf_len = 0
+        if not sym_pos.empty:
             sym_pos = sym_pos.copy()
+            sym_pos["source"] = "Pf"
+            sym_pos["action"] = ""
+            sym_pos["lmt_px"] = float("nan")
             if "expiry" in sym_pos.columns:
                 sym_pos["dte"] = _dte_series(sym_pos["expiry"]).fillna(0).astype(int)
             if "margin_init" in sym_pos.columns:
-                _sym_mcol = "margin_init"
+                sym_pos["margin"] = sym_pos["margin_init"]
                 _sym_mlabel = "Margin"
             else:
-                sym_pos["margin_est"] = position_margin_est(sym_pos)
-                _sym_mcol = "margin_est"
+                sym_pos["margin"] = position_margin_est(sym_pos)
                 _sym_mlabel = "Margin*"
-            _s_und = sym_pos["underlying_px"] if "underlying_px" in sym_pos.columns else pd.Series(float("nan"), index=sym_pos.index)
-            _s_str = sym_pos["strike"] if "strike" in sym_pos.columns else pd.Series(float("nan"), index=sym_pos.index)
-            _s_rgt = sym_pos["right"] if "right" in sym_pos.columns else pd.Series("", index=sym_pos.index)
-            _s_itm = (
-                ((sym_pos["secType"] == "OPT") & (_s_rgt == "C") & (_s_und > _s_str))
-                | ((sym_pos["secType"] == "OPT") & (_s_rgt == "P") & (_s_und < _s_str))
-            ).to_numpy(dtype=bool)
+            _pf_len = len(sym_pos)
+        else:
+            _sym_mlabel = "Margin"
+
+        _all_frames: list[pd.DataFrame] = []
+        if not sym_pos.empty:
+            _all_frames.append(sym_pos)
+        _all_frames.extend(_so_frames)
+        if not _ord_frame.empty:
+            _all_frames.append(_ord_frame)
+
+        st.markdown(f"**{selected_sym} — positions & orders**")
+        if not _all_frames:
+            st.caption(f"No positions, suggested orders, or open orders for {selected_sym}.")
+        else:
+            combined = pd.concat(_all_frames, ignore_index=True, sort=False)
+
+            # ITM highlight mask — Pf rows only (amber tint)
+            if _pf_len > 0:
+                _pf_part = combined.iloc[:_pf_len]
+                _c_und = _pf_part["underlying_px"] if "underlying_px" in _pf_part.columns else pd.Series(float("nan"), index=_pf_part.index)
+                _c_str = _pf_part["strike"] if "strike" in _pf_part.columns else pd.Series(float("nan"), index=_pf_part.index)
+                _c_rgt = _pf_part["right"] if "right" in _pf_part.columns else pd.Series("", index=_pf_part.index)
+                _pf_itm = (
+                    ((_pf_part["secType"] == "OPT") & (_c_rgt == "C") & (_c_und > _c_str))
+                    | ((_pf_part["secType"] == "OPT") & (_c_rgt == "P") & (_c_und < _c_str))
+                ).to_numpy(dtype=bool)
+                _s_itm = _np.concatenate([_pf_itm, _np.zeros(len(combined) - _pf_len, dtype=bool)])
+            else:
+                _s_itm = _np.zeros(len(combined), dtype=bool)
+
+            # Clean up STK rows
+            if "secType" in combined.columns:
+                _stk = combined["secType"] == "STK"
+                if all(c in combined.columns for c in ("underlying_px", "marketPrice")):
+                    combined.loc[_stk, "underlying_px"] = combined.loc[_stk, "marketPrice"]
+                for _col in ("right", "strike", "dte"):
+                    if _col in combined.columns:
+                        combined.loc[_stk, _col] = None if _col != "right" else ""
+            if "position" in combined.columns:
+                combined["position"] = combined["position"].fillna(0).astype(int)
 
             disp_cols = [
-                "symbol", "secType", "underlying_px", "right", "strike", "expiry", "dte",
-                "position", "pf_state", "avgCost", "marketPrice", "marketValue",
-                "unrealizedPNL", "delta", "theta", "vega", "iv", "delta_$",
+                "symbol", "source", "secType", "underlying_px", "right", "strike", "expiry", "dte",
+                "position", "action", "pf_state", "lmt_px",
+                "avgCost", "marketPrice", "marketValue",
+                "unrealizedPNL", "delta", "theta", "vega", "iv", "delta_$", "margin",
             ]
-            if _sym_mcol in sym_pos.columns:
-                disp_cols.append(_sym_mcol)
-            sym_view = sym_pos[[c for c in disp_cols if c in sym_pos.columns]].reset_index(drop=True)
-            if "secType" in sym_view.columns:
-                _stk = sym_view["secType"] == "STK"
-                if all(c in sym_view.columns for c in ("underlying_px", "marketPrice")):
-                    sym_view.loc[_stk, "underlying_px"] = sym_view.loc[_stk, "marketPrice"]
-                if "right" in sym_view.columns:
-                    sym_view.loc[_stk, "right"] = ""
-                if "strike" in sym_view.columns:
-                    sym_view.loc[_stk, "strike"] = None
-                if "dte" in sym_view.columns:
-                    sym_view.loc[_stk, "dte"] = None
-            if "position" in sym_view.columns:
-                sym_view["position"] = sym_view["position"].fillna(0).astype(int)
+            sym_view = combined[[c for c in disp_cols if c in combined.columns]].reset_index(drop=True)
             st.dataframe(
                 _banded(sym_view, _s_itm),
                 hide_index=True,
                 width="stretch",
                 column_config={
-                    "symbol":        st.column_config.TextColumn("Symbol",       help="Ticker symbol"),
-                    "secType":       st.column_config.TextColumn("Type",         help="Security type: STK=stock, OPT=option"),
-                    "underlying_px": st.column_config.NumberColumn("Underlying", format="$%.2f",  help="Current underlying stock price"),
-                    "right":         st.column_config.TextColumn("C/P",          help="C=Call, P=Put"),
-                    "position":      st.column_config.NumberColumn("Qty",        format="%d",     help="Contracts held; negative = short position"),
-                    "dte":           st.column_config.NumberColumn("DTE",        format="%.0f",   help="Calendar days to expiration"),
-                    "strike":        st.column_config.NumberColumn("Strike",     format="$%,.1f", help="Option strike price"),
-                    "expiry":        st.column_config.TextColumn("Expiry",       help="Option expiration date"),
-                    "avgCost":       st.column_config.NumberColumn("Avg Cost",   format="$%,.2f", help="Average cost basis per share/contract (for options: premium collected or paid)"),
-                    "marketPrice":   st.column_config.NumberColumn("Mkt Px",     format="$%,.2f", help="Current market price"),
-                    "marketValue":   st.column_config.NumberColumn("Mkt Val",    format="$%,.0f", help="Total market value = price × qty × multiplier"),
-                    "unrealizedPNL": st.column_config.NumberColumn("Unreal P&L", format="$%,.0f", help="Unrealized profit/loss at current market price"),
-                    "delta":         st.column_config.NumberColumn("Δ Delta",    format="%.3f",   help="Price change per $1 move in the underlying"),
-                    "theta":         st.column_config.NumberColumn("Θ Theta",    format="%.3f",   help="Daily time decay in option value"),
-                    "vega":          st.column_config.NumberColumn("ν Vega",     format="%.3f",   help="Sensitivity to a 1% change in implied volatility"),
-                    "iv":            st.column_config.NumberColumn("IV",         format="%.3f",   help="Implied volatility of the option (decimal, e.g. 0.25 = 25%)"),
-                    "delta_$":       st.column_config.NumberColumn("Delta $",    format="$%,.0f", help="Dollar delta = delta × qty × underlying_px × 100"),
-                    _sym_mcol:       st.column_config.NumberColumn(_sym_mlabel,  format="$%,.0f", help="IBKR what-if margin when available (*=Reg-T estimate)"),
-                    "pf_state":      st.column_config.TextColumn("State",        help="Portfolio state: CC=covered call, PP=protective put, NP=naked put, etc."),
+                    "symbol":        st.column_config.TextColumn("Symbol",      help="Ticker symbol"),
+                    "source":        st.column_config.TextColumn("Source",      help="Pf=Portfolio position  ·  SOrd=Suggested Order  ·  Ord=Open IBKR order"),
+                    "secType":       st.column_config.TextColumn("Type",        help="Security type: STK=stock, OPT=option"),
+                    "underlying_px": st.column_config.NumberColumn("Underlying",format="$%.2f",   help="Current underlying stock price"),
+                    "right":         st.column_config.TextColumn("C/P",         help="C=Call, P=Put"),
+                    "position":      st.column_config.NumberColumn("Qty",       format="%d",      help="Contracts held (Pf) or to trade (SO/O); negative = short"),
+                    "dte":           st.column_config.NumberColumn("DTE",       format="%.0f",    help="Calendar days to expiration"),
+                    "strike":        st.column_config.NumberColumn("Strike",    format="$%,.1f",  help="Option strike price"),
+                    "expiry":        st.column_config.TextColumn("Expiry",      help="Option expiration date"),
+                    "action":        st.column_config.TextColumn("Action",      help="BUY or SELL (SO and O rows only)"),
+                    "pf_state":      st.column_config.TextColumn("State",       help="Portfolio state: CC=covered call, PP=protective put, NP=naked put, etc."),
+                    "lmt_px":        st.column_config.NumberColumn("Limit Px",  format="$%,.2f",  help="Target execution price: xPrice for SO; lmtPrice for O"),
+                    "avgCost":       st.column_config.NumberColumn("Avg Cost",  format="$%,.2f",  help="Average cost basis per share/contract (for options: premium collected or paid)"),
+                    "marketPrice":   st.column_config.NumberColumn("Mkt Px",    format="$%,.2f",  help="Current market price"),
+                    "marketValue":   st.column_config.NumberColumn("Mkt Val",   format="$%,.0f",  help="Total market value = price × qty × multiplier"),
+                    "unrealizedPNL": st.column_config.NumberColumn("Unreal P&L",format="$%,.0f", help="Unrealized profit/loss at current market price"),
+                    "delta":         st.column_config.NumberColumn("Δ Delta",   format="%.3f",    help="Price change per $1 move in the underlying"),
+                    "theta":         st.column_config.NumberColumn("Θ Theta",   format="%.3f",    help="Daily time decay in option value"),
+                    "vega":          st.column_config.NumberColumn("ν Vega",    format="%.3f",    help="Sensitivity to a 1% change in implied volatility"),
+                    "iv":            st.column_config.NumberColumn("IV",        format="%.3f",    help="Implied volatility of the option (decimal, e.g. 0.25 = 25%)"),
+                    "delta_$":       st.column_config.NumberColumn("Delta $",   format="$%,.0f",  help="Dollar delta = delta × qty × underlying_px × 100"),
+                    "margin":        st.column_config.NumberColumn(_sym_mlabel, format="$%,.0f",  help="IBKR what-if margin (Pf) or Reg-T estimate (SO)"),
                 },
             )
 
@@ -2929,7 +3048,7 @@ def _render_perf_chart(
     """Cumulative performance vs. SPY/QQQ benchmark — shown above Trade History & Backtest."""
     import math
 
-    with st.expander("📈 Cumulative Performance vs. Benchmark", expanded=True, key="exp_ana_perf"):
+    with st.expander("📈 Performance Dashboard", expanded=True, key="exp_ana_perf"):
 
         # ── Guards ────────────────────────────────────────────────────────
         if not flex_path.exists() or not ohlc_path.exists():
@@ -3018,19 +3137,23 @@ def _render_perf_chart(
         t0        = min(t0_trades, t0_nav)
         _today    = pd.Timestamp.today().normalize()
 
-        # ── Period shortcut buttons — set From/To then rerun so date pickers update ──
-        # Presets are stored in non-widget keys to avoid StreamlitAPIException.
-        # On the rerun we pop the widget key so date_input falls back to value=.
-        _preset_start = st.session_state.pop("_perf_preset_start", None)
-        _preset_end   = st.session_state.pop("_perf_preset_end",   None)
-        if _preset_start is not None:
-            st.session_state.pop("perf_date_start", None)
-        if _preset_end is not None:
-            st.session_state.pop("perf_date_end", None)
+        # ── Period shortcut buttons ───────────────────────────────────────────
+        # Buttons set widget keys directly in session_state then rerun — this
+        # is the only reliable way to force date_input to show the new value.
+        # Using a staging key + value= can be silently ignored by Streamlit's
+        # widget reconciliation when the key already exists in session state.
+        _default_start = max(_DEFAULT_PERF_START.date(), t0.date())
+        if "perf_date_start" not in st.session_state:
+            st.session_state["perf_date_start"] = _default_start
+        if "perf_date_end" not in st.session_state:
+            st.session_state["perf_date_end"] = _today.date()
+
+        _eff_start = st.session_state["perf_date_start"]
+        _eff_end   = st.session_state["perf_date_end"]
 
         _pb = st.columns(8)
         _period_presets = [
-            ("Focus", max(_DEFAULT_PERF_START.date(), t0.date())),
+            ("Focus", _default_start),
             ("MTD",   max(_today.replace(day=1).date(), t0.date())),
             ("1M",    max((_today - pd.DateOffset(months=1)).date(), t0.date())),
             ("3M",    max((_today - pd.DateOffset(months=3)).date(), t0.date())),
@@ -3039,26 +3162,31 @@ def _render_perf_chart(
             ("3Y",    max((_today - pd.DateOffset(years=3)).date(), t0.date())),
             ("All",   t0.date()),
         ]
+        _active_preset_lbl = next(
+            (_plbl for _plbl, _pstart in _period_presets
+             if _eff_start == _pstart and _eff_end == _today.date()),
+            None,
+        )
         for _pcol, (_plbl, _pstart) in zip(_pb, _period_presets):
-            if _pcol.button(_plbl, key=f"perf_period_{_plbl}", width="stretch"):
-                st.session_state["_perf_preset_start"] = _pstart
-                st.session_state["_perf_preset_end"]   = _today.date()
+            if _pcol.button(
+                _plbl, key=f"perf_period_{_plbl}", width="stretch",
+                type="primary" if _plbl == _active_preset_lbl else "secondary",
+            ):
+                st.session_state["perf_date_start"] = _pstart
+                st.session_state["perf_date_end"]   = _today.date()
                 st.rerun()
 
-        # ── Controls: date pickers — value= driven by preset or previous input ──
+        # ── Controls: date pickers — no value= so Streamlit uses session_state
+        # exclusively (avoids double-set conflict with _ANA_PERSIST restores) ──
         _c1, _c2, _c3, _c4, _c5 = st.columns([2, 2, 2, 1, 1])
-        _default_start = _preset_start if _preset_start is not None else max(_DEFAULT_PERF_START.date(), t0.date())
-        _default_end   = _preset_end   if _preset_end   is not None else _today.date()
         _d_start = _c4.date_input(
             "From",
-            value=_default_start,
             min_value=t0.date(),
             max_value=_today.date(),
             key="perf_date_start",
         )
         _d_end = _c5.date_input(
             "To",
-            value=_default_end,
             min_value=t0.date(),
             max_value=_today.date(),
             key="perf_date_end",
@@ -3072,12 +3200,30 @@ def _render_perf_chart(
         _d_start_lbl = _d_start.strftime("%d-%b-%Y")
         _d_end_lbl   = _d_end.strftime("%d-%b-%Y")
 
+        # ── Full-period bdays for OPT P&L proxy (computed first — needed for back-calc) ──
+        bdays = pd.bdate_range(start=t0, end=_today)
+        cum_pnl = daily_pnl.reindex(bdays, fill_value=0.0).cumsum()
+        _cum_before_start = cum_pnl[cum_pnl.index <= _d_start_ts]
+        _cum_at_start    = float(_cum_before_start.iloc[-1]) if not _cum_before_start.empty else 0.0
+
         if _have_nav:
             _avail_before = _nav_series_full[_nav_series_full.index <= _d_start_ts]
-            starting_capital = (
-                float(_avail_before.iloc[-1]) if not _avail_before.empty
-                else float(_nav_series_full.iloc[0])
-            )
+            if not _avail_before.empty:
+                starting_capital = float(_avail_before.iloc[-1])
+                _start_nav_lbl   = _d_start_lbl
+            else:
+                # t0 predates flex_nav data; back-calculate NAV at t0 so the OPT P&L
+                # proxy is anchored to the correct baseline rather than the first
+                # available NAV (which may be years later and much larger).
+                _first_nav_ts       = _nav_series_full.index[0]
+                _first_nav_val      = float(_nav_series_full.iloc[0])
+                _cum_at_first_cands = cum_pnl[cum_pnl.index <= _first_nav_ts]
+                _cum_at_first       = (
+                    float(_cum_at_first_cands.iloc[-1])
+                    if not _cum_at_first_cands.empty else _cum_at_start
+                )
+                starting_capital = _first_nav_val - (_cum_at_first - _cum_at_start)
+                _start_nav_lbl   = f"{_first_nav_ts.strftime('%d-%b-%Y')} (est.)"
             _avail_at_end = _nav_series_full[_nav_series_full.index <= _d_end_ts]
             _ending_nav   = float(_avail_at_end.iloc[-1]) if not _avail_at_end.empty else None
             _period_gain  = (_ending_nav - starting_capital) if _ending_nav is not None else None
@@ -3086,7 +3232,7 @@ def _render_perf_chart(
                 if (_ending_nav is not None and starting_capital > 0) else None
             )
             _c1.metric(
-                f"Consolidated NAV ({_d_start_lbl})",
+                f"Consolidated NAV ({_start_nav_lbl})",
                 f"${starting_capital:,.0f}",
                 help="Flex consolidated NAV (US + SG) at the 'From' date.",
             )
@@ -3111,11 +3257,6 @@ def _render_perf_chart(
                 help="Consolidated NAV at the display start date — base for OPT P&L % chart.",
             )
 
-        # ── Full-period bdays for OPT P&L proxy ───────────────────────────
-        bdays = pd.bdate_range(start=t0, end=_today)
-        cum_pnl = daily_pnl.reindex(bdays, fill_value=0.0).cumsum()
-        _cum_before_start = cum_pnl[cum_pnl.index <= _d_start_ts]
-        _cum_at_start    = float(_cum_before_start.iloc[-1]) if not _cum_before_start.empty else 0.0
         options_nav_full = starting_capital + (cum_pnl - _cum_at_start)
 
         # NAV reindexed to bdays for bar chart
@@ -3328,44 +3469,48 @@ def _render_perf_chart(
                 hoverinfo="skip",
             ))
 
-        # All % lines on SECONDARY (right) axis — hover formatted natively by Plotly
+        # All % lines on SECONDARY (right) axis
         if _have_nav and not nav_index.empty:
             _nav_equiv = _nav_display.reindex(nav_index.index, method="ffill").values
+            _nav_text  = [f"{v:+.2f}%" for v in nav_index.values]
             fig.add_trace(go.Scatter(
                 x=nav_index.index, y=nav_index.values,
-                customdata=_nav_equiv,
+                customdata=_nav_equiv, text=_nav_text,
                 name="Consolidated", yaxis="y2",
                 line=dict(color="#a78bfa", width=2.5),
-                hovertemplate="%{y:+.2f}%  $%{customdata:,.0f}<extra>Consolidated</extra>",
+                hovertemplate="%{text}  $%{customdata:,.0f}<extra>Consolidated</extra>",
             ))
 
         if not opt_index.empty:
             _opt_equiv = _opt_display.reindex(opt_index.index, method="ffill").values
+            _opt_text  = [f"{v:+.2f}%" for v in opt_index.values]
             fig.add_trace(go.Scatter(
                 x=opt_index.index, y=opt_index.values,
-                customdata=_opt_equiv,
+                customdata=_opt_equiv, text=_opt_text,
                 name="OPT P&L", yaxis="y2",
                 line=dict(color="#60a5fa", width=1.5, dash="dash" if _have_nav else "solid"),
-                hovertemplate="%{y:+.2f}%  $%{customdata:,.0f}<extra>OPT P&L</extra>",
+                hovertemplate="%{text}  $%{customdata:,.0f}<extra>OPT P&L</extra>",
             ))
 
         if not spy_index.empty:
             spy_equiv = ((spy_index / 100.0 + 1.0) * starting_capital).values
+            _spy_text = [f"{v:+.2f}%" for v in spy_index.values]
             fig.add_trace(go.Scatter(
                 x=spy_index.index, y=spy_index.values,
-                customdata=spy_equiv,
+                customdata=spy_equiv, text=_spy_text,
                 name="SPY", yaxis="y2",
                 line=dict(color="#34d399", width=1.5),
-                hovertemplate="%{y:+.2f}%  $%{customdata:,.0f}<extra>SPY</extra>",
+                hovertemplate="%{text}  $%{customdata:,.0f}<extra>SPY</extra>",
             ))
         if not qqq_index.empty:
             qqq_equiv = ((qqq_index / 100.0 + 1.0) * starting_capital).values
+            _qqq_text = [f"{v:+.2f}%" for v in qqq_index.values]
             fig.add_trace(go.Scatter(
                 x=qqq_index.index, y=qqq_index.values,
-                customdata=qqq_equiv,
+                customdata=qqq_equiv, text=_qqq_text,
                 name="QQQ", yaxis="y2",
                 line=dict(color="#fbbf24", width=1.5, dash="dot"),
-                hovertemplate="%{y:+.2f}%  $%{customdata:,.0f}<extra>QQQ</extra>",
+                hovertemplate="%{text}  $%{customdata:,.0f}<extra>QQQ</extra>",
             ))
 
         # Cash markers on secondary % axis (at 0%) — full history so they show when zoomed out
@@ -3414,10 +3559,37 @@ def _render_perf_chart(
             return [_lo - _span * pad, _hi + _span * pad]
 
         _y1_range = _windowed_range([_bar_y])
-        _y2_range = _windowed_range(
-            [nav_index, opt_index, spy_index, qqq_index],
-            extra_vals=[0.0],  # keep zeroline in view
-        )
+
+        # Align y2 (%) so 0% sits at the same axis fraction as the starting NAV
+        # bar on y1. With y2_lo = -f·S and y2_hi = (1−f)·S, the zero-line
+        # overlaps the top of the first bar, and % lines visually track bar growth.
+        _y2_range = None
+        if _y1_range is not None and _have_nav:
+            _y1_lo, _y1_hi = _y1_range
+            _y1_span = _y1_hi - _y1_lo
+            if _y1_span > 0:
+                _f = (starting_capital - _y1_lo) / _y1_span
+                if 0.01 < _f < 0.99:
+                    _y2_pts = [0.0]
+                    for _s2 in [nav_index, opt_index, spy_index, qqq_index]:
+                        if _s2.empty:
+                            continue
+                        _w2 = _s2[(_s2.index >= _d_start_ts) & (_s2.index <= _d_end_ts)]
+                        _y2_pts.extend(_w2.dropna().tolist())
+                    _lo2, _hi2 = min(_y2_pts), max(_y2_pts)
+                    _spans2 = []
+                    if _f > 0 and _lo2 < 0:
+                        _spans2.append(-_lo2 / _f)
+                    if _f < 1 and _hi2 > 0:
+                        _spans2.append(_hi2 / (1.0 - _f))
+                    if _spans2:
+                        _S2 = max(_spans2) * 1.08
+                        _y2_range = [-_f * _S2, (1.0 - _f) * _S2]
+        if _y2_range is None:
+            _y2_range = _windowed_range(
+                [nav_index, opt_index, spy_index, qqq_index],
+                extra_vals=[0.0],
+            )
 
         _y1_title = "Consolidated NAV ($)" if _have_nav else "OPT NAV ($)"
         fig.update_layout(
@@ -3840,12 +4012,46 @@ def _build_live_context() -> dict:
                         .last()
                         .reset_index()
                     )
+                    import math as _math
+                    _daily_ret_full = (
+                        _nav_ts.pct_change()
+                        .replace([float("inf"), float("-inf")], float("nan"))
+                        .dropna()
+                    )
+                    _sharpe_full = (
+                        round(float(_daily_ret_full.mean() / _daily_ret_full.std() * _math.sqrt(252)), 2)
+                        if len(_daily_ret_full) >= 2 and _daily_ret_full.std() > 0 else None
+                    )
+                    _twr_full = round(float(_nav_ts.iloc[-1] / _nav_ts.iloc[0] - 1) * 100, 2)
+                    _norm_full = _nav_ts / _nav_ts.iloc[0]
+                    _max_dd_full = round(float((_norm_full / _norm_full.cummax() - 1.0).min() * 100), 2)
+
+                    _nav_2025 = _nav_ts[_nav_ts.index >= pd.Timestamp("2025-01-01")]
+                    _sharpe_2025 = _max_dd_2025 = None
+                    if len(_nav_2025) >= 2:
+                        _ret_2025 = (
+                            _nav_2025.pct_change()
+                            .replace([float("inf"), float("-inf")], float("nan"))
+                            .dropna()
+                        )
+                        _sharpe_2025 = (
+                            round(float(_ret_2025.mean() / _ret_2025.std() * _math.sqrt(252)), 2)
+                            if len(_ret_2025) >= 2 and _ret_2025.std() > 0 else None
+                        )
+                        _norm_2025 = _nav_2025 / _nav_2025.iloc[0]
+                        _max_dd_2025 = round(float((_norm_2025 / _norm_2025.cummax() - 1.0).min() * 100), 2)
+
                     context["nav_summary"] = {
-                        "current":           _current,
-                        "current_date":      str(_nav_ts.index[-1].date()),
-                        "ytd_return_pct":    round((_current / _at_ytd  - 1) * 100, 2) if _at_ytd  else None,
-                        "since_jan2025_pct": round((_current / _at_jan25 - 1) * 100, 2) if _at_jan25 else None,
-                        "monthly":           [
+                        "current":                        _current,
+                        "current_date":                   str(_nav_ts.index[-1].date()),
+                        "ytd_return_pct":                 round((_current / _at_ytd  - 1) * 100, 2) if _at_ytd  else None,
+                        "since_jan2025_pct":              round((_current / _at_jan25 - 1) * 100, 2) if _at_jan25 else None,
+                        "twr_full_pct":                   _twr_full,
+                        "sharpe_full":                    _sharpe_full,
+                        "max_drawdown_full_pct":          _max_dd_full,
+                        "sharpe_since_jan2025":           _sharpe_2025,
+                        "max_drawdown_since_jan2025_pct": _max_dd_2025,
+                        "monthly":                        [
                             (str(r.date.date()), int(round(r.nav)))
                             for _, r in _monthly_df.iterrows()
                         ],
@@ -4024,15 +4230,16 @@ def _render_llm_chat() -> None:
 # Layout
 # ---------------------------------------------------------------------------
 
-# Nav row: [header | tabs | account selector | spacer] — all fixed at top via CSS :has([stRadio])
-# Deploy button hidden via CSS; hamburger kept (dark-mode toggle is inside it).
-_hdr_c, _nav_c1, _acct_c, _spacer_c = st.columns([2, 3, 1, 2])
+# Nav row: [header | tabs | account selector | clock | refresh]
+# Fixed at top via CSS :has([stRadio]). On mobile (≤640 px) cols 1 (header) and
+# 4 (clock) are hidden, leaving Analysis/Orders · selector · ↺ on one line.
+_hdr_c, _nav_c1, _acct_c, _time_c, _refresh_c = st.columns([2, 3, 1, 2, 1])
 with _hdr_c:
     header()
 with _nav_c1:
     nav = st.radio(
         "Navigation",
-        ["Analysis", "Orders", "Diagnostics"],
+        ["Analysis", "Orders"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -4046,13 +4253,11 @@ with _acct_c:
         )
     elif _REAL_ACCOUNTS:
         st.caption(next(iter(_REAL_ACCOUNTS)))
-with _spacer_c:
-    _tc, _rc = st.columns([3, 2])
-    with _tc:
-        _nav_time()
-    with _rc:
-        if st.button("↺ Refresh", key="btn_nav_refresh", help="Reload all dashboard data"):
-            st.rerun()
+with _time_c:
+    _nav_time()
+with _refresh_c:
+    if st.button("↺", key="btn_nav_refresh", help="Reload all dashboard data"):
+        st.rerun()
 
 # Second fixed band: KPI table on top, Ask AI below — stacked in one full-width column.
 # A hidden marker div lets JS locate the outer stHorizontalBlock to pin.
@@ -4116,5 +4321,3 @@ elif nav == "Orders":
         render_orders()
     with _cfg_col:
         render_config_panel()
-elif nav == "Diagnostics":
-    render_diagnostics()

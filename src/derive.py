@@ -8,7 +8,7 @@ import time
 import numpy as np
 import pandas as pd
 from ib_async import Option, util
-from src.log_utils import setup_logging as _setup_logging
+from src.log_utils import setup_ib_logging, setup_logging as _setup_logging
 
 # pyrefly: ignore [missing-import]
 from src.build import (
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 _p = _ap.ArgumentParser(add_help=False)
 _p.add_argument("--debug", action="store_true")
 _setup_logging("derive", debug=_p.parse_known_args()[0].debug)
-util.logToFile(ROOT / "log" / "ib_async.log", level=40)
+setup_ib_logging(ROOT / "log" / "ib_async.log", level=logging.ERROR)
 del _ap, _p, _setup_logging
 
 # Start timing the script execution
@@ -153,6 +153,10 @@ df_unds = df_unds.merge(
     df_pf[df_pf.secType == "STK"][["symbol", "position", "avgCost"]], on="symbol", how="left"
 ).fillna({"position": 0, "avgCost": 0})
 
+if "mktPrice" in df_unds.columns and "price" in df_unds.columns:
+    df_unds["price"] = df_unds["price"].fillna(df_unds["mktPrice"])
+
+
 logger.info("Loaded %s underlyings", len(df_unds))
 logger.info("Loaded %s portfolio positions", len(df_pf))
 logger.info("Loaded %s chain entries", len(chains))
@@ -260,7 +264,9 @@ else:
         cov_calls = [
             Option(s, e, k, "C", "SMART")
             for s, e, k in zip(cc_long.symbol, cc_long.expiry, cc_long.strike)
+            if pd.notna(s) and pd.notna(e) and pd.notna(k)
         ]
+
 
         logger.info("Qualifying covered call contracts...")
         valid_contracts = qualify_me(ib, cov_calls, desc="Qualifying covered call contracts")
@@ -348,7 +354,9 @@ else:
         cov_puts = [
             Option(s, e, k, "P", "SMART")
             for s, e, k in zip(cp_short.symbol, cp_short.expiry, cp_short.strike)
+            if pd.notna(s) and pd.notna(e) and pd.notna(k)
         ]
+
 
         logger.info("Qualifying covered put contracts...")
         valid_contracts = qualify_me(ib, cov_puts, desc="Qualifying covered put contracts")
@@ -458,7 +466,9 @@ else:
             _monthly_opts = [
                 Option(s, e, k, "C", "SMART")
                 for s, e, k in zip(_mc_calls_df.symbol, _mc_calls_df.expiry, _mc_calls_df.strike)
+                if pd.notna(s) and pd.notna(e) and pd.notna(k)
             ]
+
 
             logger.info("Qualifying monthly CC contracts...")
             _valid_mc = qualify_me(ib, _monthly_opts, desc="Qualifying monthly CC contracts")
@@ -567,8 +577,9 @@ else:
     virg_puts = [
         Option(s, e, k, "P", "SMART")
         for s, e, k in zip(virg_short.symbol, virg_short.expiry, virg_short.strike)
-        if not pd.isna(k)
+        if pd.notna(s) and pd.notna(e) and pd.notna(k)
     ]
+
 
     df_nkd = pd.DataFrame()
 
@@ -777,10 +788,12 @@ else:
         )
 
         if not df_ul.empty:
+            df_ul = df_ul.dropna(subset=["symbol", "expiry", "strike"])
             df_ul["right"] = "P"
             df_ul["contract"] = df_ul.apply(
                 lambda x: Option(x.symbol, x.expiry, x.strike, x.right, "SMART"), axis=1
             )
+
 
             # Qualify contracts
             logger.info("Qualifying long protection contracts...")
@@ -854,10 +867,12 @@ else:
         )
 
         if not df_us.empty:
+            df_us = df_us.dropna(subset=["symbol", "expiry", "strike"])
             df_us["right"] = "C"
             df_us["contract"] = df_us.apply(
                 lambda x: Option(x.symbol, x.expiry, x.strike, x.right, "SMART"), axis=1
             )
+
 
             # Qualify contracts
             logger.info("Qualifying short protection contracts...")
@@ -990,11 +1005,13 @@ else:
     df_purl = pd.DataFrame()
 
     if not p.empty:
+        p = p.dropna(subset=["symbol", "expiry", "strike"])
         p["right"] = "P"
         # pyrefly: ignore [no-matching-overload]
         p["contract"] = p.apply(
             lambda x: Option(x.symbol, x.expiry, x.strike, x.right, "SMART"), axis=1
         )
+
 
         logger.info("Qualifying protecting put roll contracts...")
         valid_contracts = qualify_me(

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import math
+import sys
 import threading
 import time
 from collections import deque
@@ -288,7 +289,14 @@ class IBClient:
             self._loop.call_soon_threadsafe(self._subscribed.clear)
             self._loop.call_soon_threadsafe(self._mktdata_subs.clear)
         if self._loop and self._ib:
-            asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop)
+            # Wait for disconnect to complete so derive.py can immediately claim the CID.
+            # run_coroutine_threadsafe returns a concurrent.futures.Future; .result() blocks
+            # the calling thread (Streamlit) until the coroutine finishes or times out.
+            fut = asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop)
+            try:
+                fut.result(timeout=5.0)
+            except Exception:
+                pass
         with self._snap_lock:
             self._snap.connected = False
             self._snap.margins_as_of = None
@@ -490,10 +498,10 @@ class IBClient:
         #    raises "This event loop is already running" when called from a coroutine.)
         for acct in managed:
             try:
-                await asyncio.wait_for(self._ib.reqAccountUpdatesAsync(acct), timeout=15.0)
+                await asyncio.wait_for(self._ib.reqAccountUpdatesAsync(acct), timeout=5.0)
                 logger.info("Account updates subscribed for {}", self._mask(acct))
             except asyncio.TimeoutError:
-                logger.warning("reqAccountUpdatesAsync({}) timed out — continuing", self._mask(acct))
+                logger.info("reqAccountUpdatesAsync({}) timed out — continuing", self._mask(acct))
             except Exception as e:  # noqa: BLE001
                 logger.warning("reqAccountUpdatesAsync({}) failed: {}", self._mask(acct), e)
 
@@ -564,6 +572,13 @@ class IBClient:
         await self._resubscribe_market_data()
         self._bootstrapped = True
         logger.info("Bootstrap complete — live resubscription enabled")
+        print(
+            f"\n\033[92m🟢 Dashboard LIVE — {n} positions loaded. "
+            "Ready at http://localhost:8501\033[0m\n",
+            file=sys.stderr,
+            flush=True,
+        )
+
         self._margin_pending = True
         await self._fetch_what_if_margins()
 
@@ -971,7 +986,10 @@ class IBClient:
             return  # farm-connection chatter — not actionable
         with self._snap_lock:
             self._snap.errors.append((datetime.now(timezone.utc), errorCode, errorString))
+        if errorCode == 200:
+            return  # Record internally but suppress console log warning
         sym = getattr(contract, "symbol", None) if contract is not None else None
+
         if errorCode in _IBKR_PACING_CODES:
             # Pacing violations degrade data quality and indicate over-subscription.
             # Log at ERROR so they surface in dashboard.log even when scrolled past.

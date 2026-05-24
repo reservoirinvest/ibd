@@ -2,12 +2,22 @@
 # @@@ CAUTION: This script places orders @@@
 
 import os
+import sys
+import logging
 import pandas as pd
 import numpy as np
-from rich.progress import track
+from tqdm import tqdm
 from dotenv import find_dotenv, load_dotenv
 from typing import List
 from ib_async import LimitOrder
+
+# Suppress ib_async verbose dump for error 399 (order held until market open — not a failure).
+# We emit a compact summary in place_orders() instead.
+logging.getLogger("ib_async.ib").addFilter(
+    type("_NoValWarn", (logging.Filter,), {
+        "filter": lambda self, r: "IBKR API validation warning" not in r.getMessage()
+    })()
+)
 
 # Import from provided modules
 # pyrefly: ignore [missing-import]
@@ -70,15 +80,21 @@ def place_orders(cos: tuple, account_no: str = "", blk_size: int = 25) -> List:
     """CAUTION: This places trades in the system !!!"""
 
     trades = []
-
-    cobs = {cos[i : i + blk_size] for i in range(0, len(cos), blk_size)}
+    cobs = [cos[i : i + blk_size] for i in range(0, len(cos), blk_size)]
 
     with get_ib_connection("SNP", account_no=account_no) as ib:
-        for b in track(cobs, description="Executing orders"):
+        for b in tqdm(cobs, desc="Executing orders", file=sys.stderr):
             for c, o in b:
                 td = ib.placeOrder(c, o)
                 trades.append(td)
             ib.sleep(0.75)
+
+    held = [t for t in trades if t.orderStatus.status == "ValidationError"]
+    if held:
+        syms = ", ".join(t.contract.symbol for t in held[:5])
+        if len(held) > 5:
+            syms += f" +{len(held) - 5} more"
+        print(f"{len(held)} order(s) held until market open: {syms}", file=sys.stderr)
 
     return trades
 

@@ -80,7 +80,10 @@ current position details.
 - Consolidated NAV: month-end total portfolio value (US + SG accounts combined), sourced from \
 IBKR Flex EquitySummaryByReportDateInBase. Reflects full MTM including unrealized P&L, dividends, \
 interest, and FX. Provided as month-end values for the full available history (from ~2020) plus \
-YTD and since-Jan-2025 returns. Confirmed: Jan 1 2025 = $632,507; May 18 2026 = $954,938.
+YTD and since-Jan-2025 returns. Confirmed: Jan 1 2025 = $632,507; May 18 2026 = $954,938. \
+Performance KPIs pre-computed from daily NAV (Sharpe ratio full history and since Jan 2025, \
+max drawdown full history and since Jan 2025, TWR full history) are provided directly — \
+use those numbers as-is and do NOT attempt to re-derive them from the monthly closes.
 - SPY & QQQ benchmark monthly closes: price history from Jan 2020 (month-end closes in USD). \
 Use these to compare portfolio NAV growth against market benchmarks, compute cumulative returns, \
 or answer questions like "how did the portfolio compare to SPY since 2022?"
@@ -387,6 +390,17 @@ def _format_context(context: dict) -> str:
             lines.append(f"YTD return: {nav['ytd_return_pct']:+.2f}%")
         if nav.get("since_jan2025_pct") is not None:
             lines.append(f"Since 2025-01-01: {nav['since_jan2025_pct']:+.2f}%")
+        lines.append("Pre-computed KPIs (daily NAV — use these directly, do not re-derive from monthly closes):")
+        if nav.get("twr_full_pct") is not None:
+            lines.append(f"  TWR full history: {nav['twr_full_pct']:+.2f}%")
+        if nav.get("sharpe_full") is not None:
+            lines.append(f"  Sharpe ratio full history: {nav['sharpe_full']:.2f}  (annualised daily returns ×√252, no risk-free rate)")
+        if nav.get("max_drawdown_full_pct") is not None:
+            lines.append(f"  Max drawdown full history: {nav['max_drawdown_full_pct']:.2f}%")
+        if nav.get("sharpe_since_jan2025") is not None:
+            lines.append(f"  Sharpe ratio since 2025-01-01: {nav['sharpe_since_jan2025']:.2f}")
+        if nav.get("max_drawdown_since_jan2025_pct") is not None:
+            lines.append(f"  Max drawdown since 2025-01-01: {nav['max_drawdown_since_jan2025_pct']:.2f}%")
         if nav.get("monthly"):
             lines.append("Month-end NAV (full history):")
             for d, v in nav["monthly"]:

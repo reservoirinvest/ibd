@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import pickle
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -23,7 +24,7 @@ from dotenv import find_dotenv, load_dotenv
 from ib_async import IB, Contract, Stock
 from pyprojroot import here
 # pyrefly: ignore [untyped-import]
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -453,15 +454,9 @@ def qualify_stock_contracts(symbols: pd.Series, market: str = "SNP") -> list:
         contracts = [Stock(symbol, 'SMART', 'USD') for symbol in symbols]
         
         logger.info("Qualifying %s contracts via IBKR…", len(contracts))
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[green]{task.completed}[/green]/[cyan]{task.total}[/cyan]"),
-        ) as progress:
-            task = progress.add_task("[cyan]Qualifying symbols…", total=len(contracts))
+        with tqdm(total=len(contracts), desc="Qualifying symbols", unit="sym", leave=True, file=sys.stderr) as pbar:
             # pyrefly: ignore [not-iterable]
-            qualified, failed = ib.run(_qualify_batch(ib, contracts, lambda: progress.advance(task)))
+            qualified, failed = ib.run(_qualify_batch(ib, contracts, lambda: pbar.update(1)))
 
         logger.info("Qualified %s/%s contracts", len(qualified), len(contracts))
         if failed:
@@ -505,13 +500,7 @@ def qualify_me(
         # Calculate number of batches
         num_batches = (total_contracts + batch_size - 1) // batch_size
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[green]{task.completed}[/green]/[cyan]{task.total}[/cyan]"),
-        ) as progress:
-            task = progress.add_task(f"[cyan]{desc}…", total=num_batches)
+        with tqdm(total=total_contracts, desc=desc, unit="sym", leave=True, file=sys.stderr) as pbar:
             for batch_num in range(num_batches):
                 start_idx = batch_num * batch_size
                 end_idx = min(start_idx + batch_size, total_contracts)
@@ -549,12 +538,12 @@ def qualify_me(
                     logger.warning("IB socket disconnected — stopping qualification early")  # no args
                     remaining = contracts[end_idx:]
                     failed_total.extend(getattr(c, "symbol", repr(c)) for c in remaining)
-                    progress.advance(task)
+                    pbar.update(len(batch_contracts))
                     break
 
                 if batch_num < num_batches - 1:
                     ib.sleep(1)  # 1-second pause to avoid rate limiting
-                progress.advance(task)
+                pbar.update(len(batch_contracts))
 
         if failed_total:
             extra = f" + {len(failed_total) - 10} more" if len(failed_total) > 10 else ""
@@ -860,13 +849,7 @@ def get_volatilities_snapshot(
         # Process contracts in batches
         total_batches = (len(contracts) + batch_size - 1) // batch_size
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[green]{task.completed}[/green]/[cyan]{task.total}[/cyan]"),
-        ) as progress:
-            task = progress.add_task(f"[cyan]{desc}…", total=total_batches)
+        with tqdm(total=len(contracts), desc=desc, unit="sym", leave=True, file=sys.stderr) as pbar:
             for batch_num in range(total_batches):
                 start_idx = batch_num * batch_size
                 end_idx = min(start_idx + batch_size, len(contracts))
@@ -897,7 +880,7 @@ def get_volatilities_snapshot(
                         "iv": data.get("iv"),
                         "hv": data.get("hv"),
                     })
-                progress.advance(task)
+                pbar.update(len(batch_contracts))
 
         df = pd.DataFrame(all_vol_data)
         valid_ivs = df[df["iv"].notna()]
@@ -1031,13 +1014,7 @@ def get_option_chains(
         # Process contracts in batches
         total_batches = (len(contracts) + batch_size - 1) // batch_size
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[green]{task.completed}[/green]/[cyan]{task.total}[/cyan]"),
-        ) as progress:
-            task = progress.add_task("[cyan]Fetching option chains…", total=total_batches)
+        with tqdm(total=len(contracts), desc="Fetching option chains", unit="sym", leave=True, file=sys.stderr) as pbar:
             for batch_num in range(total_batches):
                 start_idx = batch_num * batch_size
                 end_idx = min(start_idx + batch_size, len(contracts))
@@ -1067,7 +1044,7 @@ def get_option_chains(
 
                 if batch_num < total_batches - 1:
                     ib.sleep(inter_batch_delay)
-                progress.advance(task)
+                pbar.update(len(batch_contracts))
 
         if failed_symbols:
             logger.info("Retrying %s failed symbols…", len(failed_symbols))
