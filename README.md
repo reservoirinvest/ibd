@@ -155,4 +155,4 @@ uv run python -c "from src.flex import fetch, parse, analyze; from src.backtest 
 
 - IBKR Gateway or TWS running with API enabled on the port in `snp_config.yml` (default 1300)
 - `127.0.0.1` in the TWS trusted IP list
-- Python 3.12 · `uv` package manager
+- Python 3.12+ · `uv` package manager
