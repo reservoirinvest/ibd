@@ -119,7 +119,7 @@ def _to_messages(history: list[dict]) -> list[dict]:
 
 
 def query_data(question: str, context: dict, history: list[dict] | None = None) -> str:
-    """Query portfolio data using Claude Haiku.
+    """Query portfolio data using the Anthropic API.
 
     Args:
         question: User question about the portfolio/data.
@@ -128,7 +128,7 @@ def query_data(question: str, context: dict, history: list[dict] | None = None) 
         history: Prior Q&A pairs as [{q, a}, ...] for multi-turn conversation.
 
     Returns:
-        Claude's response string.
+        The API response string.
 
     Raises:
         ValueError: If ANTHROPIC_API_KEY not in environment.

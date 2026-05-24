@@ -9,7 +9,7 @@ Implemented IBKR Flex Query pipeline + options backtest framework, wired into a 
 
 **Why:** User wants 5-year trade history analysis, symbol-specific strategy design, Greeks calculation, and backtesting — all using free tools (IBKR Flex + yfinance, no Alpaca/FMP).
 
-**How to apply:** When touching `src/flex/`, `src/backtest/`, or the History tab in `app.py`, refer to `.claude/skills/flex-backtest/SKILL.md` for field names, patterns, and portal setup steps.
+**How to apply:** When touching `src/flex/`, `src/backtest/`, or the History tab in `app.py`, refer to project documentation for field names, patterns, and portal setup steps.
 
 Key facts:
 - `ib_async.FlexReport` is already installed — use it, don't re-implement HTTP polling

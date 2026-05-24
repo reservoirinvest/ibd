@@ -192,13 +192,13 @@ def run() -> None:
                 "        2. The Trades section fields are not configured — in IBKR portal\n"
                 "           edit the query, expand 'Trades', and enable all required fields.\n"
                 "        3. The query has an account or asset-class filter excluding trades.\n"
-                "      See .claude/skills/flex-backtest/SKILL.md for the full field list."
+                "      See project documentation for the full field list."
             )
     else:
         print(
             "\nFAIL: <Trades> section missing from the XML entirely.\n"
             "      In IBKR portal edit your TradeHistory query:\n"
-            "        Sections -> enable 'Trades' and add all required fields (see SKILL.md)\n"
+            "        Sections -> enable 'Trades' and add all required fields.\n"
             "        General  -> Period = 'Last 365 Calendar Days'\n"
             "      Save and re-run this script."
         )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Example: Query pickled data using Claude.
+"""Example: Query pickled data using the LLM.
 
 Run:
     uv run python scripts/llm_query_example.py

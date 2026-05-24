@@ -1,4 +1,4 @@
-"""Backtest Expert scoring — adapted from tradermonty/claude-trading-skills.
+"""Backtest Expert scoring.
 
 Scores a strategy on 4 dimensions (0-25 each → 0-100 composite):
   sample_score     — trade count and density
