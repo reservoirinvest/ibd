@@ -572,15 +572,16 @@ class IBClient:
         await self._resubscribe_market_data()
         self._bootstrapped = True
         logger.info("Bootstrap complete — live resubscription enabled")
+
+        self._margin_pending = True
+        await self._fetch_what_if_margins()
+
         print(
             f"\n\033[92m🟢 Dashboard LIVE — {n} positions loaded. "
             "Ready at http://localhost:8501\033[0m\n",
             file=sys.stderr,
             flush=True,
         )
-
-        self._margin_pending = True
-        await self._fetch_what_if_margins()
 
         # Start health check for this connection generation. Each successful connect
         # increments _health_gen, which causes any older health check loop to exit.

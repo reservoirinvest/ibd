@@ -143,7 +143,7 @@ def query_data(question: str, context: dict, history: list[dict] | None = None) 
 
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=2000,
+        max_tokens=4096,
         system=system_prompt,
         messages=messages,
     )
@@ -182,7 +182,7 @@ def query_data_gemini(question: str, context: dict, history: list[dict] | None =
     response = client.models.generate_content(
         model="gemini-flash-latest",
         contents=contents,
-        config=types.GenerateContentConfig(system_instruction=system_prompt, max_output_tokens=2000),
+        config=types.GenerateContentConfig(system_instruction=system_prompt, max_output_tokens=8192),
     )
     # SDK returns None text when the response is empty or safety-blocked
     text = response.text
@@ -233,7 +233,7 @@ def query_data_deepseek(question: str, context: dict, history: list[dict] | None
                 *_to_messages(history or []),
                 {"role": "user", "content": question},
             ],
-            "max_tokens": 2000,
+            "max_tokens": 4096,
         },
         timeout=30,
     )
@@ -485,3 +485,4 @@ def _format_context(context: dict) -> str:
         )
 
     return "\n".join(lines)
+

@@ -96,7 +96,7 @@ def run() -> None:
         s  = status.text.strip()   if (status   is not None and status.text)   else "?"
         ec = err_code.text.strip() if (err_code is not None and err_code.text) else "?"
         em = err_msg.text.strip()  if (err_msg  is not None and err_msg.text)  else "?"
-        print(f"\nFAIL: IBKR returned an error response.")
+        print("\nFAIL: IBKR returned an error response.")
         print(f"  Status       : {s}")
         print(f"  ErrorCode    : {ec}")
         print(f"  ErrorMessage : {em}")
@@ -109,7 +109,7 @@ def run() -> None:
     to_dt   = flex_stmt.get("toDate",   "?") if flex_stmt is not None else "?"
     print(f"Date range: {from_dt} to {to_dt}")
 
-    print(f"\nXML structure (depth <= 4, child count = actual records at that level):")
+    print("\nXML structure (depth <= 4, child count = actual records at that level):")
     def _dump(node, depth=0, max_depth=4):
         indent = "  " * depth
         attrs  = " ".join(f"{k}={v!r}" for k, v in list(node.attrib.items())[:3])

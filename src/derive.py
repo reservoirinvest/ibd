@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 import pandas as pd
-from ib_async import Option, util
+from ib_async import Option
 from src.log_utils import setup_ib_logging, setup_logging as _setup_logging
 
 # pyrefly: ignore [missing-import]

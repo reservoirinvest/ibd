@@ -208,12 +208,7 @@ def _calendar(calls, puts, spot, iv, dte_near, exp_near, exp_far, pc="P") -> lis
     # near leg
     near_cr = _mid(row)
 
-    # far leg — fetch separately
-    try:
-        t_tmp = yf.Ticker(row.name if hasattr(row, "name") else "")
-    except Exception:
-        t_tmp = None
-    # We re-use the far chain fetched by the caller — pass as arg instead
+    # far leg — we re-use the chain fetched by the caller — pass as arg instead
     return [
         {"action": "SELL", "pc": pc, "strike": strike,
          "expiry": exp_near, "cr_dr": "CR", "price": near_cr, "qty": 1,

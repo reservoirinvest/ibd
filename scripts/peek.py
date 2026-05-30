@@ -20,7 +20,6 @@ from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 from rich import print as rprint
 
 ROOT = Path(__file__).resolve().parent.parent

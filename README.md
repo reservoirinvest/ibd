@@ -15,7 +15,7 @@ Real-time portfolio risk monitor and options strategy manager for IBKR accounts.
 ## Tabs
 
 ### Analysis
-- **Cumulative Performance chart** — portfolio TWR vs SPY/QQQ from inception; USD deposits stripped via time-weighted return. Period buttons: Focus, MTD, 1M, 3M, YTD, 1Y, 3Y, All. Deposit/withdrawal markers from Flex history. KPI cards: Realized OPT P&L, Consolidated TWR, Alpha vs SPY, Max Drawdown, Sharpe Ratio.
+- **Cumulative Performance chart** — portfolio TWR vs SPY/QQQ from inception; USD deposits stripped via time-weighted return. SGD deposits appear as markers but are excluded from TWR math (no FX rates). Period buttons: Focus, MTD, 1M, 3M, YTD, 1Y, 3Y, All. Deposit/withdrawal markers from Flex history. KPI cards: Realized OPT P&L, Consolidated TWR, Alpha vs SPY, Max Drawdown, Sharpe Ratio. Chart extends to today even on weekends/holidays (live IB NLV shown).
 - **Live positions** — filterable table of all current holdings with Greeks (delta, theta, vega per position). ITM Only and Weekly Only filters.
 - **Portfolio treemap** — market-value composition by symbol.
 - **Cover/Protect gaps** — assigned stock without a covered call, or unhedged positions needing a put.
@@ -146,7 +146,7 @@ Standalone: `uv run python scripts/update_symbol_categories.py`
 uv run ruff check .
 uv run pytest tests/ -q
 uv run python -c "from src.dashboard import settings, ib_client, state, risk, ohlc; print('dashboard ok')"
-uv run python -c "from src.flex import fetch, parse, analyze; from src.backtest import greeks, strategy, score; print('flex/backtest ok')"
+uv run python -c "from src.flex import fetch, parse, analyze; from src.backtest import score; print('flex/backtest ok')"
 ```
 
 ---

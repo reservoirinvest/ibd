@@ -2857,8 +2857,7 @@ def _render_symbol_deep_dive() -> None:
             hovermode="x unified",
             legend={
                 "orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0,
-                "bgcolor": "rgba(248, 249, 250, 0.82)",
-                "font": {"color": "#1e2130"},
+                "bgcolor": "rgba(0,0,0,0)",
             },
             margin={"l": 10, "r": 10, "t": 60, "b": 10},
             xaxis_rangeslider_visible=False,
@@ -3201,7 +3200,12 @@ def _render_perf_chart(
         _d_end_lbl   = _d_end.strftime("%d-%b-%Y")
 
         # ── Full-period bdays for OPT P&L proxy (computed first — needed for back-calc) ──
-        bdays = pd.bdate_range(start=t0, end=_today)
+        # Include today even if weekend/holiday so live NAV appears on the chart.
+        _bdays_core = pd.bdate_range(start=t0, end=_today)
+        bdays = (
+            _bdays_core.append(pd.DatetimeIndex([_today_ts]))
+            if _today_ts not in _bdays_core else _bdays_core
+        )
         cum_pnl = daily_pnl.reindex(bdays, fill_value=0.0).cumsum()
         _cum_before_start = cum_pnl[cum_pnl.index <= _d_start_ts]
         _cum_at_start    = float(_cum_before_start.iloc[-1]) if not _cum_before_start.empty else 0.0
@@ -3331,7 +3335,10 @@ def _render_perf_chart(
                 prev_val = nav_values[i]
 
             s = pd.Series(cum_perf, index=nav.index)
-            return s.reindex(pd.bdate_range(start_ts, end_ts), method="ffill").dropna()
+            _twr_bdays = pd.bdate_range(start_ts, end_ts)
+            if end_ts not in _twr_bdays:
+                _twr_bdays = _twr_bdays.append(pd.DatetimeIndex([end_ts]))
+            return s.reindex(_twr_bdays, method="ffill").dropna()
 
         # ── Clip & rebase (for OPT P&L, SPY, QQQ — no deposit adjustment) ─
         def _clip_rebase(series: pd.Series) -> pd.Series:
@@ -3601,7 +3608,7 @@ def _render_perf_chart(
                         "bordercolor": "#cbd5e1", "font_size": 11},
             legend={"orientation": "h", "yanchor": "bottom", "y": 1.02,
                     "xanchor": "center", "x": 0.5,
-                    "bgcolor": "rgba(248,249,250,0.82)", "font": {"color": "#1e2130"}},
+                    "bgcolor": "rgba(0,0,0,0)"},
             margin={"l": 10, "r": 60, "t": 40, "b": 10},
             yaxis=dict(
                 title=dict(text=_y1_title, font=dict(color="rgba(148,163,184,0.6)")),
