@@ -940,7 +940,12 @@ def render_orders() -> None:
 
     # ── Order Actions expander ────────────────────────────────────────────────
     with st.expander("⚙️ Order Actions", expanded=True, key="exp_ord_actions"):
-        gen_col, exec_col, clr_col, _btn_spacer = st.columns([2, 2, 2, 4])
+        st.caption(
+            "Daily flow: ── "
+            "Analysis → Generate OHLCs → Run Backtest → "
+            "**Generate Orders** → REFINE Overrides (below) → **Execute Orders**"
+        )
+        gen_col, deploy_chk_col, _btn_spacer, exec_col = st.columns([2, 2, 4, 2])
 
         # Generate Orders
         with gen_col:
@@ -971,6 +976,19 @@ def render_orders() -> None:
                 ages = [_pkl_age(n) for n in ["df_cov.pkl", "df_nkd.pkl", "df_reap.pkl"]]
                 age_str = ages[0] if len(set(ages)) == 1 else " | ".join(ages)
                 st.caption(f"Last: {age_str}")
+
+        # Sow filter — rendered after Execute col so widget key is defined once
+        with deploy_chk_col:
+            st.checkbox(
+                "Sow: DEPLOY only",
+                key="ord_sow_deploy_only",
+                value=True,
+                help=(
+                    "When ON, Sow shows DEPLOY symbols plus any REFINE symbols with active "
+                    "overrides set in the REFINE Overrides panel below. "
+                    "Toggle before executing to include/exclude REFINE symbols."
+                ),
+            )
 
         # Execute Orders
         with exec_col:
@@ -1017,57 +1035,6 @@ def render_orders() -> None:
                 )
                 st.session_state["execute_proc"] = exec_proc
                 logger.info("execute.py started pid={}", exec_proc.pid)
-
-        # Clear Data
-        with clr_col:
-            @st.dialog("⚠️ Confirm Clear Data", width="small")
-            def _confirm_clear(files: list[str]):
-                st.markdown(
-                    "The following files in `data/` will be **permanently deleted** "
-                    "(`data/master/` is kept):"
-                )
-                st.markdown("\n".join(f"- `{f}`" for f in files))
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("🗑️ Delete", width="stretch"):
-                        st.session_state["_clear_confirmed"] = True
-                        st.rerun()
-                with col2:
-                    if st.button("❌ Cancel", width="stretch"):
-                        st.rerun()
-
-            if st.button(
-                "🗑️ Clear Data",
-                width="stretch",
-                type="secondary",
-                help="Delete all top-level files in data/ (pickles, JSONs). "
-                     "data/master/ (OHLC store) is never deleted.",
-            ):
-                _files_to_clear = sorted(p.name for p in _DATA_DIR.iterdir() if p.is_file())
-                if _files_to_clear:
-                    _confirm_clear(_files_to_clear)
-                else:
-                    st.toast("No files to clear.")
-
-            if st.session_state.get("_clear_confirmed"):
-                st.session_state.pop("_clear_confirmed", None)
-                _cleared, _locked = [], []
-                for _p in sorted(_DATA_DIR.iterdir()):
-                    if not _p.is_file():
-                        continue
-                    try:
-                        _p.unlink()
-                        _cleared.append(_p.name)
-                    except PermissionError:
-                        _locked.append(_p.name)
-                if _cleared:
-                    st.toast(f"Cleared {len(_cleared)} file(s): {', '.join(_cleared)}")
-                if _locked:
-                    st.toast(
-                        f"⚠️ {', '.join(_locked)} still in use — retry in a moment",
-                        icon="⚠️",
-                    )
-            st.caption("Keeps OHLC store.")
 
         # ── Status row (derive + execute) ─────────────────────────────────────
         if frozen or "_derive_exit" in st.session_state or "_execute_exit" in st.session_state:
@@ -1129,6 +1096,64 @@ def render_orders() -> None:
         if "_execute_exit" in st.session_state:
             rc = st.session_state["_execute_exit"]
             _render_log_expander("📋 execute.py log", _EXECUTE_LOG, expanded=rc != 0)
+
+        # ── Advanced: Clear Data (optional fresh-start) ────────────────────────
+        # Protected files are never deleted (backtest results, overrides, backtest OHLC cache).
+        _CLEAR_PROTECTED = {"backtest_results.pkl", "backtest_ohlc.pkl", "symbol_overrides.json"}
+
+        @st.dialog("⚠️ Confirm Clear Data", width="small")
+        def _confirm_clear(files: list[str]):
+            st.markdown(
+                "The following derived files in `data/` will be **permanently deleted**. "
+                "Backtest results, REFINE overrides, and OHLC cache are **kept**."
+            )
+            st.markdown("\n".join(f"- `{f}`" for f in files))
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🗑️ Delete", width="stretch"):
+                    st.session_state["_clear_confirmed"] = True
+                    st.rerun()
+            with col2:
+                if st.button("❌ Cancel", width="stretch"):
+                    st.rerun()
+
+        with st.expander("Advanced", expanded=False):
+            st.caption(
+                "Use **Clear Data** only for a fresh start (e.g. malformed chains). "
+                "Deletes derived pkl files. Keeps backtest results, REFINE overrides, "
+                "OHLC cache, and data/master/."
+            )
+            _clr_adv_col, _ = st.columns([2, 6])
+            with _clr_adv_col:
+                if st.button("🗑️ Clear Data", width="stretch", type="secondary",
+                             key="btn_clr_data_adv"):
+                    _files_to_clear = sorted(
+                        p.name for p in _DATA_DIR.iterdir()
+                        if p.is_file() and p.name not in _CLEAR_PROTECTED
+                    )
+                    if _files_to_clear:
+                        _confirm_clear(_files_to_clear)
+                    else:
+                        st.toast("No files to clear.")
+
+            if st.session_state.get("_clear_confirmed"):
+                st.session_state.pop("_clear_confirmed", None)
+                _cleared, _locked = [], []
+                for _p in sorted(_DATA_DIR.iterdir()):
+                    if not _p.is_file() or _p.name in _CLEAR_PROTECTED:
+                        continue
+                    try:
+                        _p.unlink()
+                        _cleared.append(_p.name)
+                    except PermissionError:
+                        _locked.append(_p.name)
+                if _cleared:
+                    st.toast(f"Cleared {len(_cleared)} file(s): {', '.join(_cleared)}")
+                if _locked:
+                    st.toast(
+                        f"⚠️ {', '.join(_locked)} still in use — retry in a moment",
+                        icon="⚠️",
+                    )
 
     st.divider()
 
@@ -1345,18 +1370,16 @@ def render_orders() -> None:
         if n_nkd else "🌱 Sow — 0 orders"
     )
     with st.expander(nkd_label, expanded=True):
-        st.checkbox(
-            "DEPLOY only",
-            key="ord_sow_deploy_only",
-            value=True,
-            help=(
-                "When ON, shows DEPLOY symbols plus any REFINE symbols with active overrides "
-                "set in the REFINE Overrides panel below. "
-                "Run the backtest via Actions → 🧪 Run Backtest to populate verdicts."
-                + (f"  {len(_deploy_syms)} DEPLOY + {len(_refine_override_syms)} REFINE-override symbols."
-                   if _deploy_syms else "  No backtest results found — all symbols shown.")
-            ),
-        )
+        if _deploy_syms:
+            st.caption(
+                f"Filter: {len(_deploy_syms)} DEPLOY + {len(_refine_override_syms)} REFINE-override symbols"
+                if st.session_state.get("ord_sow_deploy_only", True)
+                else "Filter: off — all symbols shown"
+            )
+        elif not st.session_state.get("ord_sow_deploy_only", True):
+            st.caption("Filter: off — all symbols shown")
+        else:
+            st.caption("No backtest results — all symbols shown")
         if _raw_nkd.empty and _ok["cushion_breach"]:
             st.info(
                 "No sow suggestions as cushion is less. "
@@ -1528,7 +1551,7 @@ def render_refine_overrides() -> None:
         st.caption(
             "Per-symbol put-strike width override. "
             "**Override σ** replaces the global VIRGIN_PUT_STD_MULT for that symbol in the next derive run. "
-            "Tick **Use** to activate. "
+            "Tick **Use** → **Save** → then run **Generate Orders** to apply. "
             "**Suggested σ** = max(grid-optimal, config) — never tighter than global setting."
         )
 
@@ -1760,9 +1783,33 @@ def render_config_panel() -> None:
         st.number_input(_lbl("MINNAKEDOPTPRICE $", "MINNAKEDOPTPRICE"), min_value=0.0, step=0.25, format="%.2f",
                         key="cfg_minnaked",
                         help="Minimum option price to write a naked put")
+        _vqm_help = "Fraction of NLV per symbol allocated to naked puts"
+        try:
+            from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _vqm_bt_path  # noqa: PLC0415
+            import json as _vqm_json  # noqa: PLC0415
+            if _vqm_bt_path.exists():
+                _vqm_bt = pd.read_pickle(_vqm_bt_path)
+                _vqm_n_deploy = int((_vqm_bt["verdict"] == "DEPLOY").sum())
+                _vqm_n_refine_ovr = 0
+                _vqm_ovr_path = Path("data/symbol_overrides.json")
+                if _vqm_ovr_path.exists():
+                    _vqm_n_refine_ovr = len(
+                        _vqm_json.loads(_vqm_ovr_path.read_text(encoding="utf-8"))
+                        .get("VIRGIN_PUT_STD_MULT", {})
+                    )
+                _vqm_n = _vqm_n_deploy + _vqm_n_refine_ovr
+                if _vqm_n > 0:
+                    _vqm_rec = round(1.0 / _vqm_n, 3)
+                    _vqm_help += (
+                        f"\n\n**Recommended: {_vqm_rec:.3f}** "
+                        f"(1 ÷ {_vqm_n} sow symbols: "
+                        f"{_vqm_n_deploy} DEPLOY + {_vqm_n_refine_ovr} REFINE-override)"
+                    )
+        except Exception:
+            pass
         st.number_input("VIRGIN_QTY_MULT", min_value=0.0, step=0.005, format="%.3f",
                         key="cfg_virgin_qty_mult",
-                        help="Fraction of NLV per symbol allocated to naked puts")
+                        help=_vqm_help)
 
     st.divider()
 
@@ -1989,11 +2036,20 @@ def render_analysis() -> None:
 
     # ── Actions twistie ───────────────────────────────────────────────────────
     with st.expander("🛠 Actions", expanded=False, key="exp_ana_actions"):
-        _ohlc_btn_col, _trades_btn_col, _weeklies_btn_col, _clr_btn_col = st.columns(4)
+        st.caption(
+            "Daily flow: ── **Generate OHLCs** (auto-runs Update Trades) → **Run Backtest** → "
+            "then switch to Orders tab."
+        )
+        _bt_running = st.session_state.get("backtest_proc") is not None
+        _bt_proc: subprocess.Popen | None = st.session_state.get("backtest_proc")
+        if _bt_proc is not None and _bt_proc.poll() is not None:
+            st.session_state["_bt_exit"] = _bt_proc.poll()
+            st.session_state.pop("backtest_proc", None)
+            _bt_running = False
+        _ohlc_btn_col, _bt_btn_col, _bt_chk_col, _clr_btn_col = st.columns([2, 2, 2, 1])
         if _clr_btn_col.button("✕ Clear", key="btn_actions_clear", width="stretch"):
-            for _k in ("_ohlc_exit", "_weeklies_data", "_trades_exit", "llm_hist_cache"):
+            for _k in ("_ohlc_exit", "_trades_exit", "llm_hist_cache"):
                 st.session_state.pop(_k, None)
-            # Also clear finished proc references so _capture_exit doesn't re-add the exit keys.
             if not _ohlc_running:
                 st.session_state.pop("ohlc_proc", None)
             _tr = st.session_state.get("trades_proc")
@@ -2045,267 +2101,7 @@ def render_analysis() -> None:
             if not _ohlc_running and "_ohlc_exit" not in st.session_state:
                 st.caption(f"Last: {_pkl_age('', path=OHLC_PATH)}")
 
-        # ── Update Trades ─────────────────────────────────────────────────────────
-        _ut_running = st.session_state.get("trades_proc") is not None
-        if _trades_btn_col.button(
-            "🔄 Update Trades",
-            key="btn_flex_update",
-            type="primary" if _ut_running else "secondary",
-            help=(
-                "Merges all available sources into flex_trades.pkl — never erases history.\n\n"
-                "Sources tried in order:\n"
-                "1. API — IBKR Flex Web Service (requires TOKEN + TRADES_FLEXID in .env and portal "
-                "query period set to 'Last 365 Calendar Days').\n"
-                "2. XML — any *.xml files in data/master/ (manual portal download, e.g. 2024.xml).\n\n"
-                "API response is trimmed to 3 days before the pkl's most-recent entry so only "
-                "recent rows are reprocessed; XML files are always merged in full. "
-                "Both sources are deduplicated before saving."
-            ),
-            width="stretch",
-        ):
-            with st.spinner("Updating flex_trades.pkl…"):
-                from src.flex.fetch import load_xml
-                _sources: list[pd.DataFrame] = []
-                _log: list[str] = []
-
-                _pkl_max_dt: pd.Timestamp | None = None
-                if flex_path.exists():
-                    try:
-                        _df_ex = pd.read_pickle(flex_path)
-                        if not _df_ex.empty and "dateTime" in _df_ex.columns:
-                            _t = _df_ex["dateTime"].max()
-                            _pkl_max_dt = _t if pd.notna(_t) else None
-                    except Exception:
-                        pass
-
-                if _api_ready:
-                    try:
-                        df_api = mask_accounts(normalize(download_trades(token, qid)), _acct_map)
-                        if df_api.empty:
-                            _log.append(
-                                "— API: 0 rows returned. In IBKR portal edit your Flex Query → "
-                                "set Period to **Last 365 Calendar Days** (not Custom Date Range)."
-                            )
-                        else:
-                            if _pkl_max_dt is not None and "dateTime" in df_api.columns:
-                                _cutoff = _pkl_max_dt - pd.Timedelta(days=3)
-                                df_api = df_api[df_api["dateTime"] >= _cutoff]
-                            _sources.append(df_api)
-                            _log.append(f"✓ API: {len(df_api):,} rows")
-                    except Exception as _e:
-                        _log.append(f"✗ API: {_e}")
-                else:
-                    _log.append("— API: skipped (TOKEN / TRADES_FLEXID not in .env)")
-
-                try:
-                    raw = load_xml(_MASTER_DIR)
-                    df_xml = mask_accounts(normalize(raw), _acct_map)
-                    if not df_xml.empty:
-                        _n_xml = len(sorted(_MASTER_DIR.glob("*.xml")))
-                        _sources.append(df_xml)
-                        _log.append(f"✓ XML: {len(df_xml):,} rows from {_n_xml} file(s)")
-                except FileNotFoundError:
-                    _log.append("— XML: no flex_*.xml files in data/master/")
-                except Exception as _e:
-                    _log.append(f"✗ XML: {_e}")
-
-                _cash_sources: list[pd.DataFrame] = []
-                if _api_ready:
-                    try:
-                        _df_cash_api = mask_accounts(
-                            normalize_cash(download_cash_transactions(token, qid)), _acct_map
-                        )
-                        if not _df_cash_api.empty:
-                            _cash_sources.append(_df_cash_api)
-                            _log.append(f"✓ Cash API: {len(_df_cash_api):,} rows")
-                        else:
-                            _log.append(
-                                "— Cash API: 0 rows (add 'Cash Transactions' section to your "
-                                "Flex Query in IBKR portal → Reports → Flex Queries → edit → Sections)"
-                            )
-                    except Exception as _ce:
-                        _log.append(f"✗ Cash API: {_ce}")
-                try:
-                    _df_cash_xml = mask_accounts(
-                        normalize_cash(load_cash_xml(_MASTER_DIR)), _acct_map
-                    )
-                    if not _df_cash_xml.empty:
-                        _cash_sources.append(_df_cash_xml)
-                        _log.append(f"✓ Cash XML: {len(_df_cash_xml):,} rows")
-                except Exception:
-                    pass
-                if _cash_sources:
-                    merge_cash_into_pickle(
-                        pd.concat(_cash_sources, ignore_index=True), cash_path
-                    )
-
-                _nav_sources: list[pd.DataFrame] = []
-                if _api_ready:
-                    try:
-                        _df_nav_api = download_nav(token, qid)
-                        if not _df_nav_api.empty:
-                            _nav_sources.append(_df_nav_api)
-                            _log.append(f"✓ NAV API: {len(_df_nav_api):,} daily rows")
-                        else:
-                            _log.append(
-                                "— NAV API: 0 rows (add 'Equity Summary by Report Date in Base Currency' "
-                                "section to your Flex Query)"
-                            )
-                    except Exception as _ne:
-                        _log.append(f"✗ NAV API: {_ne}")
-                try:
-                    _df_nav_xml = load_nav_xml(_MASTER_DIR)
-                    if not _df_nav_xml.empty:
-                        _nav_sources.append(_df_nav_xml)
-                        _log.append(f"✓ NAV XML: {len(_df_nav_xml):,} daily rows")
-                except Exception as _ne:
-                    _log.append(f"✗ NAV XML: {_ne}")
-                if _nav_sources:
-                    merge_nav_into_pickle(
-                        pd.concat(_nav_sources, ignore_index=True), nav_path
-                    )
-                elif not _api_ready:
-                    _log.append(
-                        "— NAV: no EquitySummaryByReportDateInBase data in XMLs "
-                        "(add 'Equity Summary by Report Date in Base Currency' section to your Flex Query)"
-                    )
-
-                if _sources:
-                    _before = len(pd.read_pickle(flex_path)) if flex_path.exists() else 0
-                    df_combined = pd.concat(_sources, ignore_index=True)
-                    df_merged = merge_into_pickle(df_combined, flex_path)
-                    if _acct_map:
-                        df_merged = mask_accounts(df_merged, _acct_map)
-                        df_merged.to_pickle(flex_path)
-                    _added = len(df_merged) - _before
-                    st.success(
-                        f"Updated — **{len(df_merged):,}** rows total (**{_added:+,}** new).\n\n"
-                        + "  \n".join(_log)
-                    )
-                    st.session_state.pop("llm_hist_cache", None)
-                else:
-                    st.warning("No data found from any source.")
-                    for _msg in _log:
-                        st.caption(_msg)
-                    st.info(
-                        "**Option A — API (routine updates, no file download):**\n"
-                        "1. IBKR Portal → Reports → Flex Queries → find `TradeHistory`\n"
-                        "2. Edit → set **Period** to `Last 365 Calendar Days` → Save\n"
-                        "3. Add TOKEN + TRADES_FLEXID to `.env`\n\n"
-                        "**Option B — Manual XML (one-time or gap fills):**\n"
-                        "1. Portal → run query, Period = Custom Date Range, Format = XML\n"
-                        "2. Save as `data/master/2024.xml`, `2025.xml`, etc. (one file per year)\n"
-                        "3. Click **🔄 Update Trades** again"
-                    )
-
-        with _weeklies_btn_col:
-            if st.button(
-                "🗓 Identify Weeklies",
-                key="btn_identify_weeklies",
-                help=(
-                    "Classifies all S&P 500 symbols as weekly or monthly based on the option chain data "
-                    "from the last build. Saves data/master/symbol_categories.pkl.\n\n"
-                    "Run weekly (or after each build) to keep the monthly-only list current. "
-                    "derive.py uses this to exclude monthly-only symbols from sow candidates and to "
-                    "generate breakeven covered calls for monthly-only held stocks.\n\n"
-                    "Press once to run and show results; press again to hide."
-                ),
-                width="stretch",
-            ):
-                if "_weeklies_data" in st.session_state:
-                    st.session_state.pop("_weeklies_data", None)
-                else:
-                    with st.spinner("Classifying weekly/monthly symbols…"):
-                        from scripts.update_symbol_categories import classify_weeklies
-                        _cat_chains = _MASTER_DIR.parent.parent / "data" / "df_chains.pkl"
-                        if not _cat_chains.exists():
-                            st.error("df_chains.pkl not found — run Generate Orders (build) first.")
-                        else:
-                            _cat_df = pd.read_pickle(_cat_chains)
-                            _sym_cat = classify_weeklies(_cat_df)
-                            _sym_cat.to_pickle(_MASTER_DIR / "symbol_categories.pkl")
-                            _n_weekly  = int(_sym_cat["is_weekly"].sum())
-                            _n_monthly = int((~_sym_cat["is_weekly"]).sum())
-                            _monthly_list = sorted(_sym_cat.loc[~_sym_cat["is_weekly"], "symbol"].tolist())
-                            st.session_state["_weeklies_data"] = {
-                                "n_weekly": _n_weekly,
-                                "n_monthly": _n_monthly,
-                                "monthly_list": _monthly_list,
-                            }
-
-        # ── Result displays ────────────────────────────────────────────────────────
-        # OHLC status
-        if _ohlc_running:
-            _op, _ol = _ohlc_progress()
-            st.progress(_op, text=f"⏳ {_ol}")
-        elif "_ohlc_exit" in st.session_state:
-            _ohlc_rc = st.session_state["_ohlc_exit"]
-            if _ohlc_rc == 0:
-                st.success("✅ OHLCs up to date")
-            else:
-                st.error(f"❌ OHLC fetch failed (exit {_ohlc_rc})")
-        if _ohlc_running:
-            _ohlc_live = _ohlc_log_lines(30)
-            if _ohlc_live:
-                st.code("\n".join(_strip_ansi(ln) for ln in _ohlc_live), language=None)
-        if "_ohlc_exit" in st.session_state:
-            _ohlc_post_rc = st.session_state["_ohlc_exit"]
-            _render_log_expander("📋 OHLC log", _OHLC_LOG, expanded=_ohlc_post_rc != 0)
-
-        # Auto Update Trades status (triggered after OHLC)
-        if st.session_state.get("trades_proc") is not None:
-            st.info("⏳ Update Trades running in background…")
-        elif "_trades_exit" in st.session_state:
-            _ut_rc = st.session_state["_trades_exit"]
-            if _ut_rc == 0:
-                st.success("✅ Update Trades completed (auto-triggered after OHLC)")
-            else:
-                st.error(f"❌ Update Trades failed (exit {_ut_rc})")
-
-        # Update Trades caption
-        _warn = []
-        if not _api_ready:
-            _warn.append("⚠ TOKEN / TRADES_FLEXID not set — API disabled")
-        st.caption("  ".join(_warn) if _warn else f"flex_trades.pkl — {_pkl_age('', path=flex_path)}")
-
-        # Identify Weeklies result
-        if "_weeklies_data" in st.session_state:
-            _wd = st.session_state["_weeklies_data"]
-            _ml = _wd["monthly_list"]
-            st.success(
-                f"symbol_categories.pkl saved — {_wd['n_weekly']} weekly, "
-                f"**{_wd['n_monthly']} monthly-only** (shown below)."
-            )
-            if _ml:
-                _ncols = 10
-                _nrows = (_wd["n_monthly"] + _ncols - 1) // _ncols
-                _padded = _ml + [""] * (_nrows * _ncols - _wd["n_monthly"])
-                # Row numbers: 1-based, each covers _ncols symbols
-                _row_nums = [str(i * _ncols + 1) for i in range(_nrows)]
-                _tbl = pd.DataFrame(
-                    [_padded[i * _ncols : (i + 1) * _ncols] for i in range(_nrows)],
-                    columns=[f"_{i}" for i in range(_ncols)],
-                )
-                _tbl.insert(0, "#", _row_nums)
-                st.dataframe(
-                    _tbl,
-                    hide_index=True,
-                    column_config={
-                        "#": st.column_config.TextColumn("#", width="small"),
-                        **{f"_{i}": st.column_config.TextColumn("") for i in range(_ncols)},
-                    },
-                )
-
-        # ── Synthetic Backtest ────────────────────────────────────────────────────
-        st.divider()
-        _bt_col, _bt_opt_col, _bt_spacer = st.columns([2, 2, 6])
-        _bt_running = st.session_state.get("backtest_proc") is not None
-        _bt_proc: subprocess.Popen | None = st.session_state.get("backtest_proc")
-        if _bt_proc is not None and _bt_proc.poll() is not None:
-            st.session_state["_bt_exit"] = _bt_proc.poll()
-            st.session_state.pop("backtest_proc", None)
-
-        with _bt_opt_col:
+        with _bt_chk_col:
             _force_ohlc = st.checkbox(
                 "Force-refresh OHLC",
                 key="chk_bt_refresh_ohlc",
@@ -2317,7 +2113,7 @@ def render_analysis() -> None:
                 ),
             )
 
-        with _bt_col:
+        with _bt_btn_col:
             if st.button(
                 "🧪 Run Backtest",
                 key="btn_run_backtest",
@@ -2350,6 +2146,40 @@ def render_analysis() -> None:
             from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _BT_RESULTS
             if not _bt_running and "_bt_exit" not in st.session_state:
                 st.caption(f"Last: {_pkl_age('', path=_BT_RESULTS)}")
+
+        # ── Result displays ────────────────────────────────────────────────────────
+        # OHLC status
+        if _ohlc_running:
+            _op, _ol = _ohlc_progress()
+            st.progress(_op, text=f"⏳ {_ol}")
+        elif "_ohlc_exit" in st.session_state:
+            _ohlc_rc = st.session_state["_ohlc_exit"]
+            if _ohlc_rc == 0:
+                st.success("✅ OHLCs up to date")
+            else:
+                st.error(f"❌ OHLC fetch failed (exit {_ohlc_rc})")
+        if _ohlc_running:
+            _ohlc_live = _ohlc_log_lines(30)
+            if _ohlc_live:
+                st.code("\n".join(_strip_ansi(ln) for ln in _ohlc_live), language=None)
+        if "_ohlc_exit" in st.session_state:
+            _ohlc_post_rc = st.session_state["_ohlc_exit"]
+            _render_log_expander("📋 OHLC log", _OHLC_LOG, expanded=_ohlc_post_rc != 0)
+
+        # Update Trades status (auto-triggered after OHLC)
+        if st.session_state.get("trades_proc") is not None:
+            st.info("⏳ Update Trades running in background…")
+        elif "_trades_exit" in st.session_state:
+            _ut_rc = st.session_state["_trades_exit"]
+            if _ut_rc == 0:
+                st.success("✅ Update Trades completed")
+            else:
+                st.error(f"❌ Update Trades failed (exit {_ut_rc})")
+        else:
+            _warn = []
+            if not _api_ready:
+                _warn.append("⚠ TOKEN / TRADES_FLEXID not set — API disabled")
+            st.caption("  ".join(_warn) if _warn else f"flex_trades.pkl — {_pkl_age('', path=flex_path)}")
 
         # Backtest status / results — rendered by auto-refreshing fragment
         _bt_status_fragment()
@@ -4641,7 +4471,7 @@ def _build_live_context() -> dict:
 def _render_llm_chat() -> None:
     """Compact Ask AI dock: always visible, one row of controls + cached response."""
     _prov_w = max(len(p) for p in _PROVIDER_HINTS)  # chars in longest provider name
-    p_col, q_col, c_col = st.columns([_prov_w * 0.13, 8 - _prov_w * 0.13 - 0.5, 0.5])
+    p_col, q_col, s_col, c_col = st.columns([_prov_w * 0.13, 8 - _prov_w * 0.13 - 1.0, 0.5, 0.5])
 
     provider = p_col.selectbox(
         "Provider",
@@ -4658,18 +4488,23 @@ def _render_llm_chat() -> None:
         label_visibility="collapsed",
     )
 
+    # ▶ send button: forces re-query even when question/provider unchanged (e.g. after model switch)
+    _submit_ver = st.session_state.get("llm_submit_ver", 0)
+    if s_col.button("▶", key="llm_send", help="Submit", width="stretch"):
+        st.session_state["llm_submit_ver"] = _submit_ver + 1
+        st.rerun()
+
     if c_col.button("✕", key="llm_clr", help="Clear", width="stretch"):
         st.session_state["llm_q_ver"] = _qver + 1
         st.session_state.pop("llm_response", None)
         st.session_state.pop("llm_last_q", None)
         st.session_state.pop("llm_last_prov", None)
+        st.session_state.pop("llm_submit_ver", None)
         st.rerun()
 
-    # Only query when the question or provider actually changes (not on every fragment tick)
-    if question and (
-        question != st.session_state.get("llm_last_q")
-        or provider != st.session_state.get("llm_last_prov")
-    ):
+    # Query when question changes (Enter in text box) OR ▶ was explicitly clicked
+    _forced = _submit_ver != st.session_state.get("llm_last_submit_ver", 0)
+    if question and (question != st.session_state.get("llm_last_q") or _forced):
         _prev_hist: list[dict] = st.session_state.get("llm_history", [])
         with st.spinner(f"{provider}…"):
             try:
@@ -4686,6 +4521,7 @@ def _render_llm_chat() -> None:
                 st.session_state["llm_response"] = f"⚠️ {e}"
             st.session_state["llm_last_q"] = question
             st.session_state["llm_last_prov"] = provider
+            st.session_state["llm_last_submit_ver"] = _submit_ver
 
     if cached := st.session_state.get("llm_response"):
         _last_q = st.session_state.get("llm_last_q", "")
