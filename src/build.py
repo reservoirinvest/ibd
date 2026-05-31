@@ -958,10 +958,9 @@ async def get_an_option_chain(item: Contract, ib: IB, sleep_time: int = 2):
             timeout=sleep_time,
         )
 
-        if chain:
-            chain = chain[-1] if isinstance(chain, list) else chain
-
-        return chain
+        if not chain:
+            return None
+        return chain[-1] if isinstance(chain, list) else chain
 
     except asyncio.TimeoutError:
         logger.error(f"Timeout occurred while getting option chain for {item.symbol}")
@@ -1122,6 +1121,9 @@ def calculate_atm_margin(row, chains_df, target_dte):
     if pd.isna(und_price) or pd.isna(iv):
         return None
     
+    if chains_df.empty or 'symbol' not in chains_df.columns:
+        return None
+
     # Filter chains_df for the current symbol
     symbol_chains = chains_df[chains_df['symbol'] == symbol]
     
@@ -1170,12 +1172,41 @@ def chains_n_unds(msg: bool = False):
     # Get option chains for qualified contracts
     chain_path = ROOT / 'data' / 'df_chains.pkl'
     df_chains_check = get_pickle(chain_path)
-    if do_i_refresh(my_path=chain_path, max_days=1) or df_chains_check is None or (isinstance(df_chains_check, pd.DataFrame) and df_chains_check.empty):
+    _chains_check_syms = (
+        df_chains_check["symbol"].nunique()
+        if (isinstance(df_chains_check, pd.DataFrame) and not df_chains_check.empty and "symbol" in df_chains_check.columns)
+        else 0
+    )
+    _chains_incomplete = _chains_check_syms < len(qualified_contracts)
+    if do_i_refresh(my_path=chain_path, max_days=1) or df_chains_check is None or (isinstance(df_chains_check, pd.DataFrame) and df_chains_check.empty) or _chains_incomplete:
+        if _chains_incomplete and _chains_check_syms > 0:
+            logger.warning(
+                "df_chains incomplete (%d/%d symbols) — re-fetching",
+                _chains_check_syms, len(qualified_contracts),
+            )
         # pyrefly: ignore [bad-argument-type]
         df_chains = get_option_chains(qualified_contracts, market="SNP", batch_size=50)
-        pickle_me(df_chains, file_path=chain_path)
+        if not df_chains.empty and 'symbol' in df_chains.columns:
+            pickle_me(df_chains, file_path=chain_path)
+        else:
+            logger.warning("get_option_chains returned no usable data — keeping existing pickle")
+            _existing = get_pickle(path=chain_path, print_msg=msg)
+            df_chains = _existing if (_existing is not None and not _existing.empty) else pd.DataFrame()
     else:
         df_chains = get_pickle(path=chain_path, print_msg=msg)
+
+    # Integrity check: warn if chains coverage is materially below symbols list
+    _n_syms = len(qualified_contracts)
+    _n_chains = df_chains["symbol"].nunique() if (not df_chains.empty and "symbol" in df_chains.columns) else 0
+    if _n_chains == 0:
+        logger.error("df_chains has NO symbols — downstream covered-call generation will be skipped")
+    elif _n_chains < _n_syms:
+        logger.warning(
+            "df_chains coverage %d/%d symbols (%.0f%%) — some covered-call candidates may be missed",
+            _n_chains, _n_syms, 100 * _n_chains / _n_syms,
+        )
+    else:
+        logger.info("df_chains coverage %d/%d symbols — OK", _n_chains, _n_syms)
 
     # Get price with volatilities and margins for qualified contracts
     # pyrefly: ignore [bad-argument-type]

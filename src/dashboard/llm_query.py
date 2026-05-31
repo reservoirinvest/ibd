@@ -94,6 +94,14 @@ year. Use these to understand capital injections, income, and to cross-check NAV
 monthly/quarterly expiries (gap ≥20 days). Any symbol NOT in that list has weekly or near-weekly \
 expiries. Lookup rule: to answer "is X weekly?" — if X is absent from the monthly-only list → \
 YES (weekly); if X appears in the list → NO (monthly-only).
+- Synthetic backtest: per-symbol 5-year OHLC simulation of the wheel strategy at the current \
+config values (COVER_STD_MULT, VIRGIN_PUT_STD_MULT). Verdict is CSP-driven — DEPLOY means the \
+put leg had >=70% win rate and PF>=1.0 over 3+ years; REFINE means marginal CSP edge; ABANDON \
+means CSP was a net loser at these settings. score is the CC-leg BacktestExpert composite (0–100, \
+reference only — structural ceiling ~74 with 5yr monthly data). cc_pf and csp_pf are profit \
+factors; cc_wr% and csp_wr% are win rates. Use this to identify which symbols suit the wheel \
+at the current settings, cross-reference with per-symbol trade history for actual vs simulated \
+performance, and recommend new symbols to sow or avoid.
 - IB commissions: total_commissions_usd in global_stats is the sum of ibCommission for all trades \
 in the Flex history (negative = cost paid to IBKR). Taxes are not separately tracked in the Flex \
 export.
@@ -380,6 +388,25 @@ def _format_context(context: dict) -> str:
                 f"{r['sym']},{r['score']},{r['verdict']},{r['n']},{r['wr%']}%,"
                 f"{r['pf']},{r['yrs']},{r['sample']},{r['expect']},{r['risk']},{r['robust']},"
                 f"{r['flags']}"
+            )
+
+    if "synthetic_backtest" in context:
+        syn: list[dict] = context["synthetic_backtest"]
+        lines.append(
+            "\n=== Synthetic Backtest — Per Symbol "
+            "(5yr OHLC simulation at configured COVER_STD_MULT / VIRGIN_PUT_STD_MULT) ==="
+        )
+        lines.append(
+            "Verdict driven by CSP leg (real assignment risk): "
+            "DEPLOY=CSP win%>=70 & PF>=1.0 & 3+yr  "
+            "REFINE=CSP win%>=55 & PF>=0.85  ABANDON=below thresholds"
+        )
+        lines.append("sym,verdict,score,cc_pf,cc_wr%,csp_pf,csp_wr%,years")
+        for r in syn:
+            lines.append(
+                f"{r['sym']},{r['verdict']},{r['score']},"
+                f"{r['cc_pf']},{r['cc_wr']},"
+                f"{r['csp_pf']},{r['csp_wr']},{r['years']}"
             )
 
     if "nav_summary" in context:

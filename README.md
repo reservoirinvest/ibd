@@ -89,7 +89,7 @@ GEMINI_API_KEY=...       # for Gemini provider
 DEEPSEEK_API_KEY=...     # for DeepSeek provider (default)
 ```
 
-`TOKEN` and `TRADES_FLEXID` are required for **🔄 Update Trades**. See portal setup and the one-time XML bootstrap process.
+`TOKEN` and `TRADES_FLEXID` are required for **🔄 Update Trades**. See [docs/flex_query_setup.md](docs/flex_query_setup.md) for portal setup and the one-time XML bootstrap process.
 
 ---
 

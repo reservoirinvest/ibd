@@ -561,16 +561,34 @@ else:
     v_std = config.get("VIRGIN_PUT_STD_MULT", 3)
     no_of_options = 4
 
+    # Per-symbol VIRGIN_PUT_STD_MULT overrides (set via dashboard REFINE Overrides panel)
+    import json as _json_mod
+    _overrides_file = ROOT / "data" / "symbol_overrides.json"
+    _sym_put_mult: dict[str, float] = {}
+    if _overrides_file.exists():
+        try:
+            _sym_put_mult = _json_mod.loads(
+                _overrides_file.read_text(encoding="utf-8")
+            ).get("VIRGIN_PUT_STD_MULT", {})
+            if _sym_put_mult:
+                logger.info("Per-symbol put-mult overrides active: %s", list(_sym_put_mult.keys()))
+        except Exception:
+            pass
+
+    def _closest_put(x: pd.DataFrame) -> pd.DataFrame:
+        _v = _sym_put_mult.get(x["symbol"].iloc[0], v_std)
+        return (
+            x[x["strike"] < x["undPrice"] - _v * x["sdev"]]
+            .assign(diff=abs(x["strike"] - (x["undPrice"] - _v * x["sdev"])))
+            .sort_values("diff")
+            .head(no_of_options)
+        )
+
     df_virg = df_virg.sort_values(["symbol", "expiry", "strike"], ascending=[True, True, False])
 
     virg_short = (
         df_virg.groupby(["symbol", "expiry"])[["symbol", "expiry", "strike", "undPrice", "sdev"]]
-        .apply(
-            lambda x: x[x["strike"] < x["undPrice"] - v_std * x["sdev"]]
-            .assign(diff=abs(x["strike"] - (x["undPrice"] - v_std * x["sdev"])))
-            .sort_values("diff")
-            .head(no_of_options)
-        )
+        .apply(_closest_put)
         .drop(columns=["level_2", "diff"], errors="ignore")
     )
 

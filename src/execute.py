@@ -12,8 +12,9 @@ from typing import List
 from ib_async import LimitOrder
 
 # Suppress ib_async verbose dump for error 399 (order held until market open — not a failure).
+# Message originates in ib_async.wrapper; filter on parent covers all sub-loggers.
 # We emit a compact summary in place_orders() instead.
-logging.getLogger("ib_async.ib").addFilter(
+logging.getLogger("ib_async").addFilter(
     type("_NoValWarn", (logging.Filter,), {
         "filter": lambda self, r: "IBKR API validation warning" not in r.getMessage()
     })()

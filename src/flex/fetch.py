@@ -221,6 +221,21 @@ def merge_cash_into_pickle(new_df: pd.DataFrame, pkl_path: Path) -> pd.DataFrame
         if (dropped := before - len(combined)):
             logger.info("Cash dedup removed {} duplicate rows", dropped)
 
+    # Second-pass: same (accountId, amount, currency, description) within the same Mon-Sun week
+    # catches IBKR reporting the same deposit on transaction date AND settlement date.
+    _fuzzy_key = [c for c in ("accountId", "amount", "currency", "description") if c in combined.columns]
+    if _fuzzy_key and "date" in combined.columns:
+        _dates = pd.to_datetime(combined["date"], errors="coerce")
+        combined["_week"] = _dates - pd.to_timedelta(_dates.dt.dayofweek, unit="D")
+        before = len(combined)
+        combined = (
+            combined.sort_values("date")
+            .drop_duplicates(subset=_fuzzy_key + ["_week"], keep="last")
+            .drop(columns=["_week"])
+        )
+        if (dropped := before - len(combined)):
+            logger.info("Cash fuzzy-dedup removed {} near-duplicate rows (same week)", dropped)
+
     pkl_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_pickle(pkl_path)
     logger.info("Saved cash transactions rows={} path={}", len(combined), pkl_path)

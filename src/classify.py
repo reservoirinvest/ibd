@@ -681,10 +681,24 @@ def classifed_results(account_no: str, max_days: int = 1, msg: bool = False) -> 
     # Check if data needs refresh and load chains and underlying data
     chain_path = ROOT / "data" / "df_chains.pkl"
     df_chains_check = get_pickle(chain_path, print_msg=msg)
+    _chains_syms = (
+        df_chains_check["symbol"].nunique()
+        if (isinstance(df_chains_check, pd.DataFrame) and not df_chains_check.empty and "symbol" in df_chains_check.columns)
+        else 0
+    )
+    _sym_path = ROOT / "data" / "symbols.pkl"
+    _sym_count = len(get_pickle(_sym_path) or []) if _sym_path.exists() else 0
+    _chains_incomplete = _sym_count > 0 and _chains_syms < _sym_count
+    if _chains_incomplete and _chains_syms > 0:
+        logger.warning(
+            "df_chains incomplete (%d/%d symbols) — re-fetching before order generation",
+            _chains_syms, _sym_count,
+        )
     if (
         do_i_refresh(my_path=chain_path, max_days=max_days)
         or df_chains_check is None
         or (isinstance(df_chains_check, pd.DataFrame) and df_chains_check.empty)
+        or _chains_incomplete
     ):
         result["df_chains"], result["df_unds"] = chains_n_unds()
     else:

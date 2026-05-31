@@ -306,6 +306,7 @@ _DERIVE_LOG    = _here() / "log" / "derive_progress.log"
 _OHLC_LOG      = _here() / "log" / "ohlc_progress.log"
 _EXECUTE_LOG   = _here() / "log" / "execute.log"
 _DASHBOARD_LOG = _here() / "log" / "dashboard.log"
+_BACKTEST_LOG  = _here() / "log" / "backtest.log"
 
 # Known derive.py output markers → progress percentage
 _DERIVE_PHASES: list[tuple[str, int]] = [
@@ -527,7 +528,8 @@ def _sub_env() -> dict[str, str]:
     root = str(_here())
     existing = os.environ.get("PYTHONPATH", "")
     pythonpath = f"{root}{os.pathsep}{existing}" if existing else root
-    return {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "PYTHONPATH": pythonpath}
+    return {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+            "PYTHONPATH": pythonpath, "PYTHONUNBUFFERED": "1"}
 
 
 def _derive_progress() -> tuple[float, str, list[str]]:
@@ -953,6 +955,7 @@ def render_orders() -> None:
                 log_fh = open(_DERIVE_LOG, "w", encoding="utf-8")  # noqa: SIM115
                 _env = _sub_env()
                 st.session_state.pop("_derive_exit", None)
+                st.session_state.pop("_derive_summary", None)
                 st.session_state["frozen_for"] = "derive"
                 client.freeze()
                 new_proc = subprocess.Popen(
@@ -1076,16 +1079,19 @@ def render_orders() -> None:
                 elif "_derive_exit" in st.session_state:
                     rc = st.session_state["_derive_exit"]
                     if rc == 0:
-                        _nc = len(_load_pkl("df_cov.pkl"))
-                        _nn = len(_load_pkl("df_nkd.pkl"))
-                        _nr = len(_load_pkl("df_reap.pkl"))
-                        _np = len(_load_pkl("df_protect.pkl"))
-                        _parts = (
-                            ([f"{_nc} covers"] if _nc else [])
-                            + ([f"{_nn} nakeds"] if _nn else [])
-                            + ([f"{_nr} reaps"] if _nr else [])
-                            + ([f"{_np} protects"] if _np else [])
-                        )
+                        # Cache counts at derive-time so they survive execute clearing the pkls
+                        if "_derive_summary" not in st.session_state:
+                            _nc = len(_load_pkl("df_cov.pkl"))
+                            _nn = len(_load_pkl("df_nkd.pkl"))
+                            _nr = len(_load_pkl("df_reap.pkl"))
+                            _np = len(_load_pkl("df_protect.pkl"))
+                            st.session_state["_derive_summary"] = (
+                                ([f"{_nc} covers"] if _nc else [])
+                                + ([f"{_nn} nakeds"] if _nn else [])
+                                + ([f"{_nr} reaps"] if _nr else [])
+                                + ([f"{_np} protects"] if _np else [])
+                            )
+                        _parts = st.session_state["_derive_summary"]
                         if _parts:
                             st.success(f"✅ {', '.join(_parts)}")
                         else:
@@ -1312,14 +1318,45 @@ def render_orders() -> None:
                 },
             )
 
-    # Sow (Nakeds)
-    n_nkd = len(df_nkd)
-    nkd_premium = _exp_premium(df_nkd)
+    # Sow (Nakeds) — optional DEPLOY-only filter (includes REFINE symbols with active overrides)
+    import json as _sow_json  # noqa: PLC0415
+    from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _BT_RES  # noqa: PLC0415
+    _deploy_only = st.session_state.get("ord_sow_deploy_only", True)
+    _df_nkd_disp = df_nkd.copy()
+    _deploy_syms: set[str] = set()
+    _refine_override_syms: set[str] = set()
+    if _deploy_only and _BT_RES.exists():
+        try:
+            _bt_verd = pd.read_pickle(_BT_RES)
+            _deploy_syms = set(_bt_verd.loc[_bt_verd["verdict"] == "DEPLOY", "symbol"].dropna())
+            _ovr_path = Path("data/symbol_overrides.json")
+            if _ovr_path.exists():
+                _ovr_data = _sow_json.loads(_ovr_path.read_text(encoding="utf-8"))
+                _refine_override_syms = set(_ovr_data.get("VIRGIN_PUT_STD_MULT", {}).keys())
+            _allowed = _deploy_syms | _refine_override_syms
+            _df_nkd_disp = _df_nkd_disp[_df_nkd_disp["symbol"].isin(_allowed)]
+        except Exception:
+            pass
+
+    n_nkd = len(_df_nkd_disp)
+    nkd_premium = _exp_premium(_df_nkd_disp)
     nkd_label = (
         f"🌱 Sow — {n_nkd} orders · ${nkd_premium:,.0f} expected premium"
         if n_nkd else "🌱 Sow — 0 orders"
     )
     with st.expander(nkd_label, expanded=True):
+        st.checkbox(
+            "DEPLOY only",
+            key="ord_sow_deploy_only",
+            value=True,
+            help=(
+                "When ON, shows DEPLOY symbols plus any REFINE symbols with active overrides "
+                "set in the REFINE Overrides panel below. "
+                "Run the backtest via Actions → 🧪 Run Backtest to populate verdicts."
+                + (f"  {len(_deploy_syms)} DEPLOY + {len(_refine_override_syms)} REFINE-override symbols."
+                   if _deploy_syms else "  No backtest results found — all symbols shown.")
+            ),
+        )
         if _raw_nkd.empty and _ok["cushion_breach"]:
             st.info(
                 "No sow suggestions as cushion is less. "
@@ -1327,13 +1364,13 @@ def render_orders() -> None:
             )
         elif _raw_nkd.empty:
             st.info("No sow suggestions — run Generate Orders or no virgin/orphaned positions.")
-        elif df_nkd.empty:
+        elif _df_nkd_disp.empty:
             st.info("No sow orders match the current filter.")
         else:
             n_cols = ["symbol", "right", "strike", "expiry", "dte", "qty",
                       "undPrice", "vy", "sdev", "price", "xPrice", "margin"]
             st.dataframe(
-                _banded(df_nkd[[c for c in n_cols if c in df_nkd.columns]].copy()),
+                _banded(_df_nkd_disp[[c for c in n_cols if c in _df_nkd_disp.columns]].copy()),
                 hide_index=True, width="stretch",
                 column_config={
                     "qty":      st.column_config.NumberColumn("Qty",         format="%d"),
@@ -1412,6 +1449,177 @@ def render_orders() -> None:
 
 
 @st.fragment
+def render_refine_overrides() -> None:
+    """Per-symbol VIRGIN_PUT_STD_MULT overrides for REFINE symbols.
+
+    Saves to data/symbol_overrides.json; picked up by derive.py on next run.
+    """
+    import json as _json
+
+    from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _BT_RES
+
+    _OVERRIDE_PATH = Path("data/symbol_overrides.json")
+
+    if not _BT_RES.exists():
+        return
+
+    # Rebuild base DF when backtest file changes or after a save
+    _mtime = _BT_RES.stat().st_mtime
+    if (
+        st.session_state.get("_ref_ovr_mtime") != _mtime
+        or "_ref_ovr_base" not in st.session_state
+    ):
+        _bt = pd.read_pickle(_BT_RES)
+        _refine = (
+            _bt[_bt["verdict"] == "REFINE"][
+                ["symbol", "csp_win_rate", "csp_pf", "put_std_mult_opt"]
+            ]
+            .sort_values("symbol")
+            .reset_index(drop=True)
+            .copy()
+        )
+
+        # Suggested σ = max(grid-optimal, config) — never suggest tighter than global setting
+        from src.build import load_config as _load_cfg
+        _cfg_put_mult = float(_load_cfg("SNP").get("VIRGIN_PUT_STD_MULT", 1.0))
+        _refine["put_std_mult_opt"] = _refine["put_std_mult_opt"].apply(
+            lambda v: max(float(v), _cfg_put_mult)
+        )
+
+        _saved: dict[str, float] = {}
+        if _OVERRIDE_PATH.exists():
+            try:
+                _saved = _json.loads(
+                    _OVERRIDE_PATH.read_text(encoding="utf-8")
+                ).get("VIRGIN_PUT_STD_MULT", {})
+            except Exception:
+                pass
+
+        _refine["Use"] = _refine["symbol"].isin(_saved)
+        _refine["Override σ"] = _refine.apply(
+            lambda r: float(_saved.get(r["symbol"], r["put_std_mult_opt"])), axis=1
+        )
+        _refine["csp_win_rate"] = (_refine["csp_win_rate"] * 100).round(1)
+        st.session_state["_ref_ovr_base"] = _refine.rename(
+            columns={
+                "csp_win_rate": "CSP Win%",
+                "csp_pf": "CSP PF",
+                "put_std_mult_opt": "Suggested σ",
+            }
+        )[["Use", "symbol", "CSP Win%", "CSP PF", "Suggested σ", "Override σ"]]
+        st.session_state["_ref_ovr_mtime"] = _mtime
+
+    _base = st.session_state["_ref_ovr_base"]
+    _n_sym = len(_base)
+    _n_active = int(_base["Use"].sum())
+    _lbl = (
+        f"🔧 REFINE Overrides — {_n_active} active · {_n_sym} REFINE symbols"
+        if _n_sym
+        else "🔧 REFINE Overrides — no REFINE symbols"
+    )
+
+    # Pop the flag so it applies for exactly one render (set by buttons that call st.rerun())
+    _keep_open = st.session_state.pop("_ref_ovr_expanded", False)
+    with st.expander(_lbl, expanded=_keep_open):
+        if _n_sym == 0:
+            st.info("No REFINE symbols in current backtest results.")
+            return
+
+        st.caption(
+            "Per-symbol put-strike width override. "
+            "**Override σ** replaces the global VIRGIN_PUT_STD_MULT for that symbol in the next derive run. "
+            "Tick **Use** to activate. "
+            "**Suggested σ** = max(grid-optimal, config) — never tighter than global setting."
+        )
+
+        # Select All / Clear All
+        _sa_col, _ca_col, _ = st.columns([1, 1, 5])
+        with _sa_col:
+            if st.button("☑ Select All", key="btn_sel_all_ovr"):
+                _nb = st.session_state["_ref_ovr_base"].copy()
+                _nb["Use"] = True
+                st.session_state["_ref_ovr_base"] = _nb
+                st.session_state.pop("sym_override_editor", None)
+                st.session_state["_ref_ovr_expanded"] = True
+                st.rerun()
+        with _ca_col:
+            if st.button("☐ Clear All", key="btn_clr_all_ovr"):
+                _nb = st.session_state["_ref_ovr_base"].copy()
+                _nb["Use"] = False
+                st.session_state["_ref_ovr_base"] = _nb
+                st.session_state.pop("sym_override_editor", None)
+                st.session_state["_ref_ovr_expanded"] = True
+                st.rerun()
+
+        _edited = st.data_editor(
+            _base,
+            hide_index=True,
+            width="stretch",
+            key="sym_override_editor",
+            column_config={
+                "Use": st.column_config.CheckboxColumn(
+                    "Use", width="small",
+                    help="Apply this override in the next Generate Orders run",
+                ),
+                "symbol": st.column_config.TextColumn(
+                    "Symbol", disabled=True, width="small",
+                ),
+                "CSP Win%": st.column_config.NumberColumn(
+                    "Win%", format="%.1f", disabled=True, width="small",
+                    help="CSP win rate at global config σ",
+                ),
+                "CSP PF": st.column_config.NumberColumn(
+                    "PF", format="%.3f", disabled=True, width="small",
+                    help="CSP profit factor at global config σ",
+                ),
+                "Suggested σ": st.column_config.NumberColumn(
+                    "Suggested σ", format="%.2f", disabled=True, width="small",
+                    help="max(grid-optimal, config VIRGIN_PUT_STD_MULT). "
+                    "Higher = further OTM (safer, less premium).",
+                ),
+                "Override σ": st.column_config.NumberColumn(
+                    "Override σ", format="%.2f", min_value=0.1, max_value=5.0,
+                    width="small",
+                    help="Your per-symbol VIRGIN_PUT_STD_MULT. "
+                    "Strike = undPrice − (Override σ × sdev).",
+                ),
+            },
+        )
+
+        _save_col, _info_col = st.columns([1, 3])
+        with _save_col:
+            if st.button("💾 Save Overrides", type="primary", key="btn_save_overrides"):
+                _active_rows = _edited[_edited["Use"] == True]
+                _new_map: dict[str, float] = {
+                    row["symbol"]: round(float(row["Override σ"]), 2)
+                    for _, row in _active_rows.iterrows()
+                }
+                _existing: dict = {}
+                if _OVERRIDE_PATH.exists():
+                    try:
+                        _existing = _json.loads(
+                            _OVERRIDE_PATH.read_text(encoding="utf-8")
+                        )
+                    except Exception:
+                        pass
+                _existing["VIRGIN_PUT_STD_MULT"] = _new_map
+                _OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                _OVERRIDE_PATH.write_text(
+                    _json.dumps(_existing, indent=2), encoding="utf-8"
+                )
+                # Clear cached base so next render reflects saved state
+                st.session_state.pop("_ref_ovr_mtime", None)
+                st.session_state.pop("_ref_ovr_base", None)
+                st.session_state.pop("sym_override_editor", None)
+                st.session_state["_ref_ovr_expanded"] = True
+                st.rerun()
+        with _info_col:
+            if _n_active:
+                _active_syms = list(_base.loc[_base["Use"], "symbol"])
+                st.caption(f"Active: {', '.join(_active_syms)}")
+
+
+@st.fragment
 def render_config_panel() -> None:
     """Interactive editor for snp_config.yml.
 
@@ -1420,6 +1628,27 @@ def render_config_panel() -> None:
     in render_orders when the user edits config while derive is running.
     """
     _init_cfg_state()
+
+    # Load backtest suggestions (cached by file mtime so only recomputes on new results)
+    _bt_rec: dict = {}
+    try:
+        from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _BT_RES_PATH, suggest_config as _sug_fn
+        if _BT_RES_PATH.exists():
+            _mtime = _BT_RES_PATH.stat().st_mtime
+            _cached_rec = st.session_state.get("_bt_cfg_rec")
+            if _cached_rec is None or _cached_rec[0] != _mtime:
+                _raw_sug = _sug_fn(pd.read_pickle(_BT_RES_PATH))
+                _raw_sug.pop("_meta", None)
+                st.session_state["_bt_cfg_rec"] = (_mtime, _raw_sug)
+            _bt_rec = st.session_state["_bt_cfg_rec"][1]
+    except Exception:
+        pass
+
+    def _lbl(name: str, key: str | None = None) -> str:
+        """Return label with inline backtest recommendation when available."""
+        k = key or name
+        return f"{name}  [Recommend: {_bt_rec[k]}]" if k in _bt_rec else name
+
     _cfg_hdr, _cfg_btn = st.columns([1, 2])
     with _cfg_hdr:
         st.markdown("#### ⚙️ Config")
@@ -1485,7 +1714,7 @@ def render_config_panel() -> None:
         st.toggle("COVER_ME", key="cfg_cover_me")
     with _del_cov_col:
         if (_DATA_DIR / "df_cov.pkl").exists():
-            if st.button("🗑 DELETE_COV", key="btn_del_cov", width="stretch",
+            if st.button("🗑 Del Cov", key="btn_del_cov", width="stretch",
                          help="Delete residual df_cov.pkl from last derive run"):
                 _confirm_delete("df_cov.pkl", "Cover", "_del_cov_done")
     if st.session_state.pop("_del_cov_done", False):
@@ -1495,7 +1724,7 @@ def render_config_panel() -> None:
         st.number_input("COVER_MIN_DTE", min_value=0, step=1,
                         key="cfg_cover_min_dte",
                         help="Minimum days to expiry for covered call/put candidates")
-        st.number_input("COVER_STD_MULT", min_value=0.0, step=0.05, format="%.2f",
+        st.number_input(_lbl("COVER_STD_MULT"), min_value=0.0, step=0.05, format="%.2f",
                         key="cfg_cover_std_mult",
                         help="Strike distance in units of 1σ above/below spot")
         st.number_input("COVXPMULT", min_value=0.0, step=0.05, format="%.2f",
@@ -1510,7 +1739,7 @@ def render_config_panel() -> None:
         st.toggle("SOW_NAKEDS", key="cfg_sow_nakeds")
     with _del_sow_col:
         if (_DATA_DIR / "df_nkd.pkl").exists():
-            if st.button("🗑 DELETE_NKD", key="btn_del_nkd", width="stretch",
+            if st.button("🗑 Del Sow", key="btn_del_nkd", width="stretch",
                          help="Delete residual df_nkd.pkl from last derive run"):
                 _confirm_delete("df_nkd.pkl", "Nakeds", "_del_nkd_done")
     st.session_state.pop("_del_nkd_done", None)
@@ -1522,13 +1751,13 @@ def render_config_panel() -> None:
         st.number_input("VIRGIN_CALL_STD_MULT", min_value=0.0, step=0.1, format="%.2f",
                         key="cfg_virgin_call_std",
                         help="σ OTM for virgin call strikes")
-        st.number_input("VIRGIN_PUT_STD_MULT", min_value=0.0, step=0.1, format="%.2f",
+        st.number_input(_lbl("VIRGIN_PUT_STD_MULT"), min_value=0.0, step=0.1, format="%.2f",
                         key="cfg_virgin_put_std",
                         help="σ OTM for virgin put strikes")
         st.number_input("NAKEDXPMULT", min_value=0.0, step=0.05, format="%.2f",
                         key="cfg_nakedxpmult",
                         help="Multiplier on market price for naked execution limit")
-        st.number_input("MINNAKEDOPTPRICE $", min_value=0.0, step=0.25, format="%.2f",
+        st.number_input(_lbl("MINNAKEDOPTPRICE $", "MINNAKEDOPTPRICE"), min_value=0.0, step=0.25, format="%.2f",
                         key="cfg_minnaked",
                         help="Minimum option price to write a naked put")
         st.number_input("VIRGIN_QTY_MULT", min_value=0.0, step=0.005, format="%.3f",
@@ -1564,13 +1793,13 @@ def render_config_panel() -> None:
         st.toggle("REAP_ME", key="cfg_reap_me")
     with _del_reap_col:
         if (_DATA_DIR / "df_reap.pkl").exists():
-            if st.button("🗑 DELETE_REAP", key="btn_del_reap", width="stretch",
+            if st.button("🗑 Del Reap", key="btn_del_reap", width="stretch",
                          help="Delete residual df_reap.pkl from last derive run"):
                 _confirm_delete("df_reap.pkl", "Reap", "_del_reap_done")
     st.session_state.pop("_del_reap_done", None)
 
     if st.session_state["cfg_reap_me"]:
-        st.number_input("REAPRATIO", min_value=0.001, step=0.005, format="%.3f",
+        st.number_input(_lbl("REAPRATIO"), min_value=0.001, step=0.005, format="%.3f",
                         key="cfg_reapratio",
                         help="Close short option when price ≤ REAPRATIO × avgCost")
         st.number_input("MINREAPDTE", min_value=0, step=1,
@@ -1617,6 +1846,50 @@ def _cached_ohlc_stats() -> tuple[int, int]:
     return total, weekly_in_ohlc
 
 
+@st.fragment(run_every="5s")
+def _bt_status_fragment() -> None:
+    """Auto-refreshing backtest progress and results display."""
+    from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _BT_RESULTS
+
+    _proc: subprocess.Popen | None = st.session_state.get("backtest_proc")
+    if _proc is not None and _proc.poll() is not None:
+        st.session_state["_bt_exit"] = _proc.poll()
+        st.session_state.pop("backtest_proc", None)
+        st.rerun()
+
+    _running = st.session_state.get("backtest_proc") is not None
+
+    if _running:
+        st.info("⏳ Backtest running… (first run may take ~5 min to fetch OHLC)")
+        _render_log_expander("📋 Backtest log", _BACKTEST_LOG, expanded=True)
+    elif "_bt_exit" in st.session_state:
+        _bt_rc = st.session_state["_bt_exit"]
+        if _bt_rc == 0:
+            st.success("✅ Backtest complete")
+            _render_log_expander("📋 Backtest log", _BACKTEST_LOG, expanded=False)
+            if _BT_RESULTS.exists():
+                try:
+                    from src.backtest.synthetic import suggest_config
+                    _bt_df = pd.read_pickle(_BT_RESULTS)
+                    _bt_sug = suggest_config(_bt_df)
+                    _bt_meta = _bt_sug.pop("_meta", {})
+                    _d_pct = _bt_meta.get("deploy_pct", 0)
+                    st.caption(
+                        f"{_bt_meta.get('n_symbols', 0)} symbols — "
+                        f"**{_bt_meta.get('n_deploy', 0)} DEPLOY** / "
+                        f"{_bt_meta.get('n_refine', 0)} REFINE / "
+                        f"{_bt_meta.get('n_abandon', 0)} ABANDON "
+                        f"({_d_pct:.0f}% deploy rate)"
+                    )
+                    _rec_parts = "  ·  ".join(f"**{k}** {v}" for k, v in _bt_sug.items())
+                    st.caption(f"Suggested → {_rec_parts}")
+                    st.caption("Recommendations shown next to parameter names in Config panel (Orders tab).")
+                except Exception as _be:
+                    st.warning(f"Could not load backtest results: {_be}")
+        else:
+            st.error(f"❌ Backtest failed (exit {_bt_rc})")
+            _render_log_expander("📋 Backtest log", _BACKTEST_LOG, expanded=True)
+
 
 @st.fragment
 def render_analysis() -> None:
@@ -1651,11 +1924,14 @@ def render_analysis() -> None:
         ("perf_date_end",     None),
         ("exp_ana_actions",   False),
         ("exp_ana_positions", False),
-        ("exp_ana_cover",     False),
-        ("exp_ana_treemap",   False),
-        ("exp_ana_pnl",       False),
-        ("exp_ana_chart",     False),
-        ("exp_ana_perf",      True),
+        ("exp_ana_cover",        False),
+        ("exp_ana_treemap",      False),
+        ("exp_ana_pnl",          False),
+        ("pnl_verdict_filter",   "All"),
+        ("pnl_syn_check",        True),
+        ("pnl_sym_filter",       ""),
+        ("exp_ana_chart",        False),
+        ("exp_ana_perf",         True),
     ]
     for _wk, _wdefault in _ANA_PERSIST:
         _sk = f"_ana_{_wk}"
@@ -2020,6 +2296,64 @@ def render_analysis() -> None:
                     },
                 )
 
+        # ── Synthetic Backtest ────────────────────────────────────────────────────
+        st.divider()
+        _bt_col, _bt_opt_col, _bt_spacer = st.columns([2, 2, 6])
+        _bt_running = st.session_state.get("backtest_proc") is not None
+        _bt_proc: subprocess.Popen | None = st.session_state.get("backtest_proc")
+        if _bt_proc is not None and _bt_proc.poll() is not None:
+            st.session_state["_bt_exit"] = _bt_proc.poll()
+            st.session_state.pop("backtest_proc", None)
+
+        with _bt_opt_col:
+            _force_ohlc = st.checkbox(
+                "Force-refresh OHLC",
+                key="chk_bt_refresh_ohlc",
+                disabled=_bt_running,
+                help=(
+                    "Re-fetch 5-year daily OHLC from yfinance for all symbols. "
+                    "Only needed when the S&P 500 symbol list changes significantly "
+                    "or cached data is stale (>3 months old)."
+                ),
+            )
+
+        with _bt_col:
+            if st.button(
+                "🧪 Run Backtest",
+                key="btn_run_backtest",
+                type="primary" if _bt_running else "secondary",
+                width="stretch",
+                help=(
+                    "Synthetic wheel-strategy backtest on 5-year daily OHLC.\n\n"
+                    "First run fetches OHLC for all S&P 500 symbols (~2 min). "
+                    "Subsequent runs reuse cached data unless 'Force-refresh OHLC' is checked.\n\n"
+                    "Outputs per-symbol DEPLOY/REFINE/ABANDON verdicts and suggests "
+                    "COVER_STD_MULT, VIRGIN_PUT_STD_MULT, MINNAKEDOPTPRICE, REAPRATIO "
+                    "values for snp_config.yml."
+                ),
+            ) and not _bt_running:
+                _BACKTEST_LOG.parent.mkdir(parents=True, exist_ok=True)
+                _bt_log_fh = open(_BACKTEST_LOG, "w", encoding="utf-8")  # noqa: SIM115
+                st.session_state.pop("_bt_exit", None)
+                _bt_cmd = [sys.executable, str(_here() / "scripts" / "run_backtest.py")]
+                if _force_ohlc:
+                    _bt_cmd.append("--refresh-ohlc")
+                _bt_new_proc = subprocess.Popen(
+                    _bt_cmd,
+                    stdout=_bt_log_fh,
+                    stderr=subprocess.STDOUT,
+                    env=_sub_env(),
+                )
+                st.session_state["backtest_proc"] = _bt_new_proc
+                logger.info("run_backtest.py started pid={} force_ohlc={}", _bt_new_proc.pid, _force_ohlc)
+                st.rerun()
+            from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _BT_RESULTS
+            if not _bt_running and "_bt_exit" not in st.session_state:
+                st.caption(f"Last: {_pkl_age('', path=_BT_RESULTS)}")
+
+        # Backtest status / results — rendered by auto-refreshing fragment
+        _bt_status_fragment()
+
     # ── Positions table (live — with filters + ITM highlighting) ─────────────
     _pos_data = pd.DataFrame()
     if not snap.positions.empty:
@@ -2261,6 +2595,7 @@ def render_analysis() -> None:
 
 
     # ── Load flex trade data (needed for Options P&L by Underlying) ──────────
+    perf = pd.DataFrame()
     _flex_loaded = flex_path.exists()
     if _flex_loaded:
         df_all = pd.read_pickle(flex_path)
@@ -2311,6 +2646,7 @@ def render_analysis() -> None:
 
             # Backtest score + verdict — one call per symbol, fast (in-memory mask)
             from src.backtest.score import score_from_trades as _score_fn  # noqa: PLC0415
+            from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _SYN_RES  # noqa: PLC0415
             _bt_scores: list[int | None] = []
             _bt_verdicts: list[str | None] = []
             for _sym in perf["symbol"]:
@@ -2321,57 +2657,159 @@ def render_analysis() -> None:
                 else:
                     _bt_scores.append(int(_bs.composite))
                     _bt_verdicts.append(_bs.verdict)
+
+            # Synthetic backtest verdict — join from backtest_results.pkl if available
+            _syn_vmap: dict[str, str] = {}
+            if _SYN_RES.exists():
+                try:
+                    _syn_raw = pd.read_pickle(_SYN_RES)
+                    if not _syn_raw.empty and {"symbol", "verdict"} <= set(_syn_raw.columns):
+                        _syn_vmap = dict(zip(_syn_raw["symbol"], _syn_raw["verdict"]))
+                except Exception:
+                    pass
+            _syn_verdicts_col = [_syn_vmap.get(s) for s in perf["symbol"]]
+
             _mg_idx = perf.columns.get_loc("margin") + 1
-            perf.insert(_mg_idx,     "score",   _bt_scores)
-            perf.insert(_mg_idx + 1, "verdict", _bt_verdicts)
+            perf.insert(_mg_idx,     "syn_verdict", _syn_verdicts_col)
+            perf.insert(_mg_idx + 1, "score",       _bt_scores)
+            perf.insert(_mg_idx + 2, "verdict",     _bt_verdicts)
 
-        # ── Options P&L by Underlying ─────────────────────────────────────────
-        with st.expander("📊 Historical Trade P&L", expanded=False, key="exp_ana_pnl"):
-            if perf.empty:
-                st.info("No closed options trades in the Flex data.")
-            else:
-                st.dataframe(
-                    _banded(perf)
-                    .format({
-                        "current_price": "${:,.2f}",
-                        "hv":  "{:.1f}%",
-                        "iv":  "{:.1f}%",
-                        "margin":        "${:,.0f}",
-                        "score":         "{:.0f}",
-                        "win_rate":      "{:.0%}",
-                        "profit_factor": "{:.2f}",
-                        "avg_win":       "${:,.0f}",
-                        "avg_loss":      "${:,.0f}",
-                        "total_pnl":     "${:,.0f}",
-                    }, na_rep="—")
-                    .map(
-                        lambda v: (
-                            "color: #22c55e; font-weight: 600" if v == "DEPLOY" else
-                            "color: #f59e0b; font-weight: 600" if v == "REFINE" else
-                            "color: #ef4444; font-weight: 600" if v == "ABANDON" else ""
-                        ),
-                        subset=["verdict"],
-                    ),
-                    width="stretch",
-                    hide_index=True,
-                    column_config={
-                        "symbol":        st.column_config.TextColumn("Symbol",        help="Underlying ticker"),
-                        "current_price": st.column_config.NumberColumn("Price",       help="Last close from df_unds (yfinance)"),
-                        "hv":            st.column_config.TextColumn("HV %",          help="20-day historical volatility (annualised) from df_unds"),
-                        "iv":            st.column_config.TextColumn("IV %",          help="Implied volatility from df_unds"),
-                        "position":      st.column_config.TextColumn("Position",      help="Current live position: STK ±shares, P/C ±contracts"),
-                        "margin":        st.column_config.TextColumn("Margin",        help="Estimated margin per contract from df_unds"),
-                        "score":         st.column_config.NumberColumn("Score /100",  help="BacktestExpert composite score 0–100 (win rate + profit factor + drawdown + duration)"),
-                        "verdict":       st.column_config.TextColumn("Rating",        help="DEPLOY ≥70 · REFINE 40–69 · ABANDON <40 or critical flag"),
-                        "trades":        st.column_config.NumberColumn("Trades",      help="Closed option contracts"),
-                        "win_rate":      st.column_config.TextColumn("Win %",         help="% of closed trades with positive P&L"),
-                        "profit_factor": st.column_config.TextColumn("PF",            help="Gross profit ÷ gross loss. ≥1.5 = strong edge"),
-                        "avg_win":       st.column_config.TextColumn("Avg Win",       help="Average P&L on winning trades"),
-                        "avg_loss":      st.column_config.TextColumn("Avg Loss",      help="Average P&L on losing trades (negative)"),
-                        "total_pnl":     st.column_config.TextColumn("Total P&L",     help="Sum of all realised P&L for this symbol"),
-                    },
+    # ── Trade Analysis: Synthetic Backtest + Historical Trade P&L ───────────
+    from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _SYN_PATH  # noqa: PLC0415
+    with st.expander("📊 Trade Analysis", expanded=False, key="exp_ana_pnl"):
+
+        # Shared filter controls
+        _fv_col, _fsyn_col, _fsym_col, _fsp = st.columns([2, 1, 2, 5])
+        _vf = _fv_col.selectbox(
+            "Verdict", ["All", "DEPLOY", "REFINE", "ABANDON", "INSUFFICIENT_DATA"],
+            key="pnl_verdict_filter",
+        )
+        _use_syn = _fsyn_col.checkbox(
+            "Synthetic",
+            key="pnl_syn_check",
+            help=(
+                "Controls which verdict column the filter applies to in the "
+                "Historical Trade P&L table below.\n"
+                "ON — filter on the Synthetic backtest Rating column.\n"
+                "OFF — filter on your personal Trade Rating column.\n"
+                "The Synthetic Backtest table below always filters on its own Rating."
+            ),
+        )
+        _sf = _fsym_col.text_input("Symbol", key="pnl_sym_filter", placeholder="e.g. AAPL")
+
+        _vcolors = {
+            "DEPLOY": "color: #22c55e; font-weight: 600",
+            "REFINE": "color: #f59e0b; font-weight: 600",
+            "ABANDON": "color: #ef4444; font-weight: 600",
+        }
+
+        # ── Historical Trade P&L table (first) ───────────────────────────────
+        st.markdown("##### 📊 Historical Trade P&L")
+        if perf.empty:
+            st.info("No closed options trades in the Flex data.")
+        else:
+            _verdict_col_for_filter = "syn_verdict" if _use_syn else "verdict"
+            _perf_disp = perf.copy()
+            if _vf != "All" and _verdict_col_for_filter in _perf_disp.columns:
+                _perf_disp = _perf_disp[_perf_disp[_verdict_col_for_filter] == _vf]
+            if _sf.strip():
+                _perf_disp = _perf_disp[_perf_disp["symbol"].str.contains(_sf.strip().upper(), na=False)]
+            _perf_disp = _perf_disp.sort_values("symbol")
+            _vstyle = lambda v: _vcolors.get(v, "")
+            _vcols = [c for c in ["syn_verdict", "verdict"] if c in _perf_disp.columns]
+            _pstyled = _banded(_perf_disp).format({
+                "current_price": "${:,.2f}",
+                "hv":            "{:.1f}%",
+                "iv":            "{:.1f}%",
+                "margin":        "${:,.0f}",
+                "score":         "{:.0f}",
+                "win_rate":      "{:.0%}",
+                "profit_factor": "{:.2f}",
+                "avg_win":       "${:,.0f}",
+                "avg_loss":      "${:,.0f}",
+                "total_pnl":     "${:,.0f}",
+            }, na_rep="—")
+            for _vc in _vcols:
+                _pstyled = _pstyled.map(_vstyle, subset=[_vc])
+            st.dataframe(
+                _pstyled,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "symbol":        st.column_config.TextColumn("Symbol",       help="Underlying ticker"),
+                    "current_price": st.column_config.NumberColumn("Price",      help="Last close from df_unds (yfinance)"),
+                    "hv":            st.column_config.TextColumn("HV %",         help="20-day historical volatility (annualised) from df_unds"),
+                    "iv":            st.column_config.TextColumn("IV %",         help="Implied volatility from df_unds"),
+                    "position":      st.column_config.TextColumn("Position",     help="Current live position: STK ±shares, P/C ±contracts"),
+                    "margin":        st.column_config.TextColumn("Margin",       help="Estimated margin per contract from df_unds"),
+                    "syn_verdict":   st.column_config.TextColumn("Rating",       help="Synthetic backtest rating (DEPLOY ≥70 · REFINE 40–69 · ABANDON <40). Blank = monthly-only or backtest not yet run."),
+                    "score":         st.column_config.NumberColumn("Score /100", help="Personal trade history composite score 0–100. Populated only for symbols with ≥10 closed OPT trades."),
+                    "verdict":       st.column_config.TextColumn("Trade Rating", help="Personal trade history rating (DEPLOY ≥70 · REFINE 40–69 · ABANDON <40). Blank if fewer than 10 trades."),
+                    "trades":        st.column_config.NumberColumn("Trades",     help="Closed option contracts in your Flex history"),
+                    "win_rate":      st.column_config.TextColumn("Win %",        help="% of closed OPT trades with positive P&L"),
+                    "profit_factor": st.column_config.TextColumn("PF",           help="Gross profit ÷ gross loss on your own trades. ≥1.5 = strong edge"),
+                    "avg_win":       st.column_config.TextColumn("Avg Win",      help="Average P&L on your winning trades"),
+                    "avg_loss":      st.column_config.TextColumn("Avg Loss",     help="Average P&L on your losing trades (negative)"),
+                    "total_pnl":     st.column_config.TextColumn("Total P&L",    help="Sum of all realised P&L for this symbol"),
+                },
+            )
+
+        # ── Synthetic Backtest table (second) ────────────────────────────────
+        st.divider()
+        st.markdown("##### 🧪 Synthetic Backtest")
+        if not _SYN_PATH.exists():
+            st.info("No results yet — run the backtest via 🛠 Actions → 🧪 Run Backtest.")
+        else:
+            try:
+                _syn = pd.read_pickle(_SYN_PATH)
+                _syn_disp = _syn.copy()
+                if _vf != "All" and _use_syn:
+                    _syn_disp = _syn_disp[_syn_disp["verdict"] == _vf]
+                if _sf.strip():
+                    _syn_disp = _syn_disp[_syn_disp["symbol"].str.contains(_sf.strip().upper(), na=False)]
+                st.caption(
+                    f"{len(_syn_disp)} of {len(_syn)} symbols · last run {_pkl_age('', path=_SYN_PATH)}"
                 )
-
+                _cols_show = [c for c in [
+                    "symbol", "verdict", "composite",
+                    "cover_std_mult_opt", "cc_pf", "cc_win_rate", "cc_max_dd",
+                    "put_std_mult_opt", "csp_pf", "csp_win_rate",
+                    "years_tested",
+                ] if c in _syn_disp.columns]
+                _syn_disp = _syn_disp[_cols_show].sort_values("symbol")
+                st.dataframe(
+                    _syn_disp.style
+                    .map(lambda v: _vcolors.get(v, ""),
+                         subset=["verdict"] if "verdict" in _syn_disp.columns else [])
+                    .format({
+                        "composite":          lambda v: f"{v:,.0f}" if pd.notna(v) else "—",
+                        "cc_pf":              lambda v: ("99.9*" if v >= 99.9 else f"{v:,.2f}") if pd.notna(v) else "—",
+                        "csp_pf":             lambda v: ("99.9*" if v >= 99.9 else f"{v:,.2f}") if pd.notna(v) else "—",
+                        "cc_win_rate":        lambda v: f"{v:.0%}" if pd.notna(v) else "—",
+                        "csp_win_rate":       lambda v: f"{v:.0%}" if pd.notna(v) else "—",
+                        "cc_max_dd":          lambda v: f"{v:,.1f}%" if pd.notna(v) else "—",
+                        "cover_std_mult_opt": lambda v: f"{v:.2f}" if pd.notna(v) else "—",
+                        "put_std_mult_opt":   lambda v: f"{v:.2f}" if pd.notna(v) else "—",
+                        "years_tested":       lambda v: f"{v:.1f}" if pd.notna(v) else "—",
+                    }, na_rep="—"),
+                    column_config={
+                        "symbol":             st.column_config.TextColumn("Symbol"),
+                        "verdict":            st.column_config.TextColumn("Rating", help="Wheel-appropriate verdict based on CSP leg (the real assignment risk). DEPLOY: CSP win%>=70 & PF>=1.0 & 3+yr. REFINE: CSP win%>=55 & PF>=0.85. ABANDON: below thresholds. CC assignment is a designed wheel exit, not a loss — so CC performance does not drive the verdict."),
+                        "composite":          st.column_config.NumberColumn("Score /100", help="BacktestExpert composite score (CC leg, 0–100). Reference only — structural ceiling is ~74 with 5y monthly data. Use Rating for the actionable verdict."),
+                        "cover_std_mult_opt": st.column_config.TextColumn("CC σ best", help="Grid-optimal COVER_STD_MULT for this symbol (best PF from grid [0.30…1.50]). Compare against your config value to see how far you are from the historical optimum."),
+                        "cc_pf":              st.column_config.TextColumn("CC PF",     help="Covered-call profit factor at your configured COVER_STD_MULT. ≥1.5 good · ≥2.0 strong. 99.9* = no losing cycles (capped)."),
+                        "cc_win_rate":        st.column_config.TextColumn("CC Win%",   help="Fraction of monthly CC cycles that were profitable at your configured COVER_STD_MULT."),
+                        "cc_max_dd":          st.column_config.TextColumn("CC MaxDD",  help="Max drawdown as % of peak cumulative CC P&L at your configured COVER_STD_MULT. >30% signals adverse months despite positive PF."),
+                        "put_std_mult_opt":   st.column_config.TextColumn("CSP σ best", help="Grid-optimal VIRGIN_PUT_STD_MULT for this symbol (best PF from grid [0.50…2.00]). Compare against your config value."),
+                        "csp_pf":             st.column_config.TextColumn("CSP PF",    help="Cash-secured-put profit factor at your configured VIRGIN_PUT_STD_MULT. 99.9* = no losing cycles (capped)."),
+                        "csp_win_rate":       st.column_config.TextColumn("CSP Win%",  help="Fraction of monthly CSP cycles that expired OTM or were profitable at your configured VIRGIN_PUT_STD_MULT."),
+                        "years_tested":       st.column_config.TextColumn("Years",     help="Years of daily OHLC used (up to 5y from yfinance). Shorter = less reliable."),
+                        "n_cycles":           st.column_config.NumberColumn("Cycles",  help="Monthly cycles simulated (~years×12). Each = sell ~35 days before 3rd-Friday expiry."),
+                    },
+                    width="stretch", hide_index=True,
+                )
+            except Exception as _se:
+                st.warning(f"Could not load synthetic backtest results: {_se}")
 
 
 @st.fragment
@@ -3294,6 +3732,16 @@ def _render_perf_chart(
                         & (_df_cash["date"] >= t0)
                     ].copy()
                     if not _dw.empty:
+                        # Deduplicate same (amount, currency) within the same Mon-Sun week —
+                        # IBKR sometimes reports a deposit on both transaction date and settle date.
+                        _dw_dates = pd.to_datetime(_dw["date"], errors="coerce")
+                        _dw["_week"] = _dw_dates - pd.to_timedelta(_dw_dates.dt.dayofweek, unit="D")
+                        _fkey = [c for c in ("accountId", "amount", "currency", "description") if c in _dw.columns]
+                        _dw = (
+                            _dw.sort_values("date")
+                            .drop_duplicates(subset=_fkey + ["_week"], keep="last")
+                            .drop(columns=["_week"])
+                        )
                         _dep_events = _dw[["date", "amount", "currency"]].copy()
             except Exception:
                 pass
@@ -3525,24 +3973,38 @@ def _render_perf_chart(
             _dve  = _dep_events[_dep_events["date"] <= _d_end_ts]
             _deps = _dve[_dve["amount"] > 0]
             _wits = _dve[_dve["amount"] < 0]
+            def _agg_cash_markers(df: pd.DataFrame) -> pd.DataFrame:
+                cur_col = df.get("currency", pd.Series([""] * len(df)))
+                df = df.copy()
+                df["currency"] = cur_col.values
+                by_date_cur = (
+                    df.groupby(["date", "currency"], sort=True)["amount"]
+                    .sum()
+                    .reset_index()
+                )
+                def _fmt(grp):
+                    parts = [f"{row.currency} {abs(row.amount):,.0f}" for row in grp.itertuples()]
+                    return " / ".join(parts)
+                result = by_date_cur.groupby("date", sort=True).apply(_fmt).reset_index()
+                result.columns = ["date", "_text"]
+                return result
+
             if not _deps.empty:
-                _dep_cur  = _deps.get("currency", pd.Series([""] * len(_deps))).values
-                _dep_text = [f"{c} {abs(a):,.0f}" for a, c in zip(_deps["amount"].values, _dep_cur)]
+                _deps_g = _agg_cash_markers(_deps)
                 fig.add_trace(go.Scatter(
-                    x=_deps["date"], y=[0.0] * len(_deps), mode="markers",
+                    x=_deps_g["date"], y=[0.0] * len(_deps_g), mode="markers",
                     marker=dict(symbol="triangle-up", size=11,
                                 color="#22c55e", line=dict(width=1, color="#166534")),
-                    name="Deposit", text=_dep_text, yaxis="y2",
+                    name="Deposit", text=_deps_g["_text"].values, yaxis="y2",
                     hovertemplate="%{text}<extra>Deposit</extra>",
                 ))
             if not _wits.empty:
-                _wit_cur  = _wits.get("currency", pd.Series([""] * len(_wits))).values
-                _wit_text = [f"{c} {abs(a):,.0f}" for a, c in zip(_wits["amount"].values, _wit_cur)]
+                _wits_g = _agg_cash_markers(_wits)
                 fig.add_trace(go.Scatter(
-                    x=_wits["date"], y=[0.0] * len(_wits), mode="markers",
+                    x=_wits_g["date"], y=[0.0] * len(_wits_g), mode="markers",
                     marker=dict(symbol="triangle-down", size=11,
                                 color="#ef4444", line=dict(width=1, color="#991b1b")),
-                    name="Withdrawal", text=_wit_text, yaxis="y2",
+                    name="Withdrawal", text=_wits_g["_text"].values, yaxis="y2",
                     hovertemplate="%{text}<extra>Withdrawal</extra>",
                 ))
 
@@ -4126,6 +4588,40 @@ def _build_live_context() -> dict:
     except Exception:
         pass
 
+    # Synthetic backtest results — wheel-appropriate verdict per weekly symbol
+    from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _SYN_RES_PATH  # noqa: PLC0415
+    _SYN_CACHE, _SYN_TS = "llm_syn_cache", "llm_syn_ts"
+    if (
+        _SYN_CACHE in st.session_state
+        and time.time() - st.session_state.get(_SYN_TS, 0) < 300
+    ):
+        if st.session_state[_SYN_CACHE]:
+            context["synthetic_backtest"] = st.session_state[_SYN_CACHE]
+    elif _SYN_RES_PATH.exists():
+        try:
+            _syn_df = pd.read_pickle(_SYN_RES_PATH)
+            if not _syn_df.empty and "symbol" in _syn_df.columns:
+                _syn_rows = []
+                for _, _sr in _syn_df.iterrows():
+                    if str(_sr.get("verdict", "")) == "INSUFFICIENT_DATA":
+                        continue
+                    _syn_rows.append({
+                        "sym":    _sr["symbol"],
+                        "verdict": _sr.get("verdict", ""),
+                        "score":  _sr.get("composite"),
+                        "cc_pf":  _sr.get("cc_pf"),
+                        "cc_wr":  round(float(_sr.get("cc_win_rate") or 0) * 100),
+                        "csp_pf": _sr.get("csp_pf"),
+                        "csp_wr": round(float(_sr.get("csp_win_rate") or 0) * 100),
+                        "years":  _sr.get("years_tested"),
+                    })
+                st.session_state[_SYN_CACHE] = _syn_rows
+                st.session_state[_SYN_TS] = time.time()
+                if _syn_rows:
+                    context["synthetic_backtest"] = _syn_rows
+        except Exception:
+            st.session_state[_SYN_CACHE] = []
+
     # Symbol categories — weekly vs monthly-only (from symbol_categories.pkl)
     _sym_cat_pkl = _MASTER_DIR / "symbol_categories.pkl"
     if _sym_cat_pkl.exists():
@@ -4326,5 +4822,6 @@ elif nav == "Orders":
     _ord_col, _cfg_col = st.columns([3, 1])
     with _ord_col:
         render_orders()
+        render_refine_overrides()
     with _cfg_col:
         render_config_panel()
