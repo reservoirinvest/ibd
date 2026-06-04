@@ -1,23 +1,10 @@
 {
   "VIRGIN_PUT_STD_MULT": {
-    "AIG": 1.25,
-    "AMGN": 1.2,
-    "APO": 2.0,
     "BMY": 2.0,
-    "CAT": 2.0,
-    "CME": 1.2,
-    "CTAS": 2.0,
-    "GEV": 2.0,
-    "GILD": 1.2,
-    "IRM": 1.2,
+    "CME": 2.0,
     "LHX": 2.0,
-    "LLY": 1.2,
-    "PM": 1.25,
-    "RCL": 1.2,
-    "RTX": 1.2,
-    "SLB": 1.0,
-    "SNPS": 1.2,
-    "TMUS": 1.2,
-    "TTWO": 1.2
+    "LLY": 2.0,
+    "RTX": 2.0,
+    "TMUS": 2.0
   }
 }

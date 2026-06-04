@@ -4596,6 +4596,9 @@ with _time_c:
     _nav_time()
 with _refresh_c:
     if st.button("↺", key="btn_nav_refresh", help="Reload all dashboard data"):
+        st.session_state.pop("_ref_ovr_base", None)
+        st.session_state.pop("_ref_ovr_mtime", None)
+        st.session_state.pop("sym_override_editor", None)
         st.rerun()
 
 # Second fixed band: KPI table on top, Ask AI below — stacked in one full-width column.

@@ -12,13 +12,16 @@ from typing import List
 from ib_async import LimitOrder
 
 # Suppress ib_async verbose dump for error 399 (order held until market open — not a failure).
-# Message originates in ib_async.wrapper; filter on parent covers all sub-loggers.
-# We emit a compact summary in place_orders() instead.
-logging.getLogger("ib_async").addFilter(
-    type("_NoValWarn", (logging.Filter,), {
-        "filter": lambda self, r: "IBKR API validation warning" not in r.getMessage()
-    })()
-)
+# Must target child loggers directly: Python propagation calls callHandlers() not handle(),
+# so parent filters are never applied to records propagated from ib_async.wrapper etc.
+_399_filter = type("_NoValWarn", (logging.Filter,), {
+    "filter": lambda self, r: "IBKR API validation warning" not in r.getMessage()
+})()
+for _name, _lgr in list(logging.Logger.manager.loggerDict.items()):
+    if _name.startswith("ib_async") and isinstance(_lgr, logging.Logger):
+        _lgr.addFilter(_399_filter)
+logging.getLogger("ib_async").addFilter(_399_filter)
+logging.getLogger("ib_async.wrapper").addFilter(_399_filter)
 
 # Import from provided modules
 # pyrefly: ignore [missing-import]

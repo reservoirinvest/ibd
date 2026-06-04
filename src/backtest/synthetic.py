@@ -504,12 +504,19 @@ def run_backtest(
 
     # Load symbols list
     sym_path = ROOT / "data" / "symbols.pkl"
+    json_path = ROOT / "data" / "ohlc_symbols.json"
     if symbols is None:
         if sym_path.exists():
             import pickle
             with open(sym_path, "rb") as f:
                 contracts = pickle.load(f)
             symbols = [c.symbol for c in contracts if hasattr(c, "symbol")]
+        elif json_path.exists():
+            import json
+            with open(json_path) as f:
+                specs = json.load(f)
+            symbols = [s["symbol"] for s in specs if isinstance(s, dict) and "symbol" in s]
+            logger.info("symbols.pkl missing — loaded {} symbols from ohlc_symbols.json", len(symbols))
         else:
             raise FileNotFoundError("symbols.pkl not found — run Build first")
 
