@@ -431,6 +431,7 @@ _CFG_KEYS: list[tuple[str, str, type, object]] = [
     ("cfg_max_dte",          "MAX_DTE",               int,   50),
     ("cfg_mincushion",       "MINCUSHION",            float, 0.2),
     ("cfg_max_file_age",     "MAX_FILE_AGE",          int,   1),
+    ("cfg_defaultai",        "DEFAULTAI",             str,   "Gemini"),
 ]
 
 
@@ -444,6 +445,8 @@ def _init_cfg_state() -> None:
         cfg = {}
     for sk, yk, cast, default in _CFG_KEYS:
         st.session_state.setdefault(sk, cast(cfg.get(yk, default)))
+    _ai_raw = cfg.get("AIMODELS", ["Gemini", "DeepSeek"])
+    st.session_state.setdefault("cfg_aimodels", _ai_raw if isinstance(_ai_raw, list) else [str(_ai_raw)])
     st.session_state["_cfg_inited"] = True
 
 
@@ -494,6 +497,8 @@ def _force_reload_cfg() -> None:
         cfg = {}
     for sk, yk, cast, default in _CFG_KEYS:
         st.session_state[sk] = cast(cfg.get(yk, default))
+    _ai_raw = cfg.get("AIMODELS", ["Gemini", "DeepSeek"])
+    st.session_state["cfg_aimodels"] = _ai_raw if isinstance(_ai_raw, list) else [str(_ai_raw)]
     st.session_state["_cfg_inited"] = True
 
 
@@ -1852,6 +1857,19 @@ def render_config_panel() -> None:
         st.number_input("MINREAPDTE", min_value=0, step=1,
                         key="cfg_minreapdte",
                         help="Do not reap at or below this DTE")
+
+    st.divider()
+
+    # ── AI MODEL ───────────────────────────────────────────────────────────────
+    _ai_models = st.session_state.get("cfg_aimodels", ["Gemini", "DeepSeek"])
+    _valid_ai = [m for m in _ai_models if m in _PROVIDER_HINTS]
+    if _valid_ai:
+        st.selectbox(
+            "DEFAULTAI",
+            _valid_ai,
+            key="cfg_defaultai",
+            help="Default AI provider in the Ask AI dock. Options come from AIMODELS in snp_config.yml.",
+        )
 
     st.divider()
 
@@ -4470,12 +4488,20 @@ def _build_live_context() -> dict:
 
 def _render_llm_chat() -> None:
     """Compact Ask AI dock: always visible, one row of controls + cached response."""
-    _prov_w = max(len(p) for p in _PROVIDER_HINTS)  # chars in longest provider name
+    _ai_models = st.session_state.get("cfg_aimodels", list(_PROVIDER_HINTS))
+    _valid_prov = [m for m in _ai_models if m in _PROVIDER_HINTS] or list(_PROVIDER_HINTS)
+
+    # Seed provider selection from DEFAULTAI config on first load
+    if "llm_provider" not in st.session_state:
+        _def = st.session_state.get("cfg_defaultai", _valid_prov[0])
+        st.session_state["llm_provider"] = _def if _def in _valid_prov else _valid_prov[0]
+
+    _prov_w = max(len(p) for p in _valid_prov)  # chars in longest provider name
     p_col, q_col, s_col, c_col = st.columns([_prov_w * 0.13, 8 - _prov_w * 0.13 - 1.0, 0.5, 0.5])
 
     provider = p_col.selectbox(
         "Provider",
-        list(_PROVIDER_HINTS),
+        _valid_prov,
         key="llm_provider",
         label_visibility="collapsed",
     )

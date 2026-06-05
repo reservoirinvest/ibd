@@ -80,14 +80,15 @@ def make_ib_orders(df: pd.DataFrame, action: str, account_no: str) -> tuple:
     return cos
 
 
-def place_orders(cos: tuple, account_no: str = "", blk_size: int = 25) -> List:
+def place_orders(cos: tuple, account_no: str = "", blk_size: int = 25, label: str = "") -> List:
     """CAUTION: This places trades in the system !!!"""
 
     trades = []
     cobs = [cos[i : i + blk_size] for i in range(0, len(cos), blk_size)]
+    desc = f"Executing {label} orders" if label else "Executing orders"
 
     with get_ib_connection("SNP", account_no=account_no) as ib:
-        for b in tqdm(cobs, desc="Executing orders", file=sys.stderr):
+        for b in tqdm(cobs, desc=desc, file=sys.stderr):
             for c, o in b:
                 td = ib.placeOrder(c, o)
                 trades.append(td)
@@ -98,7 +99,8 @@ def place_orders(cos: tuple, account_no: str = "", blk_size: int = 25) -> List:
         syms = ", ".join(t.contract.symbol for t in held[:5])
         if len(held) > 5:
             syms += f" +{len(held) - 5} more"
-        print(f"{len(held)} order(s) held until market open: {syms}", file=sys.stderr)
+        prefix = f"{label} " if label else ""
+        print(f"{len(held)} {prefix}order(s) held until market open: {syms}", file=sys.stderr)
 
     return trades
 
@@ -110,7 +112,7 @@ if COVER_ME:
     if cov_path.exists():
         df_cov = get_pickle(cov_path)
         cos = make_ib_orders(df_cov, action="SELL", account_no=ACCOUNT_NO)
-        cov_trades = place_orders(cos, account_no=ACCOUNT_NO)
+        cov_trades = place_orders(cos, account_no=ACCOUNT_NO, label="cover")
         pickle_me(cov_trades, ROOT / "data" / "traded_covers.pkl")
         print(f"\nPlaced {len(df_cov)} weekly cover orders")
         delete_pkl_files(["df_cov.pkl"])
@@ -120,7 +122,7 @@ if COVER_ME:
     if monthly_cov_path.exists():
         df_monthly_cov = get_pickle(monthly_cov_path)
         monthly_cos = make_ib_orders(df_monthly_cov, action="SELL", account_no=ACCOUNT_NO)
-        monthly_trades = place_orders(monthly_cos, account_no=ACCOUNT_NO)
+        monthly_trades = place_orders(monthly_cos, account_no=ACCOUNT_NO, label="cover (monthly)")
         pickle_me(monthly_trades, ROOT / "data" / "traded_monthly_covers.pkl")
         print(f"\nPlaced {len(df_monthly_cov)} monthly cover orders")
         delete_pkl_files(["df_monthly_cov.pkl"])
@@ -135,7 +137,7 @@ if REAP_ME:
     if (df_reap_path := reap_path).exists():
         df_reap = get_pickle(df_reap_path)
         reap_cos = make_ib_orders(df_reap, action="BUY", account_no=ACCOUNT_NO)
-        reap_trades = place_orders(reap_cos, account_no=ACCOUNT_NO)
+        reap_trades = place_orders(reap_cos, account_no=ACCOUNT_NO, label="reap")
         print(f"\nPlaced {len(df_reap)} reaped options")
         pickle_me(reap_trades, ROOT / "data" / "traded_reaps.pkl")
         delete_pkl_files(["df_reap.pkl"])
@@ -157,7 +159,7 @@ if SOW_NAKEDS:
         else:
             df_nkd = get_pickle(df_nkd_path)
             nkd_cos = make_ib_orders(df_nkd, action="SELL", account_no=ACCOUNT_NO)
-            nkd_trades = place_orders(nkd_cos, account_no=ACCOUNT_NO)
+            nkd_trades = place_orders(nkd_cos, account_no=ACCOUNT_NO, label="sow")
             print(f"\nPlaced {len(df_nkd)} naked options")
             pickle_me(nkd_trades, ROOT / "data" / "traded_nakeds.pkl")
             delete_pkl_files(["df_nkd.pkl"])
@@ -172,7 +174,7 @@ if PROTECT_ME:
     if (df_protect_path := protect_path).exists():
         df_protect = get_pickle(df_protect_path)
         protect_cos = make_ib_orders(df_protect, action="BUY", account_no=ACCOUNT_NO)
-        protect_trades = place_orders(protect_cos, account_no=ACCOUNT_NO)
+        protect_trades = place_orders(protect_cos, account_no=ACCOUNT_NO, label="protect")
         print(f"\nPlaced {len(df_protect)} protect options")
         pickle_me(protect_trades, ROOT / "data" / "traded_protects.pkl")
         delete_pkl_files(["df_protect.pkl"])
@@ -186,7 +188,7 @@ else:
 if (df_deorph_path := deorph_path).exists():
     df_deorph = get_pickle(df_deorph_path)
     deorph_cos = make_ib_orders(df_deorph, action="SELL", account_no=ACCOUNT_NO)
-    deorph_trades = place_orders(deorph_cos, account_no=ACCOUNT_NO)
+    deorph_trades = place_orders(deorph_cos, account_no=ACCOUNT_NO, label="deorphan")
     print(f"\nPlaced {len(df_deorph)} orphaned options")
     pickle_me(deorph_trades, ROOT / "data" / "traded_deorphs.pkl")
     delete_pkl_files(["df_deorph.pkl"])
