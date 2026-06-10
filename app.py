@@ -2025,32 +2025,32 @@ def render_analysis() -> None:
     _ohlc_running = ohlc_proc is not None and ohlc_proc.poll() is None
     _capture_exit(ohlc_proc, "_ohlc_exit")
 
-    # ── Auto Update Trades after OHLC completes ───────────────────────────────
-    # When OHLC subprocess finishes successfully and the auto-flag is set,
-    # launch scripts/update_trades.py as a background subprocess.
+    # ── Auto Refresh Flex after OHLC completes ────────────────────────────────
     _api_ready = bool(token and qid)
+
+    def _launch_flex_refresh(year: int | None = None) -> None:
+        cmd = [sys.executable, str(_here() / "scripts" / "update_trades.py")]
+        if year is not None:
+            cmd += ["--year", str(year)]
+        _ut_log_fh = open(_here() / "log" / "update_trades.log", "w", encoding="utf-8")  # noqa: SIM115
+        _ut_proc = subprocess.Popen(cmd, stdout=_ut_log_fh, stderr=subprocess.STDOUT, env=_sub_env())
+        st.session_state["trades_proc"] = _ut_proc
+        logger.info("update_trades.py started pid={} year={}", _ut_proc.pid, year)
+
     if (
         st.session_state.get("_ohlc_exit") == 0
         and st.session_state.get("_auto_update_trades_pending")
         and not st.session_state.get("trades_proc")
     ):
         st.session_state.pop("_auto_update_trades_pending", None)
-        _ut_log_fh = open(_here() / "log" / "update_trades.log", "w", encoding="utf-8")  # noqa: SIM115
-        _ut_proc = subprocess.Popen(
-            [sys.executable, str(_here() / "scripts" / "update_trades.py")],
-            stdout=_ut_log_fh,
-            stderr=subprocess.STDOUT,
-            env=_sub_env(),
-        )
-        st.session_state["trades_proc"] = _ut_proc
-        logger.info("update_trades.py auto-started after OHLC pid={}", _ut_proc.pid)
+        _launch_flex_refresh()
 
-    # Check if auto trades subprocess finished
+    # Check if Refresh Flex subprocess finished
     _trades_proc: subprocess.Popen | None = st.session_state.get("trades_proc")
     if _trades_proc is not None and _trades_proc.poll() is not None:
         st.session_state["_trades_exit"] = _trades_proc.poll()
         st.session_state["trades_proc"] = None
-        st.rerun()  # immediately replace "running" badge with success/error status
+        st.rerun()
 
     # ── Actions twistie ───────────────────────────────────────────────────────
     with st.expander("🛠 Actions", expanded=False, key="exp_ana_actions"):
@@ -2165,6 +2165,47 @@ def render_analysis() -> None:
             if not _bt_running and "_bt_exit" not in st.session_state:
                 st.caption(f"Last: {_pkl_age('', path=_BT_RESULTS)}")
 
+        # ── Refresh Flex row ──────────────────────────────────────────────────────
+        _flex_running = st.session_state.get("trades_proc") is not None
+        _rf_btn_col, _rf_year_col, _rf_xmlonly_col, _ = st.columns([2, 1, 1, 2])
+        _rf_year = _rf_year_col.number_input(
+            "Year",
+            min_value=2010,
+            max_value=pd.Timestamp.today().year,
+            value=pd.Timestamp.today().year,
+            step=1,
+            key="ni_flex_year",
+            help="Year for the downloaded XML. For historical years, set the portal query "
+                 "to a custom date range (Jan 1 – Dec 31 of that year) first.",
+        )
+        _rf_xml_only = _rf_xmlonly_col.checkbox(
+            "XML only",
+            key="chk_flex_xml_only",
+            help="Skip API download — re-parse existing *.xml files only.",
+        )
+        if _rf_btn_col.button(
+            "🔄 Refresh Flex",
+            key="btn_refresh_flex",
+            type="primary" if _flex_running else "secondary",
+            width="stretch",
+            help="Download the Flex statement for the selected year and refresh all three "
+                 "pickles (trades, cash, NAV). Runs in background.",
+        ) and not _flex_running:
+            st.session_state.pop("_trades_exit", None)
+            if _rf_xml_only:
+                _rf_cmd = [sys.executable, str(_here() / "scripts" / "update_trades.py"), "--xml-only"]
+                _rf_log_fh = open(_here() / "log" / "update_trades.log", "w", encoding="utf-8")  # noqa: SIM115
+                _rf_proc = subprocess.Popen(_rf_cmd, stdout=_rf_log_fh, stderr=subprocess.STDOUT, env=_sub_env())
+                st.session_state["trades_proc"] = _rf_proc
+                logger.info("update_trades.py --xml-only started pid={}", _rf_proc.pid)
+            else:
+                _launch_flex_refresh(year=int(_rf_year))
+            st.rerun()
+        if not _flex_running and "_trades_exit" not in st.session_state:
+            _rf_age_lbl = _pkl_age("", path=nav_path)
+            _rf_warn = "⚠ TOKEN / TRADES_FLEXID not set — XML only mode" if not _api_ready else ""
+            st.caption(_rf_warn or f"flex_nav.pkl — {_rf_age_lbl}")
+
         # ── Result displays ────────────────────────────────────────────────────────
         # OHLC status
         if _ohlc_running:
@@ -2184,20 +2225,15 @@ def render_analysis() -> None:
             _ohlc_post_rc = st.session_state["_ohlc_exit"]
             _render_log_expander("📋 OHLC log", _OHLC_LOG, expanded=_ohlc_post_rc != 0)
 
-        # Update Trades status (auto-triggered after OHLC)
+        # Refresh Flex status
         if st.session_state.get("trades_proc") is not None:
-            st.info("⏳ Update Trades running in background…")
+            st.info("⏳ Refresh Flex running in background…")
         elif "_trades_exit" in st.session_state:
             _ut_rc = st.session_state["_trades_exit"]
             if _ut_rc == 0:
-                st.success("✅ Update Trades completed")
+                st.success("✅ Refresh Flex completed")
             else:
-                st.error(f"❌ Update Trades failed (exit {_ut_rc})")
-        else:
-            _warn = []
-            if not _api_ready:
-                _warn.append("⚠ TOKEN / TRADES_FLEXID not set — API disabled")
-            st.caption("  ".join(_warn) if _warn else f"flex_trades.pkl — {_pkl_age('', path=flex_path)}")
+                st.error(f"❌ Refresh Flex failed (exit {_ut_rc})")
 
         # Backtest status / results — rendered by auto-refreshing fragment
         _bt_status_fragment()

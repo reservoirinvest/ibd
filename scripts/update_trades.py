@@ -1,19 +1,19 @@
-"""Standalone script to refresh flex_trades.pkl from API and/or XML files.
+"""Refresh flex_trades.pkl, flex_cash.pkl, and flex_nav.pkl.
 
 Usage:
-    uv run python scripts/update_trades.py            # API + any XML in data/master/
-    uv run python scripts/update_trades.py --xml-only # XML only (no API call)
-    uv run python scripts/update_trades.py --api-only # API only (ignore XML files)
+    uv run python scripts/update_trades.py               # API download + parse XMLs (current year)
+    uv run python scripts/update_trades.py --year 2024   # API download for a specific year + parse
+    uv run python scripts/update_trades.py --xml-only    # parse existing XMLs only (no API call)
 
-The script mirrors the dashboard "Update Trades" button:
-  1. Downloads via IBKR Flex API (TOKEN + TRADES_FLEXID in .env), trimming to
-     3 days before the pkl's most-recent entry to skip old already-merged rows.
-  2. Merges any flex_*.xml files found in data/master/.
-  3. Combines both sources into flex_trades.pkl using merge_into_pickle() which
-     deduplicates on trade ID (or a composite natural key for older exports).
+API mode calls download_flex_xml() which downloads the Flex statement for the
+given year and saves it as data/master/{year}.xml. One API call covers all
+sections (Trades, CashTransactions, EquitySummaryByReportDateInBase).  All
+*.xml files in data/master/ are then parsed and merged into the three pickles.
 
-Run this script quarterly (or after a manual portal XML download) to keep
-flex_trades.pkl current.  The dashboard's History tab reads the same pkl.
+For historical years: set the portal query period to 'Custom Date Range'
+(Jan 1 – Dec 31 of that year) before running with --year <year>.
+
+Run weekly (or use the dashboard's Refresh Flex button which auto-triggers this).
 """
 from __future__ import annotations
 
@@ -29,8 +29,6 @@ load_dotenv()
 
 _HERE = Path(__file__).resolve().parent.parent
 
-# Redirect verbose INFO/DEBUG logs to file; suppress terminal output.
-# The script prints one summary line to stdout when done.
 logger.remove()
 _SCRIPT_LOG = _HERE / "log" / "update_trades.log"
 _SCRIPT_LOG.parent.mkdir(exist_ok=True)
@@ -38,11 +36,21 @@ logger.add(str(_SCRIPT_LOG), level="DEBUG", encoding="utf-8", rotation="10 MB", 
 sys.path.insert(0, str(_HERE))
 
 from src.dashboard.settings import get_settings
-from src.flex.fetch import download_trades, load_xml, merge_into_pickle
-from src.flex.parse import mask_accounts, normalize
+from src.flex.fetch import (
+    download_flex_xml,
+    load_cash_xml,
+    load_nav_xml,
+    load_xml,
+    merge_cash_into_pickle,
+    merge_into_pickle,
+    merge_nav_into_pickle,
+)
+from src.flex.parse import mask_accounts, normalize, normalize_cash
 
-_MASTER = _HERE / "data" / "master"
-_PKL    = _MASTER / "flex_trades.pkl"
+_MASTER   = _HERE / "data" / "master"
+_PKL      = _MASTER / "flex_trades.pkl"
+_CASH_PKL = _MASTER / "flex_cash.pkl"
+_NAV_PKL  = _MASTER / "flex_nav.pkl"
 
 
 def _acct_map(settings) -> dict[str, str]:
@@ -56,60 +64,58 @@ def _acct_map(settings) -> dict[str, str]:
     }
 
 
-def run(api: bool = True, xml: bool = True) -> None:
-    s = get_settings()
-    amap = _acct_map(s)
+def run(api: bool = True, year: int | None = None) -> None:
+    s     = get_settings()
+    amap  = _acct_map(s)
+    token = s.token.get_secret_value()
+    qid   = s.trades_flexid.get_secret_value()
     sources: list[pd.DataFrame] = []
 
-    # Reference date: 3 days before the pkl's most-recent entry.
-    pkl_max_dt: pd.Timestamp | None = None
-    if _PKL.exists():
-        df_ex = pd.read_pickle(_PKL)
-        if not df_ex.empty and "dateTime" in df_ex.columns:
-            t = df_ex["dateTime"].max()
-            pkl_max_dt = t if pd.notna(t) else None
     before = len(pd.read_pickle(_PKL)) if _PKL.exists() else 0
 
-    # ── API ───────────────────────────────────────────────────────────────────
+    # ── API: download once, save as {year}.xml ────────────────────────────────
+    # download_flex_xml() saves a single file covering all sections so the XML
+    # path below handles trades, cash, and NAV in one pass.
     if api:
-        token = s.token.get_secret_value()
-        qid   = s.trades_flexid.get_secret_value()
         if not (token and qid):
-            logger.warning("TOKEN / TRADES_FLEXID not set in .env — skipping API")
+            logger.warning("TOKEN / TRADES_FLEXID not set in .env — skipping API download")
         else:
-            logger.info("Downloading via Flex API query_id={}", qid)
             try:
-                df_api = mask_accounts(normalize(download_trades(token, qid)), amap)
-                if df_api.empty:
-                    logger.warning(
-                        "API returned 0 rows — ensure the IBKR portal query uses "
-                        "'Last 365 Calendar Days' (not a Custom Date Range)."
-                    )
-                else:
-                    if pkl_max_dt is not None and "dateTime" in df_api.columns:
-                        cutoff = pkl_max_dt - pd.Timedelta(days=3)
-                        df_api = df_api[df_api["dateTime"] >= cutoff]
-                    sources.append(df_api)
-                    logger.info("API: {} rows (trimmed to 3 days before pkl max)", len(df_api))
+                download_flex_xml(token, qid, _MASTER, year=year)
             except Exception as e:
                 logger.error("API download failed: {}", e)
 
-    # ── XML ───────────────────────────────────────────────────────────────────
-    if xml:
-        try:
-            raw    = load_xml(_MASTER)
-            df_xml = mask_accounts(normalize(raw), amap)
-            n_xml  = len(sorted(_MASTER.glob("*.xml")))
-            sources.append(df_xml)
-            logger.info("XML: {} rows from {} file(s)", len(df_xml), n_xml)
-        except FileNotFoundError:
-            logger.info("XML: no flex_*.xml files in {}", _MASTER)
-        except Exception as e:
-            logger.error("XML load failed: {}", e)
+    # ── XML: parse all *.xml files (includes freshly saved API file if any) ──
+    try:
+        raw   = load_xml(_MASTER)
+        df_xml = mask_accounts(normalize(raw), amap)
+        n_xml  = len(sorted(_MASTER.glob("*.xml")))
+        sources.append(df_xml)
+        logger.info("Trades XML: {} rows from {} file(s)", len(df_xml), n_xml)
+    except FileNotFoundError:
+        logger.info("XML: no *.xml files in {}", _MASTER)
+    except Exception as e:
+        logger.error("XML load failed: {}", e)
 
-    # ── Merge ─────────────────────────────────────────────────────────────────
+    try:
+        df_cash = normalize_cash(load_cash_xml(_MASTER))
+        if not df_cash.empty:
+            merge_cash_into_pickle(df_cash, _CASH_PKL)
+            logger.info("Cash XML: {} rows merged", len(df_cash))
+    except Exception as e:
+        logger.error("Cash XML load failed: {}", e)
+
+    try:
+        df_nav = load_nav_xml(_MASTER)
+        if not df_nav.empty:
+            merge_nav_into_pickle(df_nav, _NAV_PKL)
+            logger.info("NAV XML: {} rows merged", len(df_nav))
+    except Exception as e:
+        logger.error("NAV XML load failed: {}", e)
+
+    # ── Merge trades ──────────────────────────────────────────────────────────
     if not sources:
-        print("ERROR: No data from any source — pkl unchanged. See log/update_trades.log for details.")
+        print("ERROR: no XML data found — pickles unchanged. See log/update_trades.log")
         sys.exit(1)
 
     df_combined = pd.concat(sources, ignore_index=True)
@@ -123,15 +129,14 @@ def run(api: bool = True, xml: bool = True) -> None:
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Refresh flex_trades.pkl")
-    p.add_argument("--api-only", action="store_true", help="API source only")
-    p.add_argument("--xml-only", action="store_true", help="XML source only")
+    p = argparse.ArgumentParser(description="Refresh flex_trades.pkl, flex_cash.pkl, flex_nav.pkl")
+    p.add_argument("--xml-only", action="store_true", help="Parse existing XMLs only (no API call)")
+    p.add_argument("--year", type=int, default=None,
+                   help="Year for the downloaded XML filename (default: current year). "
+                        "For historical years set the portal query to the matching date range first.")
     args = p.parse_args()
-
-    if args.api_only and args.xml_only:
-        p.error("--api-only and --xml-only are mutually exclusive")
 
     run(
         api=not args.xml_only,
-        xml=not args.api_only,
+        year=args.year,
     )

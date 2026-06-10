@@ -138,6 +138,8 @@ def _render_dataframe(df: pd.DataFrame, *, rows: int, tail: bool, show_all: bool
         for val in row:
             try:
                 is_na = pd.isna(val)
+                if not isinstance(is_na, bool):
+                    is_na = False  # list/array cells are not NA
             except (TypeError, ValueError):
                 is_na = False
             if is_na:

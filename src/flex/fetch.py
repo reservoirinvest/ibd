@@ -96,6 +96,43 @@ def load_xml(xml_dir: Path) -> pd.DataFrame:
     return combined
 
 
+def download_flex_xml(
+    token: str,
+    query_id: str,
+    out_dir: Path,
+    year: int | None = None,
+) -> Path:
+    """Download a Flex statement via the API and save it as {year}.xml in out_dir.
+
+    The IBKR Flex API returns whatever period the portal query is configured for.
+    For the current year use the query's default 'Last 365 Calendar Days' setting.
+    For a historical year, temporarily set the portal query to a custom date range
+    (Jan 1 – Dec 31 of that year), then call this function with year=<year>.
+
+    One API call covers all sections (Trades, CashTransactions,
+    EquitySummaryByReportDateInBase) so the saved file is the single source of
+    truth for all three pickles.
+
+    Args:
+        token:    Flex web service token (TOKEN in .env).
+        query_id: Single Flex Query ID (TRADES_FLEXID in .env).
+        out_dir:  Directory where {year}.xml will be written (data/master/).
+        year:     Year label for the output filename. Defaults to the current year.
+
+    Returns:
+        Path to the saved XML file.
+    """
+    if year is None:
+        year = pd.Timestamp.today().year
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{year}.xml"
+    logger.info("Downloading Flex statement for {} via query_id={}", year, query_id)
+    report = FlexReport(token=token, queryId=query_id)
+    report.save(str(out_path))
+    logger.info("Saved Flex XML {} ({:,} bytes) → {}", year, out_path.stat().st_size, out_path.name)
+    return out_path
+
+
 def _download_one(token: str, query_id: str) -> pd.DataFrame:
     logger.info("API download query_id={}", query_id)
     report = FlexReport(token=token, queryId=query_id)
