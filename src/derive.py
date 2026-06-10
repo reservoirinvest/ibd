@@ -1,11 +1,11 @@
 # %%
 # IMPORTS
 import argparse as _ap
+import json
 import logging
 import os
 import time
 
-import numpy as np
 import pandas as pd
 from ib_async import Option
 from src.log_utils import setup_ib_logging, setup_logging as _setup_logging
@@ -17,6 +17,7 @@ from src.build import (
     delete_pkl_files,
     get_dte,
     get_ib_connection,
+    get_pickle,
     get_prec,
     get_volatilities_snapshot,
     load_config,
@@ -136,6 +137,7 @@ SOW_NAKEDS = config.get("SOW_NAKEDS")
 VIRGIN_CALL_STD_MULT = config.get("VIRGIN_CALL_STD_MULT")
 VIRGIN_PUT_STD_MULT = config.get("VIRGIN_PUT_STD_MULT")
 MINCUSHION = config.get("MINCUSHION", 0.20)
+COV_AGED_DTE = config.get("COV_AGED_DTE", 180)
 
 logger.info("Getting financials...")
 fin = get_financials(ACCOUNT_NO)
@@ -200,6 +202,30 @@ if _oo_reaping:
 logger.info("Connecting to IB...")
 ib = get_ib_connection("SNP", account_no=ACCOUNT_NO)
 
+# Refresh prices if the snapshot saved by build.py is stale (all NaN).
+# This happens when build.py ran pre-market and IBKR returned no price data.
+# Covers and sow both need valid undPrice/iv to compute sdev and thresholds.
+if not df_unds.empty and df_unds["price"].isna().all():
+    logger.info("df_unds prices all NaN — refreshing with live IBKR snapshot...")
+    _sym_contracts = get_pickle(ROOT / "data" / "symbols.pkl")
+    if _sym_contracts:
+        _snap = get_volatilities_snapshot(
+            _sym_contracts, market="SNP", batch_size=50, ib=ib, desc="Refreshing prices"
+        )
+        if not _snap.empty and _snap["price"].notna().any():
+            _refresh_cols = [c for c in ["price", "iv", "hv"] if c in _snap.columns]
+            df_unds = df_unds.drop(columns=_refresh_cols, errors="ignore").merge(
+                _snap[["symbol"] + _refresh_cols], on="symbol", how="left"
+            )
+            logger.info(
+                "Price refresh: %d/%d symbols with valid prices",
+                df_unds["price"].notna().sum(), len(df_unds),
+            )
+        else:
+            logger.warning("Price refresh returned no valid data — cover/sow orders may be incomplete")
+    else:
+        logger.warning("symbols.pkl not found — cannot refresh prices")
+
 # %% MAKE COVERS FOR EXPOSED AND UNCOVERED STOCK POSITIONS
 logger.info("=== MAKE COVERS FOR EXPOSED AND UNCOVERED STOCK POSITIONS ===")
 
@@ -244,21 +270,68 @@ else:
         df_cc["sdev"] = df_cc.undPrice * df_cc.vy * (df_cc.dte / 365) ** 0.5
 
         vol_based_price = df_cc.undPrice + config.get("COVER_STD_MULT") * df_cc.sdev
-        df_cc["covPrice"] = np.maximum(df_cc.avgCost + df_cc.longPutCost, vol_based_price)
+
+        # Load assignment dates from flex_trades.pkl — most recent STK BUY per symbol.
+        # Stocks held longer than COV_AGED_DTE days use vol_based_price only (earn
+        # income rather than waiting to recover cost basis). Newer assignments use
+        # max(avgCost + longPutCost, vol_based_price) to prevent selling calls below cost.
+        _assignment_dates: dict = {}
+        _flex_trades_path = ROOT / "data" / "master" / "flex_trades.pkl"
+        if _flex_trades_path.exists():
+            try:
+                _ft = pd.read_pickle(_flex_trades_path)
+                _stk_buys = _ft[(_ft["assetCategory"] == "STK") & (_ft["buySell"] == "BUY")]
+                _assignment_dates = (
+                    _stk_buys.groupby("symbol")["tradeDate"].max().to_dict()
+                )
+            except Exception as _e:
+                logger.warning(f"Could not load assignment dates from flex_trades.pkl: {_e}")
+
+        _today_ts = pd.Timestamp.now(tz=None).normalize()
+
+        def _covprice_for_row(row):
+            sym = row["symbol"]
+            default = max(row["avgCost"] + row["longPutCost"], row["vol_based_price"])
+            if sym not in _assignment_dates:
+                return default
+            assign_ts = pd.Timestamp(_assignment_dates[sym])
+            if pd.isna(assign_ts):
+                return default
+            days_held = (_today_ts - assign_ts.normalize()).days
+            if days_held > COV_AGED_DTE:
+                return row["vol_based_price"]
+            return default
+
+        df_cc["vol_based_price"] = vol_based_price
+        df_cc["covPrice"] = df_cc.apply(_covprice_for_row, axis=1)
+
+        _aged_syms = []
+        if _assignment_dates:
+            for _sym in df_cc["symbol"].unique():
+                if _sym in _assignment_dates:
+                    _ats = pd.Timestamp(_assignment_dates[_sym])
+                    if not pd.isna(_ats):
+                        _dh = (_today_ts - _ats.normalize()).days
+                        if _dh > COV_AGED_DTE:
+                            _aged_syms.append(f"{_sym}({_dh}d)")
+        if _aged_syms:
+            logger.info(f"Aged stocks using vol-only covPrice (>{COV_AGED_DTE}d): {', '.join(_aged_syms)}")
 
         no_of_options = 3
 
-        cc_long = (
-            df_cc.groupby(["symbol", "expiry"])[
-                ["symbol", "expiry", "strike", "undPrice", "sdev", "covPrice"]
-            ]
-            .apply(
-                lambda x: x[x["strike"] > x["covPrice"]]
-                .assign(diff=x["strike"] - x["covPrice"])
+        _cov_parts: list[pd.DataFrame] = []
+        for (_, _exp_unused), _cg in df_cc.groupby(["symbol", "expiry"]):
+            _cp = (
+                _cg[_cg["strike"] > _cg["covPrice"]]
+                .assign(diff=_cg["strike"] - _cg["covPrice"])
                 .sort_values("diff")
                 .head(no_of_options)
+                .drop(columns=["diff"], errors="ignore")
             )
-            .drop(columns=["level_2", "diff"], errors="ignore")
+            if not _cp.empty:
+                _cov_parts.append(_cp)
+        cc_long = pd.concat(_cov_parts) if _cov_parts else pd.DataFrame(
+            columns=["symbol", "expiry", "strike", "undPrice", "sdev", "covPrice"]
         )
 
         cov_calls = [
@@ -299,12 +372,25 @@ else:
 
             if not df_iv_cc.empty:
                 df_ccf = df_ccf.merge(df_iv_cc[["symbol", "price"]], on="symbol", how="left")
-
-                df_ccf["margin"] = df_ccf.apply(
-                    lambda x: atm_margin(x.strike, x.undPrice, get_dte(x.expiry), x.vy), axis=1
-                )
             else:
-                logger.info("No option price data available for covered calls")
+                df_ccf["price"] = float("nan")
+            _nan_cc = df_ccf["price"].isna()
+            if _nan_cc.any():
+                df_ccf.loc[_nan_cc, "price"] = df_ccf.loc[_nan_cc].apply(
+                    lambda x: max(
+                        x.undPrice * x.vy * (max(get_dte(x.expiry), 1) / 365) ** 0.5 * 0.4,
+                        0.01,
+                    ),
+                    axis=1,
+                )
+                logger.info(
+                    "Estimated theoretical price for %d covered call(s) (no live market data)",
+                    int(_nan_cc.sum()),
+                )
+            _cc_estimated = int(_nan_cc.sum())
+            df_ccf["margin"] = df_ccf.apply(
+                lambda x: atm_margin(x.strike, x.undPrice, get_dte(x.expiry), x.vy), axis=1
+            )
         else:
             logger.info("No valid contracts after qualification")
             df_ccf = pd.DataFrame()
@@ -334,7 +420,51 @@ else:
         df_cp["sdev"] = df_cp.undPrice * df_cp.vy * (df_cp.dte / 365) ** 0.5
 
         vol_based_price = df_cp.undPrice - config.get("COVER_STD_MULT") * df_cp.sdev
-        df_cp["covPrice"] = np.minimum(df_cp.avgCost, vol_based_price)
+
+        # Mirror of the long-stock aged logic: short positions held > COV_AGED_DTE days
+        # use vol_based_price only; newer assignments use min(avgCost, vol_based_price)
+        # to prevent selling puts above cost basis while in the wheel cycle.
+        _assignment_dates_cp: dict = {}
+        _flex_trades_path_cp = ROOT / "data" / "master" / "flex_trades.pkl"
+        if _flex_trades_path_cp.exists():
+            try:
+                _ft_cp = pd.read_pickle(_flex_trades_path_cp)
+                _stk_sells = _ft_cp[(_ft_cp["assetCategory"] == "STK") & (_ft_cp["buySell"] == "SELL")]
+                _assignment_dates_cp = (
+                    _stk_sells.groupby("symbol")["tradeDate"].max().to_dict()
+                )
+            except Exception as _e:
+                logger.warning(f"Could not load assignment dates (short) from flex_trades.pkl: {_e}")
+
+        _today_ts_cp = pd.Timestamp.now(tz=None).normalize()
+
+        def _covprice_for_row_cp(row):
+            sym = row["symbol"]
+            default = min(row["avgCost"], row["vol_based_price"])
+            if sym not in _assignment_dates_cp:
+                return default
+            assign_ts = pd.Timestamp(_assignment_dates_cp[sym])
+            if pd.isna(assign_ts):
+                return default
+            days_held = (_today_ts_cp - assign_ts.normalize()).days
+            if days_held > COV_AGED_DTE:
+                return row["vol_based_price"]
+            return default
+
+        df_cp["vol_based_price"] = vol_based_price
+        df_cp["covPrice"] = df_cp.apply(_covprice_for_row_cp, axis=1)
+
+        _aged_syms_cp = []
+        if _assignment_dates_cp:
+            for _sym in df_cp["symbol"].unique():
+                if _sym in _assignment_dates_cp:
+                    _ats = pd.Timestamp(_assignment_dates_cp[_sym])
+                    if not pd.isna(_ats):
+                        _dh = (_today_ts_cp - _ats.normalize()).days
+                        if _dh > COV_AGED_DTE:
+                            _aged_syms_cp.append(f"{_sym}({_dh}d)")
+        if _aged_syms_cp:
+            logger.info(f"Aged short stocks using vol-only covPrice (>{COV_AGED_DTE}d): {', '.join(_aged_syms_cp)}")
 
         no_of_options = 3
 
@@ -389,12 +519,25 @@ else:
 
             if not df_iv_cp.empty:
                 df_cpf = df_cpf.merge(df_iv_cp[["symbol", "price"]], on="symbol", how="left")
-
-                df_cpf["margin"] = df_cpf.apply(
-                    lambda x: atm_margin(x.strike, x.undPrice, get_dte(x.expiry), x.vy), axis=1
-                )
             else:
-                logger.info("No option price data available for covered puts")
+                df_cpf["price"] = float("nan")
+            _nan_cp = df_cpf["price"].isna()
+            if _nan_cp.any():
+                df_cpf.loc[_nan_cp, "price"] = df_cpf.loc[_nan_cp].apply(
+                    lambda x: max(
+                        x.undPrice * x.vy * (max(get_dte(x.expiry), 1) / 365) ** 0.5 * 0.4,
+                        0.01,
+                    ),
+                    axis=1,
+                )
+                logger.info(
+                    "Estimated theoretical price for %d covered put(s) (no live market data)",
+                    int(_nan_cp.sum()),
+                )
+            _cp_estimated = int(_nan_cp.sum())
+            df_cpf["margin"] = df_cpf.apply(
+                lambda x: atm_margin(x.strike, x.undPrice, get_dte(x.expiry), x.vy), axis=1
+            )
 
         else:
             logger.info("No valid contracts after qualification")
@@ -412,14 +555,27 @@ else:
 
         df_cov = df_cov.dropna(subset=["price"])
 
-        df_cov["xPrice"] = df_cov.apply(
-            lambda x: max(get_prec(x.price * COVXPMULT, 0.01), 0.05) if x.qty != 0 else 0,
-            axis=1,
+        _xp = df_cov["price"].apply(
+            lambda p: max(get_prec(p * COVXPMULT, 0.01) or 0.05, 0.05)
         )
+        df_cov["xPrice"] = _xp.where(df_cov["qty"] != 0, 0.0)
 
         pickle_me(df_cov, cov_path)
     else:
         logger.info("No covers generated")
+
+    try:
+        _cov_n_estimated = _cc_estimated + _cp_estimated
+    except NameError:
+        _cov_n_estimated = 0
+    (ROOT / "data" / "cover_summary.json").write_text(
+        json.dumps({
+            "processed": len(uncov_long) + len(uncov_short),
+            "generated": len(df_cov),
+            "estimated_prices": _cov_n_estimated,
+        }),
+        encoding="utf-8",
+    )
 
 # %% MAKE MONTHLY COVERED CALLS FOR MONTHLY-ONLY HELD STOCKS
 logger.info("=== MAKE MONTHLY COVERED CALLS FOR MONTHLY-ONLY HELD STOCKS ===")
@@ -526,16 +682,28 @@ logger.info("=== MAKE SOWING CONTRACTS FOR VIRGIN AND ORPHANED SYMBOLS ===")
 
 delete_pkl_files(["df_nkd.pkl"])
 
+_SOW_SKIP_PATH = ROOT / "data" / "sow_skip.json"
+
 if not SOW_NAKEDS:
     logger.info("SOW_NAKEDS=False — skipping sow generation")
+    _SOW_SKIP_PATH.unlink(missing_ok=True)
 elif fin.get("cushion", 0) < MINCUSHION:
-    logger.info("Skipping sow: cushion %s < MINCUSHION %s", f"{fin.get('cushion', 0):.1%}", f"{MINCUSHION:.1%}")
+    _cushion_actual = fin.get("cushion", 0)
+    logger.info("Skipping sow: cushion %s < MINCUSHION %s", f"{_cushion_actual:.1%}", f"{MINCUSHION:.1%}")
+    _SOW_SKIP_PATH.write_text(
+        json.dumps({"reason": "cushion", "actual": _cushion_actual, "required": MINCUSHION}),
+        encoding="utf-8",
+    )
 else:
+    _SOW_SKIP_PATH.unlink(missing_ok=True)
     df_v = df_unds[
         ((df_unds.state == "virgin") | (df_unds.state == "orphaned"))
         & ~df_unds.symbol.isin(_oo_sowing)
         & ~df_unds.symbol.isin(_monthly_syms)
     ].reset_index(drop=True)
+    logger.info("Sow candidates (virgin/orphaned, weekly-eligible): %d", len(df_v))
+    if df_v.empty:
+        logger.info("Sow: no virgin/orphaned symbols — skipping chain lookup")
     if _monthly_syms:
         _skipped_monthly = set(
             df_unds.loc[
@@ -547,8 +715,16 @@ else:
             logger.info("Skipping sow for %d monthly-only symbols", len(_skipped_monthly))
 
     sow_chains = chains[chains["expiry"].apply(_is_weekly_expiry)]
+    logger.info(
+        "Weekly chain rows after 3rd-Friday filter: %d (expiries: %s)",
+        len(sow_chains),
+        sorted(sow_chains["expiry"].unique())[:5] if not sow_chains.empty else [],
+    )
+    _sow_sym_chains = sow_chains[sow_chains.symbol.isin(df_v.symbol.to_list())]
+    if _sow_sym_chains.empty:
+        logger.info("Sow: no weekly chains found for virgin/orphaned symbols")
     df_virg = sow_chains.loc[
-        sow_chains[sow_chains.symbol.isin(df_v.symbol.to_list())]
+        _sow_sym_chains
         .groupby(["symbol", "strike"])["dte"]
         .apply(lambda x: x.sub(VIRGIN_DTE).abs().idxmin())
     ]
@@ -562,12 +738,11 @@ else:
     no_of_options = 4
 
     # Per-symbol VIRGIN_PUT_STD_MULT overrides (set via dashboard REFINE Overrides panel)
-    import json as _json_mod
     _overrides_file = ROOT / "data" / "symbol_overrides.json"
     _sym_put_mult: dict[str, float] = {}
     if _overrides_file.exists():
         try:
-            _sym_put_mult = _json_mod.loads(
+            _sym_put_mult = json.loads(
                 _overrides_file.read_text(encoding="utf-8")
             ).get("VIRGIN_PUT_STD_MULT", {})
             if _sym_put_mult:
@@ -586,10 +761,17 @@ else:
 
     df_virg = df_virg.sort_values(["symbol", "expiry", "strike"], ascending=[True, True, False])
 
-    virg_short = (
-        df_virg.groupby(["symbol", "expiry"])[["symbol", "expiry", "strike", "undPrice", "sdev"]]
-        .apply(_closest_put)
-        .drop(columns=["level_2", "diff"], errors="ignore")
+    _sow_parts: list[pd.DataFrame] = []
+    for (_, _), _sg in df_virg.groupby(["symbol", "expiry"]):
+        _sp = _closest_put(_sg)
+        if not _sp.empty:
+            _sow_parts.append(_sp.drop(columns=["diff"], errors="ignore"))
+    virg_short = pd.concat(_sow_parts) if _sow_parts else pd.DataFrame(
+        columns=["symbol", "expiry", "strike", "undPrice", "sdev"]
+    )
+    logger.info(
+        "Sow: %d put candidates after strike filter (threshold: undPrice - %.1f×sdev)",
+        len(virg_short), v_std,
     )
 
     virg_puts = [

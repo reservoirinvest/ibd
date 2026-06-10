@@ -819,7 +819,7 @@ def get_volatilities_snapshot(
     contracts: List[Contract],
     market: str = "SNP",
     batch_size: int = 50,
-    max_wait_time: int = 10,  # Note: max_wait_time is used as sleep_time in async call
+    max_wait_time: int = 10,  # seconds to wait for each ticker (IV can be slow)
     ib: IB = None,
     desc: str = "Fetching volatilities",
 ) -> pd.DataFrame:
@@ -919,29 +919,35 @@ async def get_an_iv(
 ) -> dict:
     stock_contract = Stock(item, "SMART", "USD") if isinstance(item, str) else item
 
-    ticker = ib.reqMktData(
-        stock_contract, genericTickList=gentick
-    )  # Request market data with gentick
+    ticker = ib.reqMktData(stock_contract, genericTickList=gentick)
 
-    await asyncio.sleep(sleep_time)  # Use asyncio.sleep instead of ib.sleep
+    await asyncio.sleep(sleep_time)
 
-    # Check if ticker.impliedVolatility is NaN and wait if true
-
+    # IV can be slow to arrive; give it one extra window before cancelling.
     if pd.isna(ticker.impliedVolatility):
         await asyncio.sleep(2)
 
     ib.cancelMktData(stock_contract)
 
-    # Return a dictionary with the symbol, price, implied volatility, and historical volatility
     key = item if isinstance(item, str) else stock_contract
 
-    price = ticker.last if not pd.isna(ticker.last) else ticker.close  # Get last price
+    # Price priority: last trade → bid/ask midpoint → previous close
+    if not pd.isna(ticker.last) and ticker.last > 0:
+        price = ticker.last
+    elif (
+        not pd.isna(ticker.bid)
+        and not pd.isna(ticker.ask)
+        and ticker.bid > 0
+        and ticker.ask > 0
+    ):
+        price = (ticker.bid + ticker.ask) / 2
+    else:
+        price = ticker.close
 
-    iv = ticker.impliedVolatility  # Get implied volatility from ticker
+    iv = ticker.impliedVolatility
+    hv = ticker.histVolatility
 
-    hv = ticker.histVolatility  # Get historical volatility from ticker
-
-    return {key: {"price": price, "iv": iv, "hv": hv}}  # Return structured data
+    return {key: {"price": price, "iv": iv, "hv": hv}}
 
 #%%
 # Option Chains

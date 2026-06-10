@@ -95,6 +95,7 @@ Always **merge, never replace** pickles — use `merge_cash_into_pickle` / `merg
 - **US account sow**: weekly S&P 500 only (skip 3rd-Friday expiry). SG account is exempt (LSE, no options).
 - **Monthly-only symbols** (~257/502 S&P 500): excluded from weekly sow; derive.py generates breakeven monthly CCs for assigned monthly stock.
 - **Win rate / profit factor**: must be computed on closed **OPT** trades only (`assetCategory == "OPT"`). Including STK trades halves win rate for wheel symbols.
+- **Covered call `covPrice`**: default floor is `max(avgCost + longPutCost, vol_based_price)` — prevents selling calls below cost basis while in the wheel cycle. Exception: if the stock has been held > `COV_AGED_DTE` days (default 180, config key `COV_AGED_DTE`) since the most recent STK BUY (from `flex_trades.pkl`), `covPrice = vol_based_price` only — prioritise income over cost recovery for long-held positions. Aged symbols are logged at INFO level.
 - **Flex `_dedup`**: uses ID columns only when ≥80% of rows are non-null — prevents NaN collapse of historical data.
 
 ---

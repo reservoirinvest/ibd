@@ -78,6 +78,17 @@ Fixed dock visible on all tabs. Queries the full live data context and returns a
 ## Configuration
 
 Edit `config/snp_config.yml` for PORT, CID, MINCUSHION, MAX_DTE, and strategy parameters.
+
+Key cover parameters:
+
+| Key | Default | Description |
+|---|---|---|
+| `COVER_ME` | `true` | Enable covered call generation |
+| `COVER_MIN_DTE` | `4` | Minimum DTE for covered call expiry search window |
+| `COVER_STD_MULT` | `0.5` | Strike floor = undPrice + mult × sdev (1 std dev at DTE) |
+| `COVXPMULT` | `1.2` | Expiry multiplier for cover DTE window |
+| `COV_AGED_DTE` | `180` | Days since assignment after which covPrice switches from `max(avgCost, vol_based_price)` to `vol_based_price` only — earn income rather than waiting to recover cost basis on long-held positions. Assignment date is loaded from `flex_trades.pkl`. |
+
 Set secrets in `.env`:
 
 ```

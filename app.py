@@ -415,6 +415,7 @@ _CFG_KEYS: list[tuple[str, str, type, object]] = [
     ("cfg_cover_min_dte",    "COVER_MIN_DTE",         int,   4),
     ("cfg_cover_std_mult",   "COVER_STD_MULT",        float, 0.65),
     ("cfg_covxpmult",        "COVXPMULT",             float, 1.2),
+    ("cfg_cov_aged_dte",     "COV_AGED_DTE",          int,   180),
     ("cfg_sow_nakeds",       "SOW_NAKEDS",            bool,  True),
     ("cfg_virgin_dte",       "VIRGIN_DTE",            int,   5),
     ("cfg_virgin_call_std",  "VIRGIN_CALL_STD_MULT",  float, 3.8),
@@ -1200,6 +1201,15 @@ def render_orders() -> None:
     _raw_monthly_cov  = _load_pkl("df_monthly_cov.pkl")
     _raw_nkd          = _load_pkl("df_nkd.pkl")
     _raw_reap         = _load_pkl("df_reap.pkl")
+
+    _cov_summary: dict = {}
+    try:
+        _cov_sum_path = _DATA_DIR / "cover_summary.json"
+        if _cov_sum_path.exists():
+            import json as _jcs
+            _cov_summary = _jcs.loads(_cov_sum_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
     try:
         _yml_protect = (yaml.safe_load(_CFG_PATH.read_text(encoding="utf-8")) or {}).get(
             "PROTECT_ME", False
@@ -1288,6 +1298,20 @@ def render_orders() -> None:
         if n_cov else "📈 Cover — 0 orders"
     )
     with st.expander(cov_label, expanded=True):
+        _cov_processed = _cov_summary.get("processed", 0)
+        _cov_generated = _cov_summary.get("generated", 0)
+        _cov_estimated = _cov_summary.get("estimated_prices", 0)
+        _cov_missed = max(0, _cov_processed - _cov_generated)
+        if _cov_missed > 0:
+            st.caption(
+                f"⚠ {_cov_missed} of {_cov_processed} uncovered/exposed position(s) "
+                "have no cover order — check qualify / strike filter / market hours."
+            )
+        if _cov_estimated > 0:
+            st.caption(
+                f"ℹ {_cov_estimated} order(s) use a theoretical price estimate "
+                "(no live market data — rerun Generate during market hours for live prices)."
+            )
         if _raw_cov.empty:
             st.info("No cover suggestions — run Generate Orders or no exposed positions.")
         elif df_cov.empty:
@@ -1385,13 +1409,30 @@ def render_orders() -> None:
             st.caption("Filter: off — all symbols shown")
         else:
             st.caption("No backtest results — all symbols shown")
-        if _raw_nkd.empty and _ok["cushion_breach"]:
-            st.info(
-                "No sow suggestions as cushion is less. "
-                "Adjust MINCUSHION and rerun generate, if sow is needed."
-            )
-        elif _raw_nkd.empty:
-            st.info("No sow suggestions — run Generate Orders or no virgin/orphaned positions.")
+        if _raw_nkd.empty:
+            _skip_path = _DATA_DIR / "sow_skip.json"
+            _skip_reason: dict = {}
+            try:
+                if _skip_path.exists():
+                    import json as _j
+                    _skip_reason = _j.loads(_skip_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            if _skip_reason.get("reason") == "cushion":
+                _act = _skip_reason.get("actual", 0)
+                _req = _skip_reason.get("required", settings.min_cushion)
+                st.info(
+                    f"No sow orders — last Generate skipped sow because cushion was "
+                    f"**{_act:.1%}** < MINCUSHION **{_req:.1%}**. "
+                    "Free up margin or lower MINCUSHION in config and rerun Generate."
+                )
+            elif _ok["cushion_breach"]:
+                st.info(
+                    f"No sow suggestions — cushion {_ok['cushion']:.1%} < MINCUSHION "
+                    f"{settings.min_cushion:.1%}. Free up margin or lower MINCUSHION in config."
+                )
+            else:
+                st.info("No sow suggestions — run Generate Orders or no virgin/orphaned positions.")
         elif _df_nkd_disp.empty:
             st.info("No sow orders match the current filter.")
         else:
@@ -1758,6 +1799,9 @@ def render_config_panel() -> None:
         st.number_input("COVXPMULT", min_value=0.0, step=0.05, format="%.2f",
                         key="cfg_covxpmult",
                         help="Multiplier on market price for execution limit")
+        st.number_input("COV_AGED_DTE", min_value=1, step=1,
+                        key="cfg_cov_aged_dte",
+                        help="Stocks held longer than this many days since assignment use vol-based price only (income over cost-recovery). Default: 180.")
 
     st.divider()
 
@@ -2517,11 +2561,11 @@ def render_analysis() -> None:
             for _sym in perf["symbol"]:
                 _u = _unds.loc[_sym] if _sym in _unds.index else None
                 _extra.append({
-                    "current_price": round(float(_u["price"]), 2) if _u is not None else None,
-                    "hv":  round(float(_u["hv"]) * 100, 1)  if _u is not None else None,
-                    "iv":  round(float(_u["iv"]) * 100, 1)  if _u is not None else None,
+                    "current_price": round(float(_u["price"]), 2) if _u is not None and pd.notna(_u["price"]) else None,
+                    "hv":  round(float(_u["hv"]) * 100, 1)  if _u is not None and pd.notna(_u["hv"])  else None,
+                    "iv":  round(float(_u["iv"]) * 100, 1)  if _u is not None and pd.notna(_u["iv"])  else None,
                     "position": _pos_map.get(_sym, ""),
-                    "margin": round(float(_u["margin"]), 0) if _u is not None else None,
+                    "margin": round(float(_u["margin"]), 0) if _u is not None and pd.notna(_u["margin"]) else None,
                 })
             _extra_df = pd.DataFrame(_extra)
             _sym_idx = perf.columns.get_loc("symbol") + 1
@@ -2829,6 +2873,7 @@ def _render_symbol_deep_dive() -> None:
                 _sel_margin = (
                     float(_unds.loc[selected_sym, "margin"])
                     if not _unds.empty and selected_sym in _unds.index
+                    and pd.notna(_unds.loc[selected_sym, "margin"])
                     else 0.0
                 )
                 if _nlv > 0 and _sel_margin > 0 and _qty_mult > 0:
@@ -4051,17 +4096,39 @@ def _build_history_context() -> dict:
     if total_commissions is not None:
         global_stats["total_commissions_usd"] = total_commissions
 
-    # All closed OPT trades, including pnl=0 (assignments and worthless expirations where IBKR
-    # books the premium to the stock cost basis at assignment time, not the option close row).
-    # Used for both per_symbol (n count) and trade_log so the two sources are always consistent.
-    # STK assignment trades are excluded (assetCategory == "OPT") — their inclusion would halve
-    # the apparent win rate for wheel symbols.
+    # All closed OPT trades. STK assignment trades excluded (assetCategory == "OPT") — their
+    # inclusion would halve the apparent win rate for wheel symbols.
     _all_closed_opt = (
         df[(df["openCloseIndicator"] == "C") & (df["assetCategory"] == "OPT")]
         if all(c in df.columns for c in ("openCloseIndicator", "assetCategory"))
         else closed
     )
     opens = df[df["openCloseIndicator"] == "O"] if "openCloseIndicator" in df.columns else df
+
+    # Patch pnl=0 close rows: IBKR zeroes the option pnl at assignment and absorbs the premium
+    # into the stock cost basis instead. Recover the opening-leg premium so per_symbol and
+    # trade_log show accurate wheel-cycle P&L.
+    _join_keys = [c for c in [sym_col, "putCall", "strike", "expiry"] if c in df.columns]
+    if (
+        _join_keys
+        and {"tradePrice", "quantity"}.issubset(opens.columns)
+        and not opens.empty
+        and (_all_closed_opt["pnl"] == 0).any()
+    ):
+        _op = opens.copy()
+        _mult = _op["multiplier"] if "multiplier" in _op.columns else 100
+        _sign = (
+            _op["buySell"].map({"SELL": 1.0, "BUY": -1.0}).fillna(0.0)
+            if "buySell" in _op.columns else 1.0
+        )
+        _op["_prem"] = _sign * _op["tradePrice"].abs() * _op["quantity"].abs() * _mult
+        _prem_map = _op.groupby(_join_keys, as_index=False)["_prem"].sum()
+        _zero_mask = _all_closed_opt["pnl"] == 0
+        _all_closed_opt = _all_closed_opt.copy()
+        _merged = _all_closed_opt.loc[_zero_mask, _join_keys].merge(
+            _prem_map, on=_join_keys, how="left"
+        )
+        _all_closed_opt.loc[_zero_mask, "pnl"] = _merged["_prem"].fillna(0.0).values
 
     per_symbol: list[dict] = []
     for sym, grp in _all_closed_opt.groupby(sym_col):
