@@ -9,8 +9,11 @@ import argparse
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 from loguru import logger
 
@@ -29,6 +32,18 @@ def main() -> None:
     parser.add_argument("--dte", type=int, default=35,
                         help="Target DTE for simulated option sells (default: 35)")
     args = parser.parse_args()
+
+    # ── Regenerate symbol_categories.pkl if df_chains.pkl is available ───────
+    from update_symbol_categories import classify_weeklies, CHAINS_PATH, OUT_PATH as CATS_PATH
+    if CHAINS_PATH.exists():
+        _chains = pd.read_pickle(CHAINS_PATH)
+        _df_cats = classify_weeklies(_chains)
+        _df_cats.to_pickle(CATS_PATH)
+        _n_w = int(_df_cats["is_weekly"].sum())
+        _n_m = int((~_df_cats["is_weekly"]).sum())
+        logger.info("Updated symbol_categories.pkl — {} weekly, {} monthly-only", _n_w, _n_m)
+    else:
+        logger.warning("df_chains.pkl not found — symbol_categories.pkl not updated")
 
     logger.info("Starting synthetic backtest (DTE target={})", args.dte)
     results, suggested = run_backtest(

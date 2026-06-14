@@ -100,6 +100,53 @@ Always **merge, never replace** pickles — use `merge_cash_into_pickle` / `merg
 
 ---
 
+## Position & symbol state logic
+
+### `df_pf` states — set by `classify_pf()` in `src/classify.py`
+
+Each portfolio row gets exactly one state. Rules apply in order; later rules override earlier ones:
+
+| State | Condition |
+|---|---|
+| `sowed` | Short option (`position < 0`) **and no STK position for that symbol** |
+| `covering` | Short option AND symbol has long STK (short call) or short STK (short put) |
+| `protecting` | Long option (`position > 0`) |
+| `orphaned` | Long option with no STK position for that symbol |
+| `zen` | STK with both a `covering` and a `protecting` option |
+| `unprotected` | STK with `covering` but no `protecting` option |
+| `uncovered` | STK with `protecting` but no `covering` option |
+| `exposed` | STK with neither covering nor protecting option |
+| `unclassified` | Anything unmatched |
+
+**Key invariant:** `sowed` excludes symbols with any STK position — a covering option can never be `sowed`. The `covering` rule runs after to label those options, but it is never an override of `sowed`.
+
+### `df_unds` states — set by `update_unds_status()` in `src/classify.py`
+
+Each symbol in the universe gets one state, applied in priority order:
+
+1. **Copied from STK row in df_pf** — `exposed`, `uncovered`, `unprotected`, `zen`
+2. **`virgin`** — symbol not in df_pf at all
+3. **`zen`** (override) — triggered by: pending covering+protecting orders, straddled position, active sowing order, uncovered+covering order, unprotected+protecting order, orphaned+de-orphaning order, sowed+reaping order
+4. **`unreaped`** — df_pf state is `sowed` (short option, no STK) AND no active `reaping` open order
+
+### Open order states — set by `classify_open_orders()` in `src/classify.py`
+
+| State | Condition |
+|---|---|
+| `covering` | SELL option where symbol has a matching STK position |
+| `protecting` | BUY option where symbol has a matching STK position |
+| `sowing` | SELL option where symbol has no STK position |
+| `reaping` | BUY option matching an existing short option in df_pf |
+| `de-orphaning` | SELL option matching an existing option in df_pf |
+
+### How `derive.py` consumes these states
+
+- **Reap candidates**: `df_pf[state == "sowed"]` — directly usable, no secondary STK check needed
+- **Open order guard** (`_oo_covering`, `_oo_sowing`, `_oo_protecting`): symbols excluded from each generation section to prevent duplicate orders
+- **`unreaped` in df_unds**: drives reap order generation loop
+
+---
+
 ## LLM / Ask AI context
 
 Built in `build_llm_context()` near bottom of `app.py`. Keys include: live positions, account metrics, Greeks, trade history (last 200 + global stats), backtest scores, OHLC stats + monthly prices, consolidated NAV history + KPIs (Sharpe, TWR, max drawdown), SPY/QQQ monthly closes, cash transactions, symbol classifications, suggested orders. Ghost-position multi-layer defence prevents stale positions from leaking into context.

@@ -768,13 +768,14 @@ def kpi_strip() -> None:
     g = greek_dollar_sums(positions, snap.tickers)
     av = _select_account_values(snap, acct)
     from decimal import Decimal as _D
-    opt_val    = float(av.get("OptionMarketValue", _D("0")) or 0)
-    stock_val  = float(av.get("StockMarketValue",  _D("0")) or 0)
-    dividend   = float(av.get("AccruedDividend",   _D("0")) or 0)
-    init_mg    = float(av.get("InitMarginReq",     _D("0")) or 0)
-    avail_fnds = float(av.get("AvailableFunds",    _D("0")) or 0)
-    buy_pow    = float(av.get("BuyingPower",        _D("0")) or 0)
-    leverage_s = float(av.get("Leverage-S",         _D("0")) or 0)
+    opt_val    = float(av.get("OptionMarketValue",  _D("0")) or 0)
+    stock_val  = float(av.get("StockMarketValue",   _D("0")) or 0)
+    cash_val   = float(av.get("TotalCashBalance",   _D("0")) or 0)
+    dividend   = float(av.get("AccruedDividend",    _D("0")) or 0)
+    init_mg    = float(av.get("InitMarginReq",      _D("0")) or 0)
+    avail_fnds = float(av.get("AvailableFunds",     _D("0")) or 0)
+    buy_pow    = float(av.get("BuyingPower",         _D("0")) or 0)
+    leverage_s = float(av.get("Leverage-S",          _D("0")) or 0)
 
     # Drop withstand — goes into row 1 col 3 (in line with NLV)
     if snap.account_values and not snap.positions.empty:
@@ -805,6 +806,23 @@ def kpi_strip() -> None:
         _dr_r4_val = ""
         _dr_r4_tip = ""
 
+    # MTD Interest from flex_cash.pkl
+    _mtd_interest = 0.0
+    _cash_pkl = _MASTER_DIR / "flex_cash.pkl"
+    if _cash_pkl.exists():
+        try:
+            _df_cash = pd.read_pickle(_cash_pkl)
+            if not _df_cash.empty and {"type", "amount", "date"}.issubset(_df_cash.columns):
+                _today = pd.Timestamp.today()
+                _mtd_mask = (
+                    _df_cash["type"].str.contains("Interest", case=False, na=False)
+                    & (pd.to_datetime(_df_cash["date"]).dt.year  == _today.year)
+                    & (pd.to_datetime(_df_cash["date"]).dt.month == _today.month)
+                )
+                _mtd_interest = float(_df_cash.loc[_mtd_mask, "amount"].sum())
+        except Exception:
+            pass
+
     min_c_pct = f"{settings.min_cushion:.0%}"
 
     def _lbl(text: str, tip: str) -> str:
@@ -829,40 +847,42 @@ def kpi_strip() -> None:
         _dr_r1_val,
     )
 
-    # Row 1: NLV | Drop withstand | Cushion (min X% below) | Excess Liq
+    # Row 1: NLV | Stock Value | Opt Value | Cash
     row1 = [
         _cell(_lbl("NLV", "Net Liquidation Value: total portfolio value including cash, stocks and options at current market prices."), money(k["nlv"])),
-        _dr_cell1,
-        _cell(_lbl_sub("Cushion", f"Margin cushion = Excess Liquidity ÷ NLV. Alert threshold: {min_c_pct}. Breach turns red.", f"min {min_c_pct}"), pct(k["cushion"]), k["cushion_breach"]),
-        _cell(_lbl("Excess Liq", "Excess Liquidity: funds available above the maintenance margin requirement."), money(k["excess_liquidity"])),
+        _cell(_lbl("Stock Value", "Total market value of all stock positions at current prices (StockMarketValue)."), money(stock_val)),
+        _cell(_lbl("Opt Value", "Option Market Value: total mark-to-market value of all option positions."), money(opt_val)),
+        _cell(_lbl("Cash", "Total cash balance across all currencies (TotalCashBalance)."), money(cash_val)),
     ]
-    # Row 2: ΣΔ | ΣΓ | ΣΘ | ΣΝ  (Delta → Gamma → Theta → Volatility/Vega)
+    # Row 2: ΣΔ | ΣΓ | ΣΘ | ΣΝ
     row2 = [
         _cell(_lbl("&#x3A3;&#x394; ($)", "Portfolio Dollar Delta: P&amp;L change for a 1-point broad market move."), signed_money(g["delta_$"])),
         _cell(_lbl("&#x3A3;&#x3B3; ($)", "Portfolio Dollar Gamma: rate of change of dollar delta per 1-point move."), signed_money(g["gamma_$"])),
         _cell(_lbl("&#x3A3;&#x398; ($/d)", "Portfolio Dollar Theta: daily time decay across all options in dollars. Positive = net premium seller collecting theta."), signed_money(g["theta_$"])),
         _cell(_lbl("&#x3A3;&#x3BD; ($)", "Portfolio Dollar Vega: P&amp;L sensitivity to a 1% rise in implied volatility across all options."), signed_money(g["vega_$"])),
     ]
-    # Row 3: Init Margin | Leverage-S | Buying Power | Avail Funds
+    # Row 3: US+SG drop | US drop | Cushion | Dividend
     row3 = [
-        _cell(_lbl("Init Margin", "Initial Margin Requirement: equity needed to open current positions (InitMarginReq)."), money(init_mg)),
-        _cell(_lbl("Leverage-S", "Short leverage: portfolio exposure ÷ equity. Higher = more leveraged (Leverage-S)."), f"{leverage_s:.2f}×"),
-        _cell(_lbl("Buying Power", "Maximum new position size without adding more funds (BuyingPower)."), money(buy_pow)),
-        _cell(_lbl("Avail Funds", "Funds available for trading above the maintenance margin (AvailableFunds)."), money(avail_fnds)),
-    ]
-    # Row 4: Opt Value | Stock Value | Maint Margin | Dividend
-    row4 = [
-        _cell(_lbl("Opt Value", "Option Market Value: total mark-to-market value of all option positions."), money(opt_val)),
-        _cell(_lbl("Stock Value", "Total market value of all stock positions at current prices (StockMarketValue)."), money(stock_val)),
-        _cell(_lbl("Maint Margin", "Maintenance Margin Requirement: minimum equity you must hold to keep current positions open."), money(k["maint_margin"])),
+        _dr_cell1,
+        _cell(_lbl(_dr_r4_lbl, _dr_r4_tip) if _dr_r4_lbl else _lbl("US drop", ""), _dr_r4_val if _dr_r4_lbl else "—"),
+        _cell(_lbl_sub("Cushion", f"Margin cushion = Excess Liquidity ÷ NLV. Alert threshold: {min_c_pct}. Breach turns red.", f"min {min_c_pct}"), pct(k["cushion"]), k["cushion_breach"]),
         _cell(_lbl("Dividend", "Accrued dividends not yet received (AccruedDividend)."), money(dividend)),
     ]
+    # Row 4: Init Margin | Maint Margin | Leverage | MTD Interest
+    row4 = [
+        _cell(_lbl("Init Margin", "Initial Margin Requirement: equity needed to open current positions (InitMarginReq)."), money(init_mg)),
+        _cell(_lbl("Maint Margin", "Maintenance Margin Requirement: minimum equity you must hold to keep current positions open."), money(k["maint_margin"])),
+        _cell(_lbl("Leverage-S", "Short leverage: portfolio exposure ÷ equity. Higher = more leveraged (Leverage-S)."), f"{leverage_s:.2f}×"),
+        _cell(_lbl("MTD Interest", "Month-to-date interest income from flex_cash.pkl (current calendar month)."), signed_money(_mtd_interest)),
+    ]
+    # Row 5: Buying Power | Avail Funds | Excess Liq
+    row5 = [
+        _cell(_lbl("Buying Power", "Maximum new position size without adding more funds (BuyingPower)."), money(buy_pow)),
+        _cell(_lbl("Avail Funds", "Funds available for trading above the maintenance margin (AvailableFunds)."), money(avail_fnds)),
+        _cell(_lbl("Excess Liq", "Excess Liquidity: funds available above the maintenance margin requirement."), money(k["excess_liquidity"])),
+    ]
 
-    all_rows = [row1, row2, row3, row4]
-    if _dr_r4_lbl:
-        all_rows.append([
-            _cell(_lbl(_dr_r4_lbl, _dr_r4_tip), _dr_r4_val),
-        ])
+    all_rows = [row1, row2, row3, row4, row5]
 
     html_parts = ['<div class="kpi-band">']
     for i, row_cells in enumerate(all_rows):

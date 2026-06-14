@@ -308,27 +308,38 @@ def atm_margin(strike, undPrice, dte, vy):
 @lru_cache(maxsize=1)
 def _fetch_snp_symbols() -> pd.Series:
     """Fetch S&P 500 symbols from Wikipedia (cached)."""
-    try:
-        headers = {'User-Agent': USER_AGENT}
-        snp_table = pd.read_html(
-            SNP_URL, 
-            header=0, 
-            attrs={"id": "constituents"}, 
-            flavor='lxml', 
-            storage_options=headers
-        )[0]
-        return snp_table["Symbol"]
-    except Exception as e:
-        logger.error(f"Failed to retrieve S&P 500 symbols: {e}")
-        return pd.Series(dtype=str)
+    import io
+    import requests
+    import urllib3
+    headers = {'User-Agent': USER_AGENT}
+    # Try with SSL verification first; fall back to verify=False if cert store is stale.
+    for verify in (True, False):
+        try:
+            if not verify:
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            resp = requests.get(SNP_URL, headers=headers, verify=verify, timeout=15)
+            resp.raise_for_status()
+            snp_table = pd.read_html(
+                io.StringIO(resp.text),
+                header=0,
+                attrs={"id": "constituents"},
+                flavor='lxml',
+            )[0]
+            return snp_table["Symbol"]
+        except Exception as e:
+            if verify:
+                logger.warning(f"S&P 500 fetch with SSL verification failed ({e}); retrying without verification")
+            else:
+                logger.error(f"Failed to retrieve S&P 500 symbols: {e}")
+    return pd.Series(dtype=str)
 
 @lru_cache(maxsize=1)
 def _fetch_weeklys() -> pd.Series:
-    """Fetch weekly options symbols from CBOE (cached)."""
+    """Fetch weekly options symbols from CBOE (cached). Secondary fallback only."""
     try:
         return pd.read_html(WEEKLYS_URL)[0].iloc[:, 1]
     except Exception as e:
-        logger.error(f"Failed to retrieve weekly options: {e}")
+        logger.warning(f"CBOE weeklys fetch failed (URL may have moved): {e}")
         return pd.Series(dtype=str)
     
 

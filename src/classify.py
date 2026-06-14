@@ -120,6 +120,8 @@ def get_ib_portfolio(account: str, msg: bool = False) -> pd.DataFrame:
     try:
         portfolio_items = ib.portfolio()
         upf = util.df(portfolio_items)
+        if upf is None or upf.empty:
+            return pd.DataFrame()
         # pyrefly: ignore [missing-attribute]
         contract_df = util.df(list(upf.contract)).iloc[:, :6]
         # upf = contract_df.join(upf.drop(columns=["account", "contract"]))
@@ -309,6 +311,8 @@ def classify_pf(pf):
     """
     # Create a copy to avoid modifying the original DataFrame
     pf = pf.copy()
+    if pf.empty:
+        return pf
 
     # Add dte column for options
     if "expiry" in pf.columns and "dte" not in pf.columns:
@@ -326,20 +330,22 @@ def classify_pf(pf):
     )
     pf.loc[protecting_mask, "state"] = "protecting"
 
-    # Classify sowed options (short options that are not part of a spread)
-    sowed_mask = option_mask & (pf.position < 0)  # All short options
+    # Classify sowed options: short option with no underlying STK position.
+    long_stock_syms = set(pf[(pf.secType == "STK") & (pf.position > 0)].symbol)
+    short_stock_syms = set(pf[(pf.secType == "STK") & (pf.position < 0)].symbol)
+    stk_syms = long_stock_syms | short_stock_syms
+    sowed_mask = option_mask & (pf.position < 0) & ~pf.symbol.isin(stk_syms)
     pf.loc[sowed_mask, "state"] = "sowed"
 
-    # Now classify covering options (short calls that are part of a spread)
-    # These will override the 'sowed' classification
+    # Classify covering options — short CALL covers long stock, short PUT covers short stock.
     covering_mask = (
         option_mask
         & (pf.position < 0)
-        & ((pf.right == "C") | (pf.right == "P"))  # Short call or put
+        & (
+            ((pf.right == "C") & pf.symbol.isin(long_stock_syms))
+            | ((pf.right == "P") & pf.symbol.isin(short_stock_syms))
+        )
     )
-    # Only mark as covering if there's a corresponding long position
-    has_long = pf[pf.position > 0].groupby("symbol").size()
-    covering_mask = covering_mask & pf.symbol.isin(has_long.index)
     pf.loc[covering_mask, "state"] = "covering"
 
     # Now classify stocks based on their options
@@ -600,10 +606,14 @@ def update_unds_status(
     # Update status for zen symbols
     df_unds.loc[df_unds.symbol.isin(zen_symbols), "state"] = "zen"
 
-    # Unreaped: Symbol has a short option position with no open 'reaping' order
+    # Unreaped: Symbol has only a short option (no stock) with no open 'reaping' order.
+    # Exclude symbols with any stock position — "unreaped" is an option-level concept and
+    # must not override a stock's coverage state (exposed/uncovered).
+    _has_stock = set(df_pf[df_pf.secType == "STK"].symbol)
     unreaped_symbols = df_pf[
         (df_pf.state == "sowed")
         & ~df_pf.symbol.isin(df_openords[df_openords.state == "reaping"].symbol)
+        & ~df_pf.symbol.isin(_has_stock)
     ].symbol
 
     # Update status for unreaped symbols
@@ -718,11 +728,15 @@ def classifed_results(account_no: str, max_days: int = 1, msg: bool = False) -> 
         result["df_unds"], result["df_pf"], result["df_openords"]
     )
 
-    logger.debug(
-        "%d stocks, %d options in df_pf",
-        len(result["df_pf"][result["df_pf"].secType == "STK"]),
-        len(result["df_pf"][result["df_pf"].secType == "OPT"]),
-    )
+    _df_pf = result["df_pf"]
+    if not _df_pf.empty and "secType" in _df_pf.columns:
+        logger.debug(
+            "%d stocks, %d options in df_pf",
+            len(_df_pf[_df_pf.secType == "STK"]),
+            len(_df_pf[_df_pf.secType == "OPT"]),
+        )
+    else:
+        logger.debug("df_pf is empty (no portfolio positions retrieved)")
     logger.debug("%d open orders", len(result["df_openords"]))
 
     return result
