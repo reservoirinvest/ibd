@@ -25,6 +25,7 @@ from nicegui import app, ui  # noqa: E402
 from src.dashboard.ib_client import Snapshot, get_client  # noqa: E402
 from src.dashboard.settings import get_settings  # noqa: E402
 from web import theme  # noqa: E402
+from web.components.command_center import command_center  # noqa: E402
 from web.components.header import alert_bar  # noqa: E402
 from web.components.kpi_strip import kpi_strip  # noqa: E402
 
@@ -56,15 +57,13 @@ def dashboard() -> None:
     # Static skeleton; refreshable regions fill in live data each tick.
     alert_bar(client.snapshot())
     kpi_strip(client.snapshot(), min_cushion=settings.min_cushion)
-
-    # Phase 1 placeholder — command-center panel lands here next.
-    with ui.row().classes("w-full").style("padding:6px 14px;"):
-        ui.label("COMMAND CENTER — panel arrives in Phase 1").classes("qo-label")
+    command_center(client.snapshot(), settings)
 
     def _tick() -> None:
         snap: Snapshot = client.snapshot()
         alert_bar.refresh(snap)
         kpi_strip.refresh(snap, min_cushion=settings.min_cushion)
+        command_center.refresh(snap, settings)
 
     ui.timer(1.0, _tick)
 
