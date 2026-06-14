@@ -27,6 +27,7 @@ dependencies = [
     "jupyterlab>=4.4.9",
     "loguru>=0.7.3",
     "lxml>=6.0.2",
+    "nicegui>=2.0.0",
     "numpy>=2.3.3",
     "pandas>=2.3.3",
     "pandas-datareader>=0.10.0",
