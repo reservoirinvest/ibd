@@ -2,6 +2,7 @@
 # IMPORTS
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -142,8 +143,13 @@ def delete_pkl_files(files_to_delete):
             logger.debug("Deleted %s", file_path)
 
 def pickle_me(obj, file_path: Path):
-    with open(str(file_path), "wb") as handle:
+    # Atomic write: dump to a sibling temp file then os.replace, so a crash
+    # mid-write can never leave a half-written / corrupt pickle behind.
+    file_path = Path(file_path)
+    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+    with open(str(tmp_path), "wb") as handle:
         pickle.dump(obj, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(str(tmp_path), str(file_path))
 
 def get_pickle(path: Path, print_msg: bool = True):
     try:
@@ -912,10 +918,18 @@ def get_volatilities_snapshot(
             logger.debug("Disconnected from IB")
 
 async def volatilities(
-    contracts: list, ib: IB, sleep_time: int = 3, gentick: str = "106, 104"
+    contracts: list,
+    ib: IB,
+    sleep_time: int = 8,
+    gentick: str = "106, 104",
+    max_concurrent: int = 40,
 ) -> dict:
+    # Bound concurrent market-data lines so a 50-wide batch does not burst past
+    # IBKR's ~50 req/s ceiling. Each contract resolves the moment IV arrives, so
+    # the semaphore frees up well before `sleep_time`.
+    sem = asyncio.Semaphore(max_concurrent)
     tasks = [
-        get_an_iv(item=c, ib=ib, sleep_time=sleep_time, gentick=gentick)
+        get_an_iv(item=c, ib=ib, sleep_time=sleep_time, gentick=gentick, sem=sem)
         for c in contracts
     ]
 
@@ -926,39 +940,63 @@ async def volatilities(
     }  # Combine results into a single dictionary
 
 async def get_an_iv(
-    ib: IB, item: str, sleep_time: int = 3, gentick: str = "106, 104"
+    ib: IB,
+    item: str,
+    sleep_time: int = 8,
+    gentick: str = "106, 104",
+    sem: "asyncio.Semaphore | None" = None,
 ) -> dict:
+    """Snapshot price/IV/HV for one contract, resolving the instant IV arrives.
+
+    `sleep_time` is now an upper *cap*, not a fixed wait: we subscribe to ticks
+    106 (IV) / 104 (HV) and await the ticker's updateEvent until implied
+    volatility is populated, falling back to the cap only for symbols that never
+    return a value. Typical resolution is sub-second vs the old fixed 10 s+2 s.
+    """
     stock_contract = Stock(item, "SMART", "USD") if isinstance(item, str) else item
-
-    ticker = ib.reqMktData(stock_contract, genericTickList=gentick)
-
-    await asyncio.sleep(sleep_time)
-
-    # IV can be slow to arrive; give it one extra window before cancelling.
-    if pd.isna(ticker.impliedVolatility):
-        await asyncio.sleep(2)
-
-    ib.cancelMktData(stock_contract)
-
     key = item if isinstance(item, str) else stock_contract
 
-    # Price priority: last trade → bid/ask midpoint → previous close
-    if not pd.isna(ticker.last) and ticker.last > 0:
-        price = ticker.last
-    elif (
-        not pd.isna(ticker.bid)
-        and not pd.isna(ticker.ask)
-        and ticker.bid > 0
-        and ticker.ask > 0
-    ):
-        price = (ticker.bid + ticker.ask) / 2
-    else:
-        price = ticker.close
+    async def _do() -> dict:
+        ticker = ib.reqMktData(stock_contract, genericTickList=gentick)
+        try:
+            # Wait (event-driven) for the slow IV tick, capped at sleep_time.
+            if pd.isna(ticker.impliedVolatility):
+                loop = asyncio.get_event_loop()
+                fut: asyncio.Future = loop.create_future()
 
-    iv = ticker.impliedVolatility
-    hv = ticker.histVolatility
+                def _on_update(t=ticker) -> None:
+                    if not fut.done() and not pd.isna(t.impliedVolatility):
+                        fut.set_result(True)
 
-    return {key: {"price": price, "iv": iv, "hv": hv}}
+                ticker.updateEvent += _on_update
+                try:
+                    await asyncio.wait_for(fut, timeout=sleep_time)
+                except asyncio.TimeoutError:
+                    pass
+                finally:
+                    ticker.updateEvent -= _on_update
+        finally:
+            ib.cancelMktData(stock_contract)
+
+        # Price priority: last trade → bid/ask midpoint → previous close
+        if not pd.isna(ticker.last) and ticker.last > 0:
+            price = ticker.last
+        elif (
+            not pd.isna(ticker.bid)
+            and not pd.isna(ticker.ask)
+            and ticker.bid > 0
+            and ticker.ask > 0
+        ):
+            price = (ticker.bid + ticker.ask) / 2
+        else:
+            price = ticker.close
+
+        return {key: {"price": price, "iv": ticker.impliedVolatility, "hv": ticker.histVolatility}}
+
+    if sem is not None:
+        async with sem:
+            return await _do()
+    return await _do()
 
 #%%
 # Option Chains
@@ -1169,10 +1207,91 @@ def calculate_atm_margin(row, chains_df, target_dte):
     margin = atm_margin(strike=strike, undPrice=und_price, dte=dte, vy=iv)
     return margin
 
+BUILD_SUMMARY_PATH = ROOT / "data" / "build_summary.json"
+_COVERAGE_WARN_PCT = 90.0  # below this, surface a WHAT-TO-DO-NEXT message
+
+
+def _coverage(numerator: int, denominator: int) -> float:
+    return round(100.0 * numerator / denominator, 1) if denominator else 0.0
+
+
+def write_build_summary(
+    n_symbols: int,
+    df_chains: pd.DataFrame,
+    df_unds: pd.DataFrame,
+    path: Path = BUILD_SUMMARY_PATH,
+) -> dict:
+    """Compute per-stage coverage, emit clear next-step guidance, and persist a
+    machine-readable summary the dashboard can surface.
+
+    Returns the summary dict (also written to `path` as JSON).
+    """
+    # Chains coverage
+    n_chains = (
+        int(df_chains["symbol"].nunique())
+        if (isinstance(df_chains, pd.DataFrame) and not df_chains.empty and "symbol" in df_chains.columns)
+        else 0
+    )
+
+    # Price / IV coverage from df_unds
+    if isinstance(df_unds, pd.DataFrame) and not df_unds.empty and "symbol" in df_unds.columns:
+        n_unds = int(len(df_unds))
+        valid_price = int((pd.to_numeric(df_unds.get("price"), errors="coerce") > 0).sum())
+        valid_iv = int((pd.to_numeric(df_unds.get("iv"), errors="coerce") > 0).sum())
+        missing_iv_syms = sorted(
+            df_unds.loc[~(pd.to_numeric(df_unds["iv"], errors="coerce") > 0), "symbol"].astype(str).tolist()
+        )
+    else:
+        n_unds = valid_price = valid_iv = 0
+        missing_iv_syms = []
+
+    summary = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbols_qualified": int(n_symbols),
+        "chains": {"symbols_with_chains": n_chains, "coverage_pct": _coverage(n_chains, n_symbols)},
+        "prices": {"rows": n_unds, "valid": valid_price, "coverage_pct": _coverage(valid_price, n_unds)},
+        "iv": {"rows": n_unds, "valid": valid_iv, "coverage_pct": _coverage(valid_iv, n_unds)},
+        "warnings": [],
+        "next_steps": [],
+    }
+
+    # Clear, actionable next-step messages when coverage is materially low.
+    def _flag(label: str, pct: float, missing: int) -> None:
+        if pct < _COVERAGE_WARN_PCT:
+            msg = (
+                f"{label} coverage {pct:.0f}% — {missing} symbols missing; "
+                f"derive.py will SKIP these. Re-run during market hours: "
+                f"uv run python src/build.py"
+            )
+            summary["warnings"].append(msg)
+            summary["next_steps"].append(msg)
+            logger.warning("WHAT TO DO NEXT: %s", msg)
+
+    _flag("Chains", summary["chains"]["coverage_pct"], max(n_symbols - n_chains, 0))
+    _flag("Price", summary["prices"]["coverage_pct"], max(n_unds - valid_price, 0))
+    _flag("IV", summary["iv"]["coverage_pct"], len(missing_iv_syms))
+
+    if missing_iv_syms:
+        summary["missing_iv_symbols"] = missing_iv_syms[:50]  # cap list size
+
+    try:
+        path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        logger.info(
+            "build_summary.json — chains %.0f%%, price %.0f%%, iv %.0f%%",
+            summary["chains"]["coverage_pct"],
+            summary["prices"]["coverage_pct"],
+            summary["iv"]["coverage_pct"],
+        )
+    except Exception as exc:
+        logger.warning("Could not write build_summary.json: %s", exc)
+
+    return summary
+
+
 def chains_n_unds(msg: bool = False):
     """
     Processes qualified contracts, option chains, and calculate margins.
-    
+
     Returns:
         Tuple of DataFrames: (df_chains, df_unds)
     """
@@ -1249,6 +1368,9 @@ def chains_n_unds(msg: bool = False):
     if df_unds.empty or 'symbol' not in df_unds.columns:
         logger.warning("df_unds is empty — no volatility data retrieved")
     pickle_me(df_unds, file_path=ROOT / 'data' / 'df_unds.pkl')
+
+    # Per-stage coverage + machine-readable summary + next-step guidance.
+    write_build_summary(_n_syms, df_chains, df_unds)
 
     return df_chains, df_unds
 

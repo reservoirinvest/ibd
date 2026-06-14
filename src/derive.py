@@ -202,29 +202,57 @@ if _oo_reaping:
 logger.info("Connecting to IB...")
 ib = get_ib_connection("SNP", account_no=ACCOUNT_NO)
 
-# Refresh prices if the snapshot saved by build.py is stale (all NaN).
-# This happens when build.py ran pre-market and IBKR returned no price data.
-# Covers and sow both need valid undPrice/iv to compute sdev and thresholds.
-if not df_unds.empty and df_unds["price"].isna().all():
-    logger.info("df_unds prices all NaN — refreshing with live IBKR snapshot...")
-    _sym_contracts = get_pickle(ROOT / "data" / "symbols.pkl")
-    if _sym_contracts:
-        _snap = get_volatilities_snapshot(
-            _sym_contracts, market="SNP", batch_size=50, ib=ib, desc="Refreshing prices"
+# Refresh prices/IV for any symbol whose snapshot is missing (NaN or ≤0) — not
+# only the all-NaN pre-market case. Covers and sow both need valid undPrice/iv to
+# compute sdev and thresholds. After refreshing, symbols still missing price/iv
+# are EXPLICITLY excluded and logged, so they are never silently dropped by the
+# downstream how="left" NaN merges.
+def _invalid_price_iv(_df: pd.DataFrame) -> pd.Series:
+    _p = pd.to_numeric(_df.get("price"), errors="coerce")
+    _v = pd.to_numeric(_df.get("iv"), errors="coerce")
+    return ~((_p > 0) & (_v > 0))
+
+if not df_unds.empty and "price" in df_unds.columns:
+    _need = df_unds[_invalid_price_iv(df_unds)]
+    if not _need.empty:
+        logger.info(
+            "df_unds missing price/iv for %d/%d symbols — refreshing with live IBKR snapshot...",
+            len(_need), len(df_unds),
         )
-        if not _snap.empty and _snap["price"].notna().any():
-            _refresh_cols = [c for c in ["price", "iv", "hv"] if c in _snap.columns]
-            df_unds = df_unds.drop(columns=_refresh_cols, errors="ignore").merge(
-                _snap[["symbol"] + _refresh_cols], on="symbol", how="left"
-            )
-            logger.info(
-                "Price refresh: %d/%d symbols with valid prices",
-                df_unds["price"].notna().sum(), len(df_unds),
-            )
+        _sym_contracts = get_pickle(ROOT / "data" / "symbols.pkl")
+        if _sym_contracts:
+            _need_syms = set(_need["symbol"])
+            _subset = [c for c in _sym_contracts if getattr(c, "symbol", None) in _need_syms]
+            if _subset:
+                _snap = get_volatilities_snapshot(
+                    _subset, market="SNP", batch_size=50, ib=ib, desc="Refreshing prices"
+                )
+                if not _snap.empty and _snap["price"].notna().any():
+                    _refresh_cols = [c for c in ["price", "iv", "hv"] if c in _snap.columns]
+                    # update() fills only the refreshed symbols with non-NaN values,
+                    # preserving any good existing data.
+                    df_unds = df_unds.set_index("symbol")
+                    df_unds.update(_snap.set_index("symbol")[_refresh_cols])
+                    df_unds = df_unds.reset_index()
+                    logger.info(
+                        "Price refresh: %d/%d symbols now have valid price+iv",
+                        int((~_invalid_price_iv(df_unds)).sum()), len(df_unds),
+                    )
+                else:
+                    logger.warning("Price refresh returned no valid data — cover/sow orders may be incomplete")
         else:
-            logger.warning("Price refresh returned no valid data — cover/sow orders may be incomplete")
-    else:
-        logger.warning("symbols.pkl not found — cannot refresh prices")
+            logger.warning("symbols.pkl not found — cannot refresh prices")
+
+    # Explicitly drop + log symbols that still lack valid price/iv.
+    _still_bad = df_unds[_invalid_price_iv(df_unds)]
+    if not _still_bad.empty:
+        _bad_syms = sorted(_still_bad["symbol"].astype(str).tolist())
+        logger.warning(
+            "Excluded %d symbols missing price/iv (NO orders generated for them): %s",
+            len(_bad_syms),
+            ", ".join(_bad_syms[:30]) + (" …" if len(_bad_syms) > 30 else ""),
+        )
+        df_unds = df_unds[~_invalid_price_iv(df_unds)].reset_index(drop=True)
 
 # %% MAKE COVERS FOR EXPOSED AND UNCOVERED STOCK POSITIONS
 logger.info("=== MAKE COVERS FOR EXPOSED AND UNCOVERED STOCK POSITIONS ===")

@@ -34,6 +34,7 @@ from ib_async import IB, Stock
 import pandas as pd
 from loguru import logger
 from pyprojroot import here
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -50,6 +51,9 @@ _YF_OVERRIDES_PATH = here() / "data" / "yf_ticker_overrides.json"
 MIN_DAYS = 548  # 1.5 years ≈ 548 calendar days
 _OHLC_COLS = ["Open", "High", "Low", "Close", "Volume"]
 _CONCURRENCY = 20  # parallel yfinance coroutines
+_IB_HIST_CONCURRENCY = 5  # parallel IBKR historical-data requests (pacing-safe)
+_IB_HIST_TIMEOUT = 30.0  # seconds per historical-data request before retry
+_IB_PACING_BACKOFF = 2.0  # seconds to wait after an error-162 pacing violation
 
 # Benchmark symbols always backfilled to this date for full-history performance comparison
 _BENCHMARK_START = date(2019, 12, 31)
@@ -253,29 +257,19 @@ async def _fetch_yf_all(
     log_fh: TextIO,
 ) -> dict[str, pd.DataFrame]:
     """Bounded-concurrency yfinance fetch with inline tqdm progress."""
-    from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn
-    from rich.console import Console
-
     sem = asyncio.Semaphore(_CONCURRENCY)
     results: dict[str, pd.DataFrame] = {}
 
-    console = Console(file=log_fh, force_terminal=False)
-    with Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TextColumn("{task.fields[status]}"),
-        console=console,
-    ) as pbar:
-        task_id = pbar.add_task("Fetching OHLC (yfinance)", total=len(specs), status="")
+    with tqdm(total=len(specs), desc="OHLC yfinance", unit="sym",
+              leave=True, file=log_fh) as pbar:
 
         async def _bounded(spec: SymbolSpec) -> None:
             async with sem:
                 ib_sym, df = await _fetch_one_yf(spec, start, end)
             if df is not None:
                 results[ib_sym] = df
-            pbar.advance(task_id, 1)
-            pbar.update(task_id, status=spec["symbol"])
+            pbar.set_postfix_str(spec["symbol"], refresh=False)
+            pbar.update(1)
 
         await asyncio.gather(*[_bounded(s) for s in specs])
 
@@ -296,12 +290,15 @@ async def _fetch_ib_all(
     port: int = 1300,
     client_id: int = 12,
 ) -> dict[str, pd.DataFrame]:
-    """Fetch daily bars via IBKR reqHistoricalDataAsync for symbols yfinance missed."""
+    """Fetch daily bars via IBKR reqHistoricalDataAsync for symbols yfinance missed.
+
+    Runs requests concurrently behind a small semaphore: IBKR historical-data
+    pacing is stricter than market data (≤ ~6 simultaneous; ~60 reqs / 10 min per
+    contract), so concurrency is capped at _IB_HIST_CONCURRENCY and pacing
+    violations (error 162) are retried once after a short backoff.
+    """
     if not specs:
         return {}
-
-    from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn
-    from rich.console import Console
 
     results: dict[str, pd.DataFrame] = {}
     duration_days = (end - start).days + 5
@@ -315,25 +312,14 @@ async def _fetch_ib_all(
         log_fh.flush()
         return {}
 
-    try:
-        console = Console(file=log_fh, force_terminal=False)
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TextColumn("{task.fields[status]}"),
-            console=console,
-        ) as pbar:
-            task_id = pbar.add_task("Fetching OHLC (IBKR fallback)", total=len(specs), status="")
-            for spec in specs:
-                sym = spec["symbol"]
-                exchange = spec.get("exchange", "SMART")
-                currency = spec.get("currency", "USD")
-                contract = Stock(
-                    sym, exchange if exchange not in ("SMART", "") else "SMART", currency
-                )
-                try:
-                    bars = await ib.reqHistoricalDataAsync(
+    sem = asyncio.Semaphore(_IB_HIST_CONCURRENCY)
+
+    async def _one_bars(contract):
+        """Single historical-data request with timeout + one pacing retry."""
+        for attempt in (1, 2):
+            try:
+                return await asyncio.wait_for(
+                    ib.reqHistoricalDataAsync(
                         contract,
                         endDateTime="",
                         durationStr=duration_str,
@@ -341,29 +327,59 @@ async def _fetch_ib_all(
                         whatToShow="ADJUSTED_LAST",
                         useRTH=True,
                         formatDate=1,
-                    )
-                    if bars:
-                        rows = [
-                            {
-                                "date": b.date,
-                                "Open": b.open,
-                                "High": b.high,
-                                "Low": b.low,
-                                "Close": b.close,
-                                "Volume": b.volume,
-                            }
-                            for b in bars
-                        ]
-                        df = pd.DataFrame(rows).set_index("date")
-                        df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
-                        df = df.sort_index().dropna(subset=["Close"])
-                        df = df[df.index.date >= start]
-                        if not df.empty:
-                            results[sym] = df
-                except Exception as exc:
-                    logger.warning("IBKR history {}: {}", sym, exc)
-                pbar.advance(task_id, 1)
-                pbar.update(task_id, status=sym)
+                    ),
+                    timeout=_IB_HIST_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                if attempt == 1:
+                    continue  # one retry on a slow/dropped response
+                raise
+            except Exception as exc:
+                # Error 162 == historical-data pacing violation → brief backoff + retry.
+                if attempt == 1 and "162" in str(exc):
+                    await asyncio.sleep(_IB_PACING_BACKOFF)
+                    continue
+                raise
+
+    try:
+        with tqdm(total=len(specs), desc="OHLC IBKR fallback", unit="sym",
+                  leave=True, file=log_fh) as pbar:
+
+            async def _bounded(spec: SymbolSpec) -> None:
+                sym = spec["symbol"]
+                exchange = spec.get("exchange", "SMART")
+                currency = spec.get("currency", "USD")
+                contract = Stock(
+                    sym, exchange if exchange not in ("SMART", "") else "SMART", currency
+                )
+                async with sem:
+                    try:
+                        bars = await _one_bars(contract)
+                    except Exception as exc:
+                        logger.warning("IBKR history {}: {}", sym, exc)
+                        bars = None
+                if bars:
+                    rows = [
+                        {
+                            "date": b.date,
+                            "Open": b.open,
+                            "High": b.high,
+                            "Low": b.low,
+                            "Close": b.close,
+                            "Volume": b.volume,
+                        }
+                        for b in bars
+                    ]
+                    df = pd.DataFrame(rows).set_index("date")
+                    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
+                    df = df.sort_index().dropna(subset=["Close"])
+                    df = df[df.index.date >= start]
+                    if not df.empty:
+                        results[sym] = df
+                pbar.set_postfix_str(sym, refresh=False)
+                pbar.update(1)
+
+            await asyncio.gather(*[_bounded(s) for s in specs])
     finally:
         ib.disconnect()
 

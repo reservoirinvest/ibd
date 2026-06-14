@@ -61,3 +61,9 @@ ignore = ["E702"]
 
 [tool.pyrefly]
 infer-with-first-use = false
+
+[tool.pytest.ini_options]
+addopts = "-m 'not live'"
+markers = [
+    "live: tests that require a live IBKR/TWS connection (skipped by default; run with -m live)",
+]
