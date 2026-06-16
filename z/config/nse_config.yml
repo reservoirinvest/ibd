@@ -1,0 +1,58 @@
+# NSE Wheel Strategy — Zerodha Kite Connect configuration
+# All keys can be overridden by matching environment variables.
+
+# --- Market ---
+MARKET: NSE
+CURRENCY: INR
+EXCHANGE: NFO              # F&O segment for option orders
+PRODUCT: NRML             # carry-forward product (overnight); MIS = intraday
+OFFLINE: true             # true = run against mock data (no Kite credentials needed)
+LOGLEVEL: INFO
+
+# --- Universe & settlement ---
+# Index symbols are CASH-settled -> income-only (no assignment / no wheel).
+# Everything else in the F&O instruments dump is a single-stock = PHYSICAL settlement -> wheelable.
+INDEX_SYMBOLS:
+- NIFTY
+- BANKNIFTY
+- FINNIFTY
+- MIDCPNIFTY
+- NIFTYNXT50
+- SENSEX
+- BANKEX
+INDEX_WHEEL: false        # false = index legs are income-only (recommended; cash-settled)
+
+# --- Expiry handling ---
+STOCK_EXPIRY_WEEKDAY: 3   # 0=Mon ... 3=Thu (NSE monthly stock F&O expiry weekday; configurable)
+MAX_DTE: 50               # ignore option contracts beyond this many days to expiry
+
+# --- Risk / sizing ---
+MINCUSHION: 0.18          # block fresh sow orders when account cushion falls below this
+FUND_PER_SYMBOL_PCT: 0.05 # fraction of NAV to allocate as margin budget per symbol
+SPAN_MARGIN_PCT: 0.15     # OFFLINE fallback: margin_per_lot ~= notional * this (live uses Kite order_margins)
+
+# --- Covered calls / puts (wheel cover leg, physical only) ---
+COVER_ME: true
+COVER_MIN_DTE: 4
+COVER_STD_MULT: 0.5       # strike = undPrice + COVER_STD_MULT * sdev (calls)
+COVXPMULT: 1.5            # limit price markup over theoretical
+COV_AGED_DTE: 180         # held longer than this -> prioritise income over cost recovery
+
+# --- Sow (cash-secured puts on stocks; income calls/puts on indices) ---
+SOW_NAKEDS: true
+VIRGIN_DTE: 5             # target DTE for fresh sow legs
+VIRGIN_PUT_STD_MULT: 1.5  # put strike = undPrice - mult * sdev
+VIRGIN_CALL_STD_MULT: 3.5 # call strike = undPrice + mult * sdev
+NAKEDXPMULT: 1.5          # limit price markup over theoretical
+MINNAKEDOPTPRICE: 1.0     # floor premium (INR) per share for a sow leg
+
+# --- Reap (buy-to-close profitable shorts) ---
+REAP_ME: true
+REAPRATIO: 0.2            # buy back when price <= REAPRATIO * entry credit
+MINREAPDTE: 1
+
+# --- Ask AI (optional; requires the `ai` extra + API keys) ---
+AIMODELS:
+- Gemini
+- Claude
+DEFAULTAI: Gemini

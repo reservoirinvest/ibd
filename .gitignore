@@ -26,6 +26,9 @@ ipython_config.py
 # Others
 z*/
 **/z*.*
+# ...but track the standalone NSE-wheel project (named 'z'); its own .gitignore
+# still excludes z/data/master, z/.env, etc.
+!z/
 data/t*.*
 data/master/*.xml
 log/*.*

@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nsewheel"]
+
+[project.scripts]
+nsew = "nsewheel._cli:main"
+
+[project]
+name = "nsewheel"
+version = "0.1.0"
+description = "Wheel-strategy options trading system for NSE via Zerodha Kite Connect"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "kiteconnect>=5.0.1",
+    "streamlit>=1.57.0",
+    "plotly>=6.7.0",
+    "pandas>=2.3.3",
+    "numpy>=2.3.3",
+    "scipy>=1.16.2",
+    "yfinance>=0.2.66",
+    "pyyaml>=6.0.3",
+    "loguru>=0.7.3",
+    "pydantic-settings>=2.14.0",
+    "python-dotenv>=1.1.1",
+    "pytz>=2025.2",
+    "rich>=15.0.0",
+]
+
+[project.optional-dependencies]
+ai = [
+    "anthropic>=0.28.0",
+    "google-genai>=1.0.0",
+]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.13.3",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+per-file-ignores = { "scripts/*.py" = ["E402"], "src/nsewheel/execute.py" = ["E402"] }
+ignore = ["E702"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not live'"
+markers = [
+    "live: tests that require a live Kite Connect session (skipped by default; run with -m live)",
+]
