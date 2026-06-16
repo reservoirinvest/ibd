@@ -25,7 +25,7 @@ from dotenv import find_dotenv, load_dotenv
 from ib_async import IB, Contract, Stock
 from pyprojroot import here
 # pyrefly: ignore [untyped-import]
-from tqdm import tqdm
+from src.dashboard.progress import progress_bar
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,10 @@ ROOT = here()
 config = load_config("SNP")
 MAX_DTE = config.get("MAX_DTE")
 PORT = config.get("PORT", 1300)
+# Market-data type for bulk fetches: primary (frozen) works live + off-hours for
+# subscribed symbols; fallback (delayed-frozen) fills the rest with free delayed data.
+MKT_DATA_TYPE = int(config.get("MKT_DATA_TYPE", 2))
+MKT_DATA_FALLBACK = int(config.get("MKT_DATA_FALLBACK", 4))
 
 def get_ib_connection(market: str = "SNP", account_no: str = '', msg: bool=False) -> IB:
     """
@@ -471,7 +475,7 @@ def qualify_stock_contracts(symbols: pd.Series, market: str = "SNP") -> list:
         contracts = [Stock(symbol, 'SMART', 'USD') for symbol in symbols]
         
         logger.info("Qualifying %s contracts via IBKR…", len(contracts))
-        with tqdm(total=len(contracts), desc="Qualifying symbols", unit="sym", leave=True, file=sys.stderr) as pbar:
+        with progress_bar(len(contracts), "Qualifying symbols", unit="sym", file=sys.stderr) as pbar:
             # pyrefly: ignore [not-iterable]
             qualified, failed = ib.run(_qualify_batch(ib, contracts, lambda: pbar.update(1)))
 
@@ -517,7 +521,7 @@ def qualify_me(
         # Calculate number of batches
         num_batches = (total_contracts + batch_size - 1) // batch_size
 
-        with tqdm(total=total_contracts, desc=desc, unit="sym", leave=True, file=sys.stderr) as pbar:
+        with progress_bar(total_contracts, desc, unit="sym", file=sys.stderr) as pbar:
             for batch_num in range(num_batches):
                 start_idx = batch_num * batch_size
                 end_idx = min(start_idx + batch_size, total_contracts)
@@ -854,23 +858,32 @@ def get_volatilities_snapshot(
     Returns:
         DataFrame with symbol, price, implied volatility (iv), and historical volatility (hv).
     """
-    all_vol_data = []
+    # Keyed by conId (falls back to symbol) so the delayed fallback pass can
+    # overwrite the rows whose price never arrived on the primary pass.
+    rows: dict = {}
 
-    try:
-        # Connect to IB
-        disconnect = False
-        if ib is None:
-            ib = get_ib_connection(market)
-            disconnect = True
+    def _has_price(d: dict) -> bool:
+        p = d.get("price")
+        return p is not None and not pd.isna(p) and p > 0
 
-        # Process contracts in batches
-        total_batches = (len(contracts) + batch_size - 1) // batch_size
+    def _keep(new, old):
+        """Prefer a fresh non-null value, else retain the prior pass's value."""
+        return new if (new is not None and not pd.isna(new)) else old
 
-        with tqdm(total=len(contracts), desc=desc, unit="sym", leave=True, file=sys.stderr) as pbar:
+    def _set_mkt_data_type(t: int) -> None:
+        try:
+            ib.reqMarketDataType(t)
+        except Exception as _e:  # noqa: BLE001
+            logger.debug("reqMarketDataType(%s) failed: %s", t, _e)
+
+    def _run_pass(pass_contracts: list, label: str) -> None:
+        """Fetch one market-data-type pass over the given contracts into `rows`."""
+        total_batches = (len(pass_contracts) + batch_size - 1) // batch_size
+        with progress_bar(len(pass_contracts), label, unit="sym", file=sys.stderr) as pbar:
             for batch_num in range(total_batches):
                 start_idx = batch_num * batch_size
-                end_idx = min(start_idx + batch_size, len(contracts))
-                batch_contracts = contracts[start_idx:end_idx]
+                end_idx = min(start_idx + batch_size, len(pass_contracts))
+                batch_contracts = pass_contracts[start_idx:end_idx]
 
                 # pyrefly: ignore [missing-attribute]
                 batch_results = ib.run(
@@ -889,22 +902,57 @@ def get_volatilities_snapshot(
                     else:
                         symbol = contract_key
                         conId = None
-
-                    all_vol_data.append({
+                    key = conId if conId else symbol
+                    prev = rows.get(key, {})
+                    _np, _ni, _nh = data.get("price"), data.get("iv"), data.get("hv")
+                    rows[key] = {
                         "symbol": symbol,
                         "conId": conId,
-                        "price": data.get("price"),
-                        "iv": data.get("iv"),
-                        "hv": data.get("hv"),
-                    })
+                        "price": _keep(_np, prev.get("price")),
+                        "iv": _keep(_ni, prev.get("iv")),
+                        "hv": _keep(_nh, prev.get("hv")),
+                    }
                 pbar.update(len(batch_contracts))
 
-        df = pd.DataFrame(all_vol_data)
+    try:
+        # Connect to IB
+        disconnect = False
+        if ib is None:
+            ib = get_ib_connection(market)
+            disconnect = True
+
+        # Primary pass — frozen (2) returns live data in market hours and the last
+        # recorded close off-hours, so subscribed symbols fill in both regimes.
+        _set_mkt_data_type(MKT_DATA_TYPE)
+        _run_pass(list(contracts), desc)
+
+        # Fallback pass — re-fetch only the symbols still missing a price using the
+        # delayed-frozen (4) feed, which needs no real-time subscription and works
+        # off-hours. This closes the coverage gap that left ~40% of symbols NaN.
+        if MKT_DATA_FALLBACK and MKT_DATA_FALLBACK != MKT_DATA_TYPE:
+            missing = [
+                c for c in contracts
+                if not _has_price(rows.get(getattr(c, "conId", None) or getattr(c, "symbol", c), {}))
+            ]
+            if missing:
+                logger.info(
+                    "Price fallback: %d/%d symbols missing price on type %d — retrying on delayed-frozen type %d",
+                    len(missing), len(contracts), MKT_DATA_TYPE, MKT_DATA_FALLBACK,
+                )
+                _set_mkt_data_type(MKT_DATA_FALLBACK)
+                _run_pass(missing, f"{desc} (delayed fallback)")
+                _set_mkt_data_type(MKT_DATA_TYPE)  # restore primary for later calls
+
+        df = pd.DataFrame(list(rows.values()))
+        if df.empty:
+            return df
         valid_ivs = df[df["iv"].notna()]
+        valid_px = df[df["price"].apply(lambda p: p is not None and not pd.isna(p) and p > 0)]
         logger.info(
-            "Volatility snapshot: %s contracts, %s/%s valid IVs (%s%%)",
-            len(df), len(valid_ivs), len(df),
-            f"{100 * len(valid_ivs) / len(df) if len(df) else 0.0:.1f}",
+            "Volatility snapshot: %s contracts, %s/%s valid prices (%s%%), %s/%s valid IVs (%s%%)",
+            len(df),
+            len(valid_px), len(df), f"{100 * len(valid_px) / len(df) if len(df) else 0.0:.1f}",
+            len(valid_ivs), len(df), f"{100 * len(valid_ivs) / len(df) if len(df) else 0.0:.1f}",
         )
         return df
 
@@ -1068,7 +1116,7 @@ def get_option_chains(
         # Process contracts in batches
         total_batches = (len(contracts) + batch_size - 1) // batch_size
 
-        with tqdm(total=len(contracts), desc="Fetching option chains", unit="sym", leave=True, file=sys.stderr) as pbar:
+        with progress_bar(len(contracts), "Fetching option chains", unit="sym", file=sys.stderr) as pbar:
             for batch_num in range(total_batches):
                 start_idx = batch_num * batch_size
                 end_idx = min(start_idx + batch_size, len(contracts))
@@ -1146,7 +1194,12 @@ def get_option_chains(
                 expanded_rows.append({"symbol": row["symbol"], "expiry": expiry, "strike": strike})
 
         df_out = pd.DataFrame(expanded_rows)
+        if df_out.empty:
+            return df_out
         df_out["dte"] = get_dte(df_out["expiry"])
+        # Drop already-expired expiries (negative DTE) so stale contracts never
+        # leak into df_chains and downstream DTE windows.
+        df_out = df_out[df_out["dte"] >= 0].reset_index(drop=True)
         return df_out
 
     except Exception as e:

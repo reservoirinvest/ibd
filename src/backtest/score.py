@@ -32,6 +32,9 @@ class BacktestScore:
     composite: float = 0.0
     red_flags: list[str] = field(default_factory=list)
     verdict: str = "UNKNOWN"
+    # True when scoring is restricted to a focus window (`since` set). A short
+    # test period is then expected by design, so it must not force ABANDON.
+    windowed: bool = False
 
     def compute(self) -> "BacktestScore":
         flags: list[str] = []
@@ -70,7 +73,12 @@ class BacktestScore:
 
         # Robustness (0-25)
         if self.years_tested < 3.0:
-            flags.append("CRITICAL: Test period < 3 years — insufficient history")
+            # When focus-windowed, a short test period is intended — flag it but
+            # don't make it CRITICAL, else every windowed symbol becomes ABANDON.
+            if self.windowed:
+                flags.append("WARNING: Test period < 3 years (focus-windowed)")
+            else:
+                flags.append("CRITICAL: Test period < 3 years — insufficient history")
             self.robustness_score = 0.0
         elif self.years_tested < 5.0:
             flags.append("WARNING: Test period < 5 years")
@@ -93,8 +101,14 @@ def score_from_trades(
     df: pd.DataFrame,
     symbol: str,
     strategy: str = "options",
+    since=None,
 ) -> BacktestScore:
-    """Derive BacktestScore from a normalized Flex trade DataFrame for one symbol."""
+    """Derive BacktestScore from a normalized Flex trade DataFrame for one symbol.
+
+    since — when given (date / Timestamp / 'YYYY-MM-DD'), only closing trades on or
+    after this date are scored. Lets the caller exclude pre-focus-period history so
+    early mistakes don't drag the ABANDON/REFINE verdict.
+    """
     und = "underlyingSymbol" if "underlyingSymbol" in df.columns else "symbol"
     oc = "openCloseIndicator" if "openCloseIndicator" in df.columns else None
     cat = "assetCategory" if "assetCategory" in df.columns else None
@@ -106,9 +120,15 @@ def score_from_trades(
         mask &= df[oc] == "C"
 
     sub = df[mask].copy()
+
+    _windowed = since is not None
+    if _windowed and "dateTime" in sub.columns and not sub.empty:
+        _since = pd.Timestamp(since).normalize()
+        sub = sub[pd.to_datetime(sub["dateTime"], errors="coerce") >= _since]
     empty = BacktestScore(
         symbol=symbol, strategy=strategy, total_trades=0,
         win_rate=0.0, profit_factor=0.0, max_drawdown_pct=100.0, years_tested=0.0,
+        windowed=_windowed,
     ).compute()
 
     if sub.empty or "pnl" not in sub.columns:
@@ -138,4 +158,5 @@ def score_from_trades(
         symbol=symbol, strategy=strategy, total_trades=n,
         win_rate=win_rate, profit_factor=round(pf, 3),
         max_drawdown_pct=round(dd_pct, 1), years_tested=round(years, 1),
+        windowed=_windowed,
     ).compute()

@@ -6,7 +6,7 @@ import sys
 import logging
 import pandas as pd
 import numpy as np
-from tqdm import tqdm
+from src.dashboard.progress import track
 from dotenv import find_dotenv, load_dotenv
 from typing import List
 from ib_async import LimitOrder
@@ -88,7 +88,7 @@ def place_orders(cos: tuple, account_no: str = "", blk_size: int = 25, label: st
     desc = f"Executing {label} orders" if label else "Executing orders"
 
     with get_ib_connection("SNP", account_no=account_no) as ib:
-        for b in tqdm(cobs, desc=desc, file=sys.stderr):
+        for b in track(cobs, desc=desc, file=sys.stderr):
             for c, o in b:
                 td = ib.placeOrder(c, o)
                 trades.append(td)

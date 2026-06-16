@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import plotly.express as px
@@ -72,119 +72,72 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Apply minimal CSS to position navigation and allow native Streamlit dark/light mode
+# Claude-inspired styling. Palette comes from .streamlit/config.toml; the rules
+# below add serif display type, clay-accented expanders, the action pipeline
+# arrows, and keep the KPI / header utility classes. Everything keys off
+# Streamlit theme variables so dark mode stays legible.
 st.markdown(
     """
     <style>
-    /* Hide Deploy button only; keep hamburger (dark-mode toggle lives inside it) */
+    /* Hide Deploy button (dark-mode toggle lives in the hamburger menu) */
     [data-testid="stAppDeployButton"] { display: none !important; }
 
-    /* Outer nav bar — identified by #nav-outer-marker in the header column.
-       Using the marker (not :has([stRadio])) avoids applying position:fixed to the
-       inner sub-row that also contains the radio.
-       right: 3.5rem leaves space for the hamburger icon.
-       :has() is supported Chrome 105+, Safari 15.4+, Firefox 121+, Edge 105+. */
-    [data-testid="stHorizontalBlock"]:has(#nav-outer-marker) {
-        position: fixed !important;
-        top: 0 !important;
-        left: 0 !important;
-        right: 3.5rem !important;
-        z-index: 999999 !important;
-        background-color: var(--background-color) !important;
-        padding: 0 0.5rem !important;
-        margin: 0 !important;
-        align-items: center !important;
+    /* ── Type: serif display for headings + expander titles (Claude feel) ── */
+    h1, h2, h3, h4,
+    [data-testid="stExpander"] summary p,
+    .hdr-title {
+        font-family: Georgia, "Tiempos Text", "Times New Roman", serif !important;
+        letter-spacing: 0.2px;
     }
-    /* Inner sub-row (radio + selector + ↺): vertical centre alignment only */
-    [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) {
-        align-items: center !important;
+
+    /* ── Expanders: parchment panel, clay left-accent on the header ── */
+    [data-testid="stExpander"] {
+        border: 1px solid color-mix(in srgb, var(--text-color) 12%, transparent);
+        border-radius: 10px;
+        overflow: hidden;
+        margin-bottom: 0.5rem;
     }
-    /* Style radio as tab pills */
-    [data-testid="stRadio"] > div {
-        gap: 0.5rem;
+    [data-testid="stExpander"] summary {
+        border-left: 3px solid #D97757;  /* clay — literal so it persists in dark mode */
+        padding-left: 0.6rem;
     }
-    [data-testid="stRadio"] label {
-        padding: 0.25rem 1rem;
-        border-radius: 999px;
-        background-color: transparent;
-        border: 1px solid transparent;
-        transition: all 0.2s ease;
-    }
-    [data-testid="stRadio"] label:hover {
-        background-color: var(--secondary-background-color);
-    }
-    [data-testid="stRadio"] label[data-checked="true"] {
-        background-color: var(--secondary-background-color);
-        border: 1px solid var(--text-color);
-        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        font-weight: 600;
-    }
-    /* Opaque background for all expander content */
+    [data-testid="stExpander"] summary:hover { color: #D97757; }
     [data-testid="stExpanderDetails"] {
         background-color: var(--secondary-background-color) !important;
         backdrop-filter: none !important;
     }
-    /* Fixed KPI/AI band — JS adds .kpi-bar-fixed and sets top dynamically */
-    .kpi-bar-fixed {
-        position: fixed !important;
-        top: 2.5rem;           /* fallback — JS overrides with actual nav height */
-        left: 0 !important;
-        right: 3.5rem !important;
-        z-index: 999998 !important;
-        background-color: var(--background-color) !important;
-        padding: 0 0.5rem !important;
-        border-bottom: 1px solid rgba(128, 128, 128, 0.15) !important;
+
+    /* ── Action pipeline arrows ── */
+    .pipe-arrow {
+        display: flex; align-items: center; justify-content: center;
+        height: 100%; min-height: 2.4rem;
+        font-size: 1.5rem; font-weight: 700;
+        color: #D97757; opacity: 0.85;  /* clay — literal so it persists in dark mode */
     }
-    /* Ask AI column: allow natural height (answer expander drives it) */
-    .ask-ai-col { overflow: visible !important; min-width: 0 !important; }
-    /* Answer box — text wraps, no horizontal scroll on prose */
-    .ask-ai-col .stMarkdown p,
-    .ask-ai-col .stMarkdown li { overflow-wrap: break-word; word-break: normal; }
-    /* Tables scroll horizontally within their own block; container stays clean */
-    .ask-ai-col .stMarkdown table {
-        display: block; overflow-x: auto; max-width: 100%;
-    }
-    /* Table cells: wrap long text at ~20em, never force horizontal scroll on text */
-    .ask-ai-col .stMarkdown td,
-    .ask-ai-col .stMarkdown th {
-        white-space: normal !important; word-break: break-word; max-width: 20em; min-width: 4em;
-    }
-    /* Provider dropdown: fit to longest name — prevents leftward overlap with KPI table */
-    .ask-ai-col [data-baseweb="select"] { min-width: 0 !important; }
-    .ask-ai-col [data-testid="stSelectbox"] { max-width: fit-content !important; }
-    /* Compact status bar inside left column of the fixed band */
-    .hdr-bar { font-size: 0.72rem; line-height: 1.5; padding: 3px 0; }
-    .hdr-title { font-weight: 700; font-size: 0.86rem; }
-    .hdr-cur { color: #22c55e; font-weight: 700; font-size: 0.86rem; }
-    .hdr-item { opacity: 0.8; }
-    /* Push main content below nav + KPI/AI bar (JS refines this dynamically) */
-    section[data-testid="stMain"] > div.block-container {
-        padding-top: 7rem !important;
-    }
-    /* Analysis symbol selectbox — narrow to ~10 chars */
-    .sym-sel-narrow [data-baseweb="select"] {
-        min-width: 0 !important;
-        width: 10ch !important;
-    }
-    /* KPI flex band — responsive, wraps on narrow viewports */
+
+    /* ── Header status bar ── */
+    .hdr-bar   { font-size: 0.72rem; line-height: 1.5; padding: 3px 0; }
+    .hdr-title { font-weight: 700; font-size: 1.0rem; }
+    .hdr-cur   { color: #1f9d55; font-weight: 700; font-size: 0.86rem; }
+    .hdr-item  { opacity: 0.8; }
+
+    /* ── KPI flex band (built by kpi_strip) ── */
     .kpi-band { display: flex; flex-direction: column; }
-    .kpi-row { display: flex; flex-wrap: wrap; padding: 3px 4px; align-items: center; }
-    .kpi-row-a { background-color: rgba(128,128,128,0.04); }
-    .kpi-row-b { background-color: rgba(128,128,128,0.1); }
-    .kpi-cell { display: flex; align-items: center; gap: 5px; flex: 1 1 22%; min-width: 130px; padding: 1px 10px 1px 0; overflow: hidden; }
-    /* Medium viewports: 2 NLV cells per row prevents label overflow */
-    @media (min-width: 641px) and (max-width: 900px) {
-        .kpi-cell { flex: 1 1 45%; }
-    }
+    .kpi-row  { display: flex; flex-wrap: wrap; padding: 3px 4px; align-items: center; }
+    .kpi-row-a { background-color: color-mix(in srgb, var(--text-color) 4%, transparent); }
+    .kpi-row-b { background-color: color-mix(in srgb, var(--text-color) 9%, transparent); }
+    /* Cells stack label-above-value like st.metric (Performance Dashboard look) */
+    .kpi-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 0; flex: 1 1 22%; min-width: 120px; padding: 2px 12px 2px 0; line-height: 1.3; overflow: hidden; }
+    @media (min-width: 641px) and (max-width: 900px) { .kpi-cell { flex: 1 1 45%; } }
     .kpi-lbl-stack { display: flex; flex-direction: column; line-height: 1.2; }
-    .kpi-lbl { opacity: 0.6; font-size: 1.48rem; white-space: nowrap; }
-    .kpi-sub { font-size: 0.74rem; opacity: 0.55; white-space: nowrap; }
-    .kpi-val { font-weight: 600; font-size: 1.84rem; white-space: nowrap; }
+    .kpi-lbl { opacity: 0.6; font-size: 0.82rem; white-space: nowrap; }
+    .kpi-sub { font-size: 0.68rem; opacity: 0.55; white-space: nowrap; }
+    .kpi-val { font-weight: 600; font-size: 1.4rem; white-space: nowrap; }
     .kpi-breach { color: #ef4444 !important; }
-    /* st.metric() — match value/label sizes to NLV table */
     [data-testid="stMetricValue"] { font-size: 1.84rem !important; font-weight: 600 !important; }
     [data-testid="stMetricLabel"] { font-size: 1.0rem !important; opacity: 0.7; }
     [data-testid="stMetricDelta"] { font-size: 0.95rem !important; }
+
     /* Tooltip (?) badge */
     .kpi-help {
         cursor: help; opacity: 0.65; font-size: 0.72rem; line-height: 1;
@@ -193,88 +146,69 @@ st.markdown(
         border: 1px solid currentColor; border-radius: 50%;
         margin-left: 3px; vertical-align: middle;
     }
-    /* ── Mobile adjustments (≤ 640 px) ─────────────────────────────────── */
+
+    /* Deep-dive symbol selectbox — narrow to ~10 chars */
+    .sym-sel-narrow [data-baseweb="select"] { min-width: 0 !important; width: 10ch !important; }
+
+    /* Ask AI answer: wrap prose + scroll wide tables within their block */
+    [data-testid="stExpander"] .stMarkdown table { display: block; overflow-x: auto; max-width: 100%; }
+    [data-testid="stExpander"] .stMarkdown td,
+    [data-testid="stExpander"] .stMarkdown th { white-space: normal !important; word-break: break-word; max-width: 24em; }
+
+    /* Trim the default top padding now that the nav band is gone */
+    section[data-testid="stMain"] > div.block-container { padding-top: 2.5rem !important; }
+
+    /* ── Master section banners (Performance / Orders / Config) ── */
+    .st-key-btn_master_perf button,
+    .st-key-btn_master_orders button,
+    .st-key-btn_master_config button {
+        justify-content: flex-start !important;
+        text-align: left !important;
+        font-size: 1.15rem !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.01em;
+        padding: 0.45rem 0.9rem !important;
+        margin-top: 0.35rem;
+        border: none !important;
+        border-left: 4px solid #D97757 !important;
+        border-radius: 8px !important;
+        background: color-mix(in srgb, #D97757 12%, transparent) !important;
+    }
+    .st-key-btn_master_perf button:hover,
+    .st-key-btn_master_orders button:hover,
+    .st-key-btn_master_config button:hover {
+        background: color-mix(in srgb, #D97757 20%, transparent) !important;
+    }
+    /* Force the label (whatever tag Streamlit uses) hard-left — tag-agnostic.
+       The label wrapper is itself a flex container, so text-align alone won't
+       move it — pin justify-content too, and target nested tags as well. */
+    .st-key-btn_master_perf button > *,
+    .st-key-btn_master_orders button > *,
+    .st-key-btn_master_config button > *,
+    .st-key-btn_master_perf button p,
+    .st-key-btn_master_orders button p,
+    .st-key-btn_master_config button p {
+        width: 100% !important;
+        text-align: left !important;
+        justify-content: flex-start !important;
+    }
+
+    /* Keep narrow-column checkbox labels on one line */
+    .st-key-syn_chk_wrap label p,
+    .st-key-wk_chk_wrap label p { white-space: nowrap !important; }
+
+    /* REFINE Overrides controls row — center every cell vertically so the
+       "Change all overrides to:" label lines up with the input + buttons */
+    .st-key-ref_ovr_ctrls div[data-testid="stHorizontalBlock"] { align-items: stretch; }
+    .st-key-ref_ovr_ctrls div[data-testid="stColumn"] {
+        display: flex; flex-direction: column; justify-content: center;
+    }
+
+    /* ── Mobile (≤ 640 px): stack KPI cells two-up ── */
     @media (max-width: 640px) {
-        /* Nav bar: display as a CSS grid with 3 rows.
-           Col 1 is the main content (1fr), Col 2 is the refresh button (auto). */
-        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) {
-            display: grid !important;
-            grid-template-columns: 1fr auto !important;
-            grid-template-rows: auto auto auto !important;
-            gap: 0 0.5rem !important;
-            align-items: center !important;
-            padding: 0.5rem !important;
-            flex-wrap: nowrap !important;
-            overflow: visible !important;
-            background-color: var(--background-color) !important;
-            height: auto !important;
-            min-height: fit-content !important;
-        }
-
-        /* Set default Column behavior under Grid */
-        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) > [data-testid="stColumn"] {
-            width: auto !important;
-            min-width: 0 !important;
-            margin: 0 !important;
-            padding: 0.2rem 0 !important;
-            background-color: var(--background-color) !important;
-        }
-
-        /* Row 1: Header (Column 1) - spans the entire width */
-        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) > [data-testid="stColumn"]:nth-child(1) {
-            display: block !important;
-            grid-column: 1 / span 2 !important;
-            grid-row: 1 !important;
-        }
-
-        /* Row 2: Radio buttons (Column 2) - spans the entire width */
-        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) > [data-testid="stColumn"]:nth-child(2) {
-            display: block !important;
-            grid-column: 1 / span 2 !important;
-            grid-row: 2 !important;
-        }
-
-        /* Row 3: Account Selector (Column 3) on the left, Refresh (Column 5) on the right */
-        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) > [data-testid="stColumn"]:nth-child(3) {
-            display: block !important;
-            grid-column: 1 !important;
-            grid-row: 3 !important;
-        }
-        
-        /* Hide Clock/Nav Time (Column 4) on mobile */
-        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) > [data-testid="stColumn"]:nth-child(4) {
-            display: none !important;
-        }
-
-        /* Refresh Button (Column 5) */
-        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"]) > [data-testid="stColumn"]:nth-child(5) {
-            display: block !important;
-            grid-column: 2 !important;
-            grid-row: 3 !important;
-            justify-self: end !important;
-        }
-
-        /* Account selector selectbox styling overrides */
-        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"])
-          > [data-testid="stColumn"]:nth-child(3) * {
-            min-width: 0 !important;
-        }
-        [data-testid="stHorizontalBlock"]:has([data-testid="stRadio"])
-          > [data-testid="stColumn"]:nth-child(3) [data-baseweb="select"] {
-            width: 100% !important;
-        }
-
-        /* NLV table: 2-per-row with label stacked above value */
-        .kpi-cell {
-            flex: 1 1 45%;
-            min-width: 0;
-            flex-direction: column;
-            align-items: flex-start;
-            gap: 0;
-            padding: 2px 4px 2px 0;
-        }
-        .kpi-lbl { font-size: 1.1rem; }
-        .kpi-val { font-size: 1.35rem; }
+        .kpi-cell { flex: 1 1 45%; min-width: 0; flex-direction: column; align-items: flex-start; gap: 0; padding: 2px 4px 2px 0; }
+        .kpi-lbl { font-size: 0.78rem; }
+        .kpi-val { font-size: 1.2rem; }
     }
     </style>
     """,
@@ -432,8 +366,43 @@ _CFG_KEYS: list[tuple[str, str, type, object]] = [
     ("cfg_max_dte",          "MAX_DTE",               int,   50),
     ("cfg_mincushion",       "MINCUSHION",            float, 0.2),
     ("cfg_max_file_age",     "MAX_FILE_AGE",          int,   1),
+    ("cfg_score_from_focus", "SCORE_FROM_FOCUS",      bool,  False),
     ("cfg_defaultai",        "DEFAULTAI",             str,   "Gemini"),
 ]
+
+# Hardcoded fallback when FOCUS_DATE is missing from snp_config.yml.
+_FOCUS_DATE_FALLBACK = date(2025, 8, 8)
+
+
+def _cfg_focus_date_default() -> date:
+    """FOCUS_DATE from snp_config.yml (read fresh), falling back to the hardcoded date."""
+    try:
+        cfg = yaml.safe_load(_CFG_PATH.read_text(encoding="utf-8")) or {}
+        v = cfg.get("FOCUS_DATE", _FOCUS_DATE_FALLBACK)
+    except Exception:
+        v = _FOCUS_DATE_FALLBACK
+    if isinstance(v, date):
+        return v
+    try:
+        return pd.Timestamp(str(v)).date()
+    except Exception:
+        return _FOCUS_DATE_FALLBACK
+
+
+def focus_date() -> pd.Timestamp:
+    """Active focus date — the dashboard date-picker value if set, else snp_config.yml."""
+    v = st.session_state.get("cfg_focus_date")
+    if isinstance(v, date):
+        return pd.Timestamp(v)
+    return pd.Timestamp(_cfg_focus_date_default())
+
+
+def score_since():
+    """Cut-off Timestamp for trade-history scoring (focus date) when SCORE_FROM_FOCUS
+    is enabled, else None (full trade history)."""
+    if st.session_state.get("cfg_score_from_focus", False):
+        return focus_date()
+    return None
 
 
 def _init_cfg_state() -> None:
@@ -446,8 +415,14 @@ def _init_cfg_state() -> None:
         cfg = {}
     for sk, yk, cast, default in _CFG_KEYS:
         st.session_state.setdefault(sk, cast(cfg.get(yk, default)))
+    st.session_state.setdefault("cfg_focus_date", _cfg_focus_date_default())
+    st.session_state.setdefault(
+        "_focus_applied",
+        (st.session_state["cfg_focus_date"], st.session_state.get("cfg_score_from_focus", False)),
+    )
     _ai_raw = cfg.get("AIMODELS", ["Gemini", "DeepSeek"])
     st.session_state.setdefault("cfg_aimodels", _ai_raw if isinstance(_ai_raw, list) else [str(_ai_raw)])
+    st.session_state.setdefault("_defaultai_applied", st.session_state.get("cfg_defaultai"))
     st.session_state["_cfg_inited"] = True
 
 
@@ -466,6 +441,13 @@ def _save_cfg() -> None:
         if new_val != old_val:
             changed.append(f"{yk}={new_val!r}")
         cfg[yk] = new_val
+    # FOCUS_DATE — date widget, stored as an ISO string (kept out of _CFG_KEYS).
+    _fd = st.session_state.get("cfg_focus_date")
+    if isinstance(_fd, date):
+        _fd_str = _fd.isoformat()
+        if str(cfg.get("FOCUS_DATE", "")) != _fd_str:
+            changed.append(f"FOCUS_DATE={_fd_str!r}")
+        cfg["FOCUS_DATE"] = _fd_str
     _CFG_PATH.write_text(
         yaml.dump(cfg, default_flow_style=False, sort_keys=False),
         encoding="utf-8",
@@ -484,10 +466,15 @@ def _cfg_dirty() -> bool:
         cfg = yaml.safe_load(_CFG_PATH.read_text(encoding="utf-8")) or {}
     except Exception:
         return True
-    return any(
+    if any(
         cast(st.session_state.get(sk, default)) != cast(cfg.get(yk, default))
         for sk, yk, cast, default in _CFG_KEYS
-    )
+    ):
+        return True
+    _fd = st.session_state.get("cfg_focus_date")
+    if isinstance(_fd, date) and _fd.isoformat() != str(cfg.get("FOCUS_DATE", "")):
+        return True
+    return False
 
 
 def _force_reload_cfg() -> None:
@@ -498,6 +485,7 @@ def _force_reload_cfg() -> None:
         cfg = {}
     for sk, yk, cast, default in _CFG_KEYS:
         st.session_state[sk] = cast(cfg.get(yk, default))
+    st.session_state["cfg_focus_date"] = _cfg_focus_date_default()
     _ai_raw = cfg.get("AIMODELS", ["Gemini", "DeepSeek"])
     st.session_state["cfg_aimodels"] = _ai_raw if isinstance(_ai_raw, list) else [str(_ai_raw)]
     st.session_state["_cfg_inited"] = True
@@ -522,6 +510,169 @@ def _capture_exit(proc: subprocess.Popen | None, key: str) -> None:
         rc = proc.poll()
         st.session_state[key] = rc
         logger.info("Subprocess exited: key={} rc={} pid={}", key, rc, proc.pid)
+
+
+# ── Single global filter — one set of controls drives every expander ──────────
+_FILTER_STATES = [
+    "covering", "sowing", "sowed", "reaping", "protecting",
+    "orphaned", "zen", "unprotected", "uncovered", "exposed",
+]
+# Order-table key → the state that table represents (for show/hide on State filter).
+_ORDER_TABLE_STATE = {
+    "cover": "covering", "monthly_cov": "covering",
+    "nkd": "sowing", "reap": "reaping", "protect": "protecting",
+}
+
+
+def _global_filter_active() -> bool:
+    """True when any of the global filter controls is set."""
+    return bool(
+        str(st.session_state.get("flt_symbol", "") or "").strip()
+        or st.session_state.get("flt_right")
+        or st.session_state.get("flt_state")
+        or st.session_state.get("flt_itm")
+    )
+
+
+def apply_global_filter(df: pd.DataFrame, *, use_state: bool = True) -> pd.DataFrame:
+    """Apply the global filter (symbol prefix + C/P + state + ITM) to *df*.
+
+    Only dimensions present as columns take effect; ``use_state=False`` skips the
+    state column (order tables carry no ``state`` column — they are gated by
+    :func:`_order_table_visible` instead).
+    """
+    if df is None or df.empty:
+        return df
+    sym     = str(st.session_state.get("flt_symbol", "") or "").strip().upper()
+    rights  = st.session_state.get("flt_right") or []
+    states  = st.session_state.get("flt_state") or []
+    itm_only = bool(st.session_state.get("flt_itm", False))
+    out = df
+    if sym and "symbol" in out.columns:
+        out = out[out["symbol"].astype(str).str.upper() == sym]
+    if rights and "right" in out.columns:
+        out = out[out["right"].isin(rights)]
+    if use_state and states and "state" in out.columns:
+        out = out[out["state"].isin(states)]
+    if itm_only and "underlying_px" in out.columns:
+        _mask = _itm_mask_vec(out)
+        if _mask:
+            out = out[pd.Series(_mask, index=out.index)]
+    return out.reset_index(drop=True)
+
+
+def _order_table_visible(table_key: str) -> bool:
+    """Order tables have no per-row state; hide a table when the active State
+    filter excludes the state that table represents."""
+    states = st.session_state.get("flt_state") or []
+    if not states:
+        return True
+    return _ORDER_TABLE_STATE.get(table_key) in states
+
+
+def _clear_global_filter() -> None:
+    """Reset every global-filter widget. Used as the Clear button's on_click.
+    Assigns explicit cleared values (NOT pop): a callback write is authoritative
+    over the widget's frontend-submitted value, so the selectbox/multiselects
+    actually clear. pop() leaves them repopulated from the cached frontend value
+    on the rerun. Assigning a widget key is legal here because callbacks run
+    before the widgets are instantiated this run."""
+    st.session_state["flt_symbol"] = ""
+    st.session_state["flt_right"] = []
+    st.session_state["flt_state"] = []
+    st.session_state["flt_itm"] = False
+
+
+def _clear_positions_filter() -> None:
+    """Reset the Positions-only filter widgets (secType / DTE / Weekly only).
+    Symbol / State / ITM are cleared from the global Filter bar's Clear.
+    Assigns explicit defaults (see _clear_global_filter on why not pop())."""
+    st.session_state["pf_sectype"] = "ALL"
+    st.session_state["pf_dte_sel"] = "ALL"
+    st.session_state["pf_weekly_only"] = False
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _symbol_universe_static() -> list[str]:
+    """Tradeable symbols from suggested-order pickles + flex trade history.
+    Cached (60s) — these only change when the derive / flex pipelines run."""
+    syms: set[str] = set()
+    for _name in ("df_cov.pkl", "df_nkd.pkl", "df_reap.pkl", "df_protect.pkl"):
+        _p = _DATA_DIR / _name
+        if _p.exists():
+            try:
+                _d = pd.read_pickle(_p)
+                if "symbol" in _d.columns:
+                    syms |= set(_d["symbol"].dropna().astype(str))
+            except Exception:
+                pass
+    _ft = _MASTER_DIR / "flex_trades.pkl"
+    if _ft.exists():
+        try:
+            _d = pd.read_pickle(_ft)
+            _col = "underlyingSymbol" if "underlyingSymbol" in _d.columns else "symbol"
+            if _col in _d.columns:
+                syms |= set(_d[_col].dropna().astype(str))
+        except Exception:
+            pass
+    return sorted({s.strip().upper() for s in syms if s and str(s).strip()})
+
+
+def _filter_symbol_options() -> list[str]:
+    """Every symbol any panel could show: live positions + open orders +
+    suggested orders + traded history. Populates the global Symbol dropdown."""
+    syms: set[str] = set(_symbol_universe_static())
+    try:
+        _snap = client.snapshot()
+        for _df in (_snap.positions, _snap.orders):
+            if _df is not None and not _df.empty and "symbol" in _df.columns:
+                syms |= set(_df["symbol"].dropna().astype(str))
+    except Exception:
+        pass
+    return sorted({s.strip().upper() for s in syms if s and str(s).strip()})
+
+
+def render_filter_bar() -> None:
+    """Persistent global filter row — the single control set for all panels."""
+    _scope = (
+        "Global filter — narrows every panel below: Positions, Open Orders, "
+        "Cover / Sow / Reap / Protect, Gaps, Trade Analysis, Deep-Dive. "
+        "Empty = show everything."
+    )
+    c_lbl, c_sym, c_right, c_state, c_itm, c_clr = st.columns([0.9, 3, 1.4, 2.8, 1.1, 1])
+    c_lbl.markdown(
+        "<div style='padding-top:6px; font-weight:700; color:#D97757;'>🔎 Filter</div>",
+        unsafe_allow_html=True,
+    )
+    # Exact-match dropdown (type-to-search) over every filterable symbol —
+    # live positions + open orders + suggested orders + traded history.
+    _sym_opts = [""] + _filter_symbol_options()
+    # Migrating from the old free-text box: drop a stale value not in the list,
+    # else st.selectbox raises on an out-of-range session value.
+    if st.session_state.get("flt_symbol") not in _sym_opts:
+        st.session_state.pop("flt_symbol", None)
+    c_sym.selectbox(
+        "Symbol", _sym_opts, key="flt_symbol",
+        format_func=lambda s: s or "🔍  All symbols",
+        label_visibility="collapsed", help=_scope,
+    )
+    c_right.multiselect(
+        "C/P", ["C", "P"], key="flt_right", placeholder="C / P",
+        label_visibility="collapsed",
+    )
+    c_state.multiselect(
+        "State", _FILTER_STATES, key="flt_state", placeholder="State…",
+        label_visibility="collapsed",
+    )
+    c_itm.checkbox("ITM only", key="flt_itm")
+    # Clear via on_click callback (runs BEFORE widgets re-instantiate next run).
+    # Popping flt_symbol in the button return-branch + st.rerun() is unreliable
+    # for st.text_input — the frontend re-submits its cached value, so the Symbol
+    # box stays filled. A callback resets the widget keys cleanly.
+    c_clr.button(
+        "✕ Clear", key="flt_clear", width="stretch", help="Clear all filters",
+        on_click=_clear_global_filter,
+    )
 
 
 def _sub_env() -> dict[str, str]:
@@ -705,7 +856,7 @@ def _drop_withstand(excess: float, delta_abs: float) -> str:
 
 @st.fragment(run_every=2)
 def header() -> None:
-    """Compact status bar — rendered in the nav row (left of tabs)."""
+    """Compact status bar — title, connection state, port/cid, position count."""
     # Trigger a rerun of the main app once bootstrap completes or restarts after disconnect
     if not client._bootstrapped:
         st.session_state["_bootstrapped_rerun_done"] = False
@@ -727,33 +878,13 @@ def header() -> None:
     pos_n = len(positions_filt)
 
     st.markdown(
-        f'<div class="hdr-bar" id="nav-outer-marker">'
+        f'<div class="hdr-bar">'
         f'<span class="hdr-title">IB Monitor</span>'
         f'&nbsp;&nbsp;{st_html}&nbsp;&nbsp;'
         f'<span class="hdr-cur">{settings.currency}</span>'
         f'<br>'
         f'<span class="hdr-item">port:&nbsp;{settings.ib_port}&nbsp;cid:&nbsp;{settings.ib_client_id}</span>'
         f'&nbsp;&bull;&nbsp;<span class="hdr-item">pos:&nbsp;{pos_n}</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-
-@st.fragment(run_every=5)
-def _nav_time() -> None:
-    """Clock + snapshot age, refreshed every 30 s."""
-    snap = client.snapshot()
-    _now_str = datetime.now().strftime("%H:%M:%S")
-    _ago_str = "—"
-    if snap.as_of:
-        _elapsed_s = max(0, int((datetime.now().astimezone() - snap.as_of.astimezone()).total_seconds()))
-        _h, _rem = divmod(_elapsed_s, 3600)
-        _m, _s   = divmod(_rem, 60)
-        _ago_str = f"{_h}:{_m:02d}:{_s:02d}"
-    st.markdown(
-        f'<div class="hdr-bar" style="text-align:right;">'
-        f'<span class="hdr-item">{_now_str}</span><br>'
-        f'<span class="hdr-item" style="font-size:0.65rem;opacity:0.7;">data {_ago_str} old</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -915,274 +1046,6 @@ def render_orders() -> None:
     acct = _selected_account()
     _ok = account_kpis(snap, min_cushion=settings.min_cushion, account=acct)
 
-    # ── Subprocess state ─────────────────────────────────────────────────────
-    proc: subprocess.Popen | None       = st.session_state.get("derive_proc")
-    exec_proc: subprocess.Popen | None  = st.session_state.get("execute_proc")
-    frozen     = client.is_frozen()
-    frozen_for = st.session_state.get("frozen_for", "")   # "derive" | "execute" | ""
-
-    # Auto-unfreeze when each subprocess finishes (derive + execute only; ohlc runs without freeze)
-    def _auto_unfreeze(tag: str, proc_key: str) -> None:
-        proc_ = st.session_state.get(proc_key)
-        if frozen and proc_ is not None and proc_.poll() is not None and frozen_for == tag:
-            st.session_state[f"_{tag}_exit"] = proc_.poll()  # capture before clearing proc
-            client.unfreeze()
-            st.session_state[proc_key] = None
-            st.session_state.pop("frozen_for", None)
-            st.rerun()
-
-    _auto_unfreeze("derive",  "derive_proc")
-    _auto_unfreeze("execute", "execute_proc")
-
-    # Fallback: if log shows RECOMMENDATIONS COMPLETE but derive.py hasn't exited in 60s, kill it.
-    # Handles cases where derive.py hangs on ib.disconnect() or other cleanup after logging done.
-    if frozen and frozen_for == "derive" and proc is not None and proc.poll() is None:
-        _pct_chk, _, _ = _derive_progress()
-        if _pct_chk >= 1.0:
-            _since = st.session_state.get("_derive_complete_since")
-            if _since is None:
-                st.session_state["_derive_complete_since"] = time.monotonic()
-            elif time.monotonic() - _since > 60.0:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                try:
-                    _kill_rc = proc.wait(timeout=3)
-                except Exception:
-                    _kill_rc = 1
-                st.session_state["_derive_exit"] = _kill_rc
-                client.unfreeze()
-                st.session_state["derive_proc"] = None
-                st.session_state.pop("frozen_for", None)
-                st.session_state.pop("_derive_complete_since", None)
-                st.rerun()
-    else:
-        st.session_state.pop("_derive_complete_since", None)
-
-    # Capture exit codes the moment each process ends
-    _capture_exit(proc,      "_derive_exit")
-    _capture_exit(exec_proc, "_execute_exit")
-
-    # ── Order Actions expander ────────────────────────────────────────────────
-    with st.expander("⚙️ Order Actions", expanded=True, key="exp_ord_actions"):
-        st.caption(
-            "Daily flow: ── "
-            "Analysis → Generate OHLCs → Run Backtest → "
-            "**Generate Orders** → REFINE Overrides (below) → **Execute Orders**"
-        )
-        gen_col, deploy_chk_col, _btn_spacer, exec_col = st.columns([2, 2, 4, 2])
-
-        # Generate Orders
-        with gen_col:
-            if st.button(
-                "⚙️ Generate Orders",
-                type="primary" if frozen else "secondary",
-                width="stretch",
-                help="Freezes the dashboard (releases CID), runs derive.py, then reconnects. "
-                     "Takes 2–5 min. Last-known data stays visible during the freeze.",
-            ) and not frozen:
-                _DERIVE_LOG.parent.mkdir(parents=True, exist_ok=True)
-                log_fh = open(_DERIVE_LOG, "w", encoding="utf-8")  # noqa: SIM115
-                _env = _sub_env()
-                st.session_state.pop("_derive_exit", None)
-                st.session_state.pop("_derive_summary", None)
-                st.session_state["frozen_for"] = "derive"
-                client.freeze()
-                new_proc = subprocess.Popen(
-                    [sys.executable, str(_here() / "src" / "derive.py")],
-                    stdout=log_fh,
-                    stderr=None,
-                    env=_env,
-                )
-                st.session_state["derive_proc"] = new_proc
-                logger.info("derive.py started pid={}", new_proc.pid)
-                st.rerun()
-            if "_derive_exit" not in st.session_state and not frozen:
-                ages = [_pkl_age(n) for n in ["df_cov.pkl", "df_nkd.pkl", "df_reap.pkl"]]
-                age_str = ages[0] if len(set(ages)) == 1 else " | ".join(ages)
-                st.caption(f"Last: {age_str}")
-
-        # Sow filter — rendered after Execute col so widget key is defined once
-        with deploy_chk_col:
-            st.checkbox(
-                "Sow: DEPLOY only",
-                key="ord_sow_deploy_only",
-                value=True,
-                help=(
-                    "When ON, Sow shows DEPLOY symbols plus any REFINE symbols with active "
-                    "overrides set in the REFINE Overrides panel below. "
-                    "Toggle before executing to include/exclude REFINE symbols."
-                ),
-            )
-
-        # Execute Orders
-        with exec_col:
-            @st.dialog("⚠️ Confirm Order Execution", width="small")
-            def _confirm_execute():
-                st.markdown(
-                    "This will execute all orders from the Suggested Orders section. "
-                    "**This action is irreversible.** Are you sure?"
-                )
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("✅ Execute", width="stretch"):
-                        st.session_state["_exec_confirmed"] = True
-                        st.rerun()
-                with col2:
-                    if st.button("❌ Cancel", width="stretch"):
-                        st.session_state.pop("_execute_exit", None)
-                        st.session_state.pop("_exec_confirmed", None)
-                        st.rerun()
-
-            if st.button(
-                "▶️ Execute Orders",
-                type="primary" if (frozen and frozen_for == "execute") else "secondary",
-                width="stretch",
-                help="Execute all orders from the Suggested Orders section. "
-                     "Freezes the dashboard, runs execute.py, then reconnects. "
-                     "⚠️ This is IRREVERSIBLE.",
-            ) and not frozen:
-                _confirm_execute()
-
-            if st.session_state.get("_exec_confirmed"):
-                st.session_state.pop("_exec_confirmed", None)
-                _EXECUTE_LOG.parent.mkdir(parents=True, exist_ok=True)
-                log_fh = open(_EXECUTE_LOG, "w", encoding="utf-8")  # noqa: SIM115
-                _env = _sub_env()
-                st.session_state.pop("_execute_exit", None)
-                st.session_state["frozen_for"] = "execute"
-                client.freeze()
-                exec_proc = subprocess.Popen(
-                    [sys.executable, str(_here() / "src" / "execute.py")],
-                    stdout=log_fh,
-                    stderr=None,  # tqdm progress bars flow to terminal; stdout (counts/errors) to log
-                    env=_env,
-                )
-                st.session_state["execute_proc"] = exec_proc
-                logger.info("execute.py started pid={}", exec_proc.pid)
-
-        # ── Status row (derive + execute) ─────────────────────────────────────
-        if frozen or "_derive_exit" in st.session_state or "_execute_exit" in st.session_state:
-            gen_status_col, exec_status_col, _st_spacer = st.columns([2.5, 2.5, 5])
-            with gen_status_col:
-                if frozen and frozen_for == "derive":
-                    _pct, phase, _ = _derive_progress()
-                    st.progress(max(_pct, 0.01), text=f"⏳ {phase}")
-                elif "_derive_exit" in st.session_state:
-                    rc = st.session_state["_derive_exit"]
-                    if rc == 0:
-                        # Cache counts at derive-time so they survive execute clearing the pkls
-                        if "_derive_summary" not in st.session_state:
-                            _nc = len(_load_pkl("df_cov.pkl"))
-                            _nn = len(_load_pkl("df_nkd.pkl"))
-                            _nr = len(_load_pkl("df_reap.pkl"))
-                            _np = len(_load_pkl("df_protect.pkl"))
-                            st.session_state["_derive_summary"] = (
-                                ([f"{_nc} covers"] if _nc else [])
-                                + ([f"{_nn} nakeds"] if _nn else [])
-                                + ([f"{_nr} reaps"] if _nr else [])
-                                + ([f"{_np} protects"] if _np else [])
-                            )
-                        _parts = st.session_state["_derive_summary"]
-                        if _parts:
-                            st.success(f"✅ {', '.join(_parts)}")
-                        else:
-                            st.warning("⚠️ derive.py ran OK — no orders generated (check log)")
-                    else:
-                        st.error(f"❌ Generate Orders failed (exit {rc})")
-            with exec_status_col:
-                if frozen and frozen_for == "execute":
-                    st.progress(0.5, text="⏳ Executing orders…")
-                elif "_execute_exit" in st.session_state:
-                    rc = st.session_state["_execute_exit"]
-                    if rc == 0:
-                        st.success("✅ Orders executed")
-                    else:
-                        st.error(f"❌ Order execution failed (exit {rc})")
-
-        # ── Live log (during run) and post-run log expander ───────────────────
-        if frozen and frozen_for == "execute":
-            _exec_log = _here() / "log" / "execute.log"
-            if _exec_log.exists():
-                try:
-                    _exec_live = _exec_log.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
-                    if _exec_live:
-                        st.code("\n".join(_exec_live), language=None)
-                except Exception:
-                    pass
-        elif frozen:
-            log_lines = _derive_log_lines(35)
-            if log_lines:
-                st.code("\n".join(_strip_ansi(ln) for ln in log_lines), language=None)
-        elif "_derive_exit" in st.session_state:
-            rc = st.session_state["_derive_exit"]
-            _render_log_expander("📋 derive.py log", _DERIVE_LOG, expanded=rc != 0)
-
-        if "_execute_exit" in st.session_state:
-            rc = st.session_state["_execute_exit"]
-            _render_log_expander("📋 execute.py log", _EXECUTE_LOG, expanded=rc != 0)
-
-        # ── Advanced: Clear Data (optional fresh-start) ────────────────────────
-        # Protected files are never deleted (backtest results, overrides, backtest OHLC cache).
-        _CLEAR_PROTECTED = {"backtest_results.pkl", "backtest_ohlc.pkl", "symbol_overrides.json"}
-
-        @st.dialog("⚠️ Confirm Clear Data", width="small")
-        def _confirm_clear(files: list[str]):
-            st.markdown(
-                "The following derived files in `data/` will be **permanently deleted**. "
-                "Backtest results, REFINE overrides, and OHLC cache are **kept**."
-            )
-            st.markdown("\n".join(f"- `{f}`" for f in files))
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("🗑️ Delete", width="stretch"):
-                    st.session_state["_clear_confirmed"] = True
-                    st.rerun()
-            with col2:
-                if st.button("❌ Cancel", width="stretch"):
-                    st.rerun()
-
-        with st.expander("Advanced", expanded=False):
-            st.caption(
-                "Use **Clear Data** only for a fresh start (e.g. malformed chains). "
-                "Deletes derived pkl files. Keeps backtest results, REFINE overrides, "
-                "OHLC cache, and data/master/."
-            )
-            _clr_adv_col, _ = st.columns([2, 6])
-            with _clr_adv_col:
-                if st.button("🗑️ Clear Data", width="stretch", type="secondary",
-                             key="btn_clr_data_adv"):
-                    _files_to_clear = sorted(
-                        p.name for p in _DATA_DIR.iterdir()
-                        if p.is_file() and p.name not in _CLEAR_PROTECTED
-                    )
-                    if _files_to_clear:
-                        _confirm_clear(_files_to_clear)
-                    else:
-                        st.toast("No files to clear.")
-
-            if st.session_state.get("_clear_confirmed"):
-                st.session_state.pop("_clear_confirmed", None)
-                _cleared, _locked = [], []
-                for _p in sorted(_DATA_DIR.iterdir()):
-                    if not _p.is_file() or _p.name in _CLEAR_PROTECTED:
-                        continue
-                    try:
-                        _p.unlink()
-                        _cleared.append(_p.name)
-                    except PermissionError:
-                        _locked.append(_p.name)
-                if _cleared:
-                    st.toast(f"Cleared {len(_cleared)} file(s): {', '.join(_cleared)}")
-                if _locked:
-                    st.toast(
-                        f"⚠️ {', '.join(_locked)} still in use — retry in a moment",
-                        icon="⚠️",
-                    )
-
-    st.divider()
-
     # ── Auto-delete stale order pickles (MAX_FILE_AGE check) ──────────────────
     try:
         _yml = yaml.safe_load(_CFG_PATH.read_text(encoding="utf-8")) or {}
@@ -1238,38 +1101,17 @@ def render_orders() -> None:
         _yml_protect = False
     _raw_prot = _load_pkl("df_protect.pkl") if _yml_protect else pd.DataFrame()
 
-    # ── Filter bar (shared: applies to Open Orders + all Suggested tables) ──
-    _f1, _f2, _f3 = st.columns([3, 1, 1])
-    _sym_filt   = _f1.text_input(
-        "🔍 Filter by symbol", key="ord_f_sym", placeholder="e.g. AAPL, SPY",
-        label_visibility="collapsed",
-    )
-    _right_filt = _f2.multiselect(
-        "C/P", ["C", "P"], key="ord_f_right", placeholder="C / P",
-        label_visibility="collapsed",
-    )
-    if _f3.button("✕ Clear", key="ord_clear_filter", width="stretch",
-                  help="Clear symbol and C/P filters"):
-        st.session_state.pop("ord_f_sym", None)
-        st.session_state.pop("ord_f_right", None)
-        st.rerun()
-
+    # Order tables are driven by the single global filter bar (symbol + C/P + ITM).
+    # State is handled per-table via _order_table_visible() since order pickles
+    # carry no per-row state column.
     def _ord_filt(df: pd.DataFrame) -> pd.DataFrame:
-        """Apply symbol prefix + C/P filter; returns a reset-index copy."""
-        if df.empty:
-            return df
-        if _sym_filt and "symbol" in df.columns:
-            # Strict prefix match — 'A' shows AAPL/AMZN, not symbols with A elsewhere
-            df = df[df["symbol"].str.upper().str.startswith(_sym_filt.strip().upper())]
-        if _right_filt and "right" in df.columns:
-            df = df[df["right"].isin(_right_filt)]
-        return df.reset_index(drop=True)
+        return apply_global_filter(df, use_state=False)
 
-    df_cov         = _ord_filt(_raw_cov)
-    df_monthly_cov = _ord_filt(_raw_monthly_cov)
-    df_nkd         = _ord_filt(_raw_nkd)
-    df_reap_pkl    = _ord_filt(_raw_reap)
-    df_prot        = _ord_filt(_raw_prot)
+    df_cov         = _ord_filt(_raw_cov)         if _order_table_visible("cover")       else _raw_cov.iloc[0:0]
+    df_monthly_cov = _ord_filt(_raw_monthly_cov) if _order_table_visible("monthly_cov") else _raw_monthly_cov.iloc[0:0]
+    df_nkd         = _ord_filt(_raw_nkd)         if _order_table_visible("nkd")         else _raw_nkd.iloc[0:0]
+    df_reap_pkl    = _ord_filt(_raw_reap)        if _order_table_visible("reap")        else _raw_reap.iloc[0:0]
+    df_prot        = _ord_filt(_raw_prot)        if _order_table_visible("protect")     else _raw_prot.iloc[0:0]
 
     # ── Open Orders ─────────────────────────────────────────────────────────
     orders = snap.orders
@@ -1280,7 +1122,7 @@ def render_orders() -> None:
     _open_label = f"🗂 Open Orders — {_n_open}" if _n_open else "🗂 Open Orders"
     with st.expander(_open_label, expanded=False):
         if orders.empty:
-            st.info("No open orders." if not (_sym_filt or _right_filt) else "No open orders match filter.")
+            st.info("No open orders." if not _global_filter_active() else "No open orders match filter.")
         else:
             cols_show = [
                 "symbol", "secType", "right", "strike", "expiry",
@@ -1317,7 +1159,7 @@ def render_orders() -> None:
         f"📈 Cover — {n_cov} orders · ${cov_reward:,.0f} expected if called"
         if n_cov else "📈 Cover — 0 orders"
     )
-    with st.expander(cov_label, expanded=True):
+    with st.expander(cov_label, expanded=n_cov > 0):
         _cov_processed = _cov_summary.get("processed", 0)
         _cov_generated = _cov_summary.get("generated", 0)
         _cov_estimated = _cov_summary.get("estimated_prices", 0)
@@ -1364,7 +1206,7 @@ def render_orders() -> None:
         f"📅 Monthly CC — {n_mc} orders · ${mc_reward:,.0f} profit if called"
         if n_mc else "📅 Monthly CC — 0 orders"
     )
-    with st.expander(mc_label, expanded=True):
+    with st.expander(mc_label, expanded=n_mc > 0):
         if _raw_monthly_cov.empty:
             st.info(
                 "No monthly CC suggestions — run Generate Orders, or no monthly-only "
@@ -1392,23 +1234,35 @@ def render_orders() -> None:
                 },
             )
 
-    # Sow (Nakeds) — optional DEPLOY-only filter (includes REFINE symbols with active overrides)
+    # Sow (Nakeds) — optional DEPLOY-only filter (synthetic OR trade-history DEPLOY, plus REFINE overrides)
     import json as _sow_json  # noqa: PLC0415
+    from src.backtest.score import score_from_trades as _sft  # noqa: PLC0415
     from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _BT_RES  # noqa: PLC0415
     _deploy_only = st.session_state.get("ord_sow_deploy_only", True)
     _df_nkd_disp = df_nkd.copy()
-    _deploy_syms: set[str] = set()
+    _syn_deploy_syms: set[str] = set()
+    _trade_deploy_syms: set[str] = set()
     _refine_override_syms: set[str] = set()
-    if _deploy_only and _BT_RES.exists():
+    if _deploy_only:
         try:
-            _bt_verd = pd.read_pickle(_BT_RES)
-            _deploy_syms = set(_bt_verd.loc[_bt_verd["verdict"] == "DEPLOY", "symbol"].dropna())
+            if _BT_RES.exists():
+                _bt_verd = pd.read_pickle(_BT_RES)
+                _syn_deploy_syms = set(_bt_verd.loc[_bt_verd["verdict"] == "DEPLOY", "symbol"].dropna())
+            _flex_pkl = Path("data/master/flex_trades.pkl")
+            if _flex_pkl.exists():
+                _flex_df = pd.read_pickle(_flex_pkl)
+                for _sym in df_nkd["symbol"].dropna().unique():
+                    _bs = _sft(_flex_df, _sym, since=score_since())
+                    if _bs.total_trades > 0 and _bs.verdict == "DEPLOY":
+                        _trade_deploy_syms.add(_sym)
             _ovr_path = Path("data/symbol_overrides.json")
             if _ovr_path.exists():
                 _ovr_data = _sow_json.loads(_ovr_path.read_text(encoding="utf-8"))
                 _refine_override_syms = set(_ovr_data.get("VIRGIN_PUT_STD_MULT", {}).keys())
+            _deploy_syms = _syn_deploy_syms | _trade_deploy_syms
             _allowed = _deploy_syms | _refine_override_syms
-            _df_nkd_disp = _df_nkd_disp[_df_nkd_disp["symbol"].isin(_allowed)]
+            if _allowed:
+                _df_nkd_disp = _df_nkd_disp[_df_nkd_disp["symbol"].isin(_allowed)]
         except Exception:
             pass
 
@@ -1418,17 +1272,19 @@ def render_orders() -> None:
         f"🌱 Sow — {n_nkd} orders · ${nkd_premium:,.0f} expected premium"
         if n_nkd else "🌱 Sow — 0 orders"
     )
-    with st.expander(nkd_label, expanded=True):
-        if _deploy_syms:
-            st.caption(
-                f"Filter: {len(_deploy_syms)} DEPLOY + {len(_refine_override_syms)} REFINE-override symbols"
-                if st.session_state.get("ord_sow_deploy_only", True)
-                else "Filter: off — all symbols shown"
-            )
-        elif not st.session_state.get("ord_sow_deploy_only", True):
-            st.caption("Filter: off — all symbols shown")
+    with st.expander(nkd_label, expanded=n_nkd > 0):
+        _deploy_syms_all = _syn_deploy_syms | _trade_deploy_syms
+        if st.session_state.get("ord_sow_deploy_only", True):
+            if _deploy_syms_all or _refine_override_syms:
+                st.caption(
+                    f"Filter: {len(_syn_deploy_syms)} syn-DEPLOY"
+                    f" + {len(_trade_deploy_syms)} trade-DEPLOY"
+                    f" + {len(_refine_override_syms)} REFINE-override"
+                )
+            else:
+                st.caption("No backtest results — all symbols shown")
         else:
-            st.caption("No backtest results — all symbols shown")
+            st.caption("Filter: off — all symbols shown")
         if _raw_nkd.empty:
             _skip_path = _DATA_DIR / "sow_skip.json"
             _skip_reason: dict = {}
@@ -1476,6 +1332,9 @@ def render_orders() -> None:
                 },
             )
 
+    # REFINE Overrides — sits directly under Sow (drives sow σ per symbol)
+    render_refine_overrides()
+
     # Reap
     n_reap = len(df_reap_pkl)
     reap_cost = _exp_premium(df_reap_pkl)
@@ -1483,7 +1342,7 @@ def render_orders() -> None:
         f"🌾 Reap — {n_reap} orders · ${reap_cost:,.0f} to close"
         if n_reap else "🌾 Reap — 0 orders"
     )
-    with st.expander(reap_label, expanded=True):
+    with st.expander(reap_label, expanded=n_reap > 0):
         if _raw_reap.empty:
             st.info("No reap suggestions - run Generate Orders or nothing to reap")
         elif df_reap_pkl.empty:
@@ -1508,7 +1367,7 @@ def render_orders() -> None:
     # Protect
     n_prot = len(df_prot)
     prot_label = f"🛡️ Protect — {n_prot} orders" if _yml_protect else "🛡️ Protect"
-    with st.expander(prot_label, expanded=True):
+    with st.expander(prot_label, expanded=n_prot > 0):
         if not _yml_protect:
             st.info("PROTECT_ME=False — protection suggestions not shown. "
                     "Enable in the Config panel and save, then re-run Generate Orders.")
@@ -1537,7 +1396,6 @@ def render_orders() -> None:
             )
 
 
-@st.fragment
 def render_refine_overrides() -> None:
     """Per-symbol VIRGIN_PUT_STD_MULT overrides for REFINE symbols.
 
@@ -1589,13 +1447,19 @@ def render_refine_overrides() -> None:
             lambda r: float(_saved.get(r["symbol"], r["put_std_mult_opt"])), axis=1
         )
         _refine["csp_win_rate"] = (_refine["csp_win_rate"] * 100).round(1)
-        st.session_state["_ref_ovr_base"] = _refine.rename(
-            columns={
-                "csp_win_rate": "CSP Win%",
-                "csp_pf": "CSP PF",
-                "put_std_mult_opt": "Suggested σ",
-            }
-        )[["Use", "symbol", "CSP Win%", "CSP PF", "Suggested σ", "Override σ"]]
+        st.session_state["_ref_ovr_base"] = (
+            _refine.rename(
+                columns={
+                    "csp_win_rate": "CSP Win%",
+                    "csp_pf": "CSP PF",
+                    "put_std_mult_opt": "Suggested σ",
+                }
+            )[["Use", "symbol", "CSP Win%", "CSP PF", "Suggested σ", "Override σ"]]
+            # Lowest Override σ first (ascending) — surfaces symbols whose override
+            # still needs raising at the top.
+            .sort_values("Override σ", ascending=True, kind="stable")
+            .reset_index(drop=True)
+        )
         st.session_state["_ref_ovr_mtime"] = _mtime
 
     _base = st.session_state["_ref_ovr_base"]
@@ -1621,24 +1485,51 @@ def render_refine_overrides() -> None:
             "**Suggested σ** = max(grid-optimal, config) — never tighter than global setting."
         )
 
-        # Select All / Clear All
-        _sa_col, _ca_col, _ = st.columns([1, 1, 5])
-        with _sa_col:
-            if st.button("☑ Select All", key="btn_sel_all_ovr"):
-                _nb = st.session_state["_ref_ovr_base"].copy()
-                _nb["Use"] = True
-                st.session_state["_ref_ovr_base"] = _nb
-                st.session_state.pop("sym_override_editor", None)
-                st.session_state["_ref_ovr_expanded"] = True
-                st.rerun()
-        with _ca_col:
-            if st.button("☐ Clear All", key="btn_clr_all_ovr"):
-                _nb = st.session_state["_ref_ovr_base"].copy()
-                _nb["Use"] = False
-                st.session_state["_ref_ovr_base"] = _nb
-                st.session_state.pop("sym_override_editor", None)
-                st.session_state["_ref_ovr_expanded"] = True
-                st.rerun()
+        # Select All | Change all overrides to: [value] ↵ | Clear All  (one row)
+        # Keyed container → .st-key-ref_ovr_ctrls CSS centers each cell vertically.
+        with st.container(key="ref_ovr_ctrls"):
+            _sa_col, _lbl_col, _inp_col, _go_col, _ca_col, _sp_col = st.columns(
+                [1.1, 1.7, 0.9, 0.5, 1.1, 1.4], vertical_alignment="center"
+            )
+            with _sa_col:
+                if st.button("☑ Select All", key="btn_sel_all_ovr", width="stretch"):
+                    _nb = st.session_state["_ref_ovr_base"].copy()
+                    _nb["Use"] = True
+                    st.session_state["_ref_ovr_base"] = _nb
+                    st.session_state.pop("sym_override_editor", None)
+                    st.session_state["_ref_ovr_expanded"] = True
+                    st.rerun()
+            with _lbl_col:
+                st.markdown(
+                    "<div style='display:flex; align-items:center; "
+                    "justify-content:flex-end; height:100%; min-height:2.5rem; "
+                    "white-space:nowrap; font-weight:600; margin:0;'>"
+                    "Change all overrides to:</div>",
+                    unsafe_allow_html=True,
+                )
+            with _inp_col:
+                _ovr_all_val = st.number_input(
+                    "Change all overrides to",
+                    value=2.00, step=0.25, min_value=0.1, max_value=5.0,
+                    key="ovr_all_val", label_visibility="collapsed",
+                )
+            with _go_col:
+                if st.button("↵", key="btn_apply_all_ovr", width="stretch",
+                             help="Set every Override σ to this value"):
+                    _nb = st.session_state["_ref_ovr_base"].copy()
+                    _nb["Override σ"] = round(float(_ovr_all_val), 2)
+                    st.session_state["_ref_ovr_base"] = _nb
+                    st.session_state.pop("sym_override_editor", None)
+                    st.session_state["_ref_ovr_expanded"] = True
+                    st.rerun()
+            with _ca_col:
+                if st.button("☐ Clear All", key="btn_clr_all_ovr", width="stretch"):
+                    _nb = st.session_state["_ref_ovr_base"].copy()
+                    _nb["Use"] = False
+                    st.session_state["_ref_ovr_base"] = _nb
+                    st.session_state.pop("sym_override_editor", None)
+                    st.session_state["_ref_ovr_expanded"] = True
+                    st.rerun()
 
         _edited = st.data_editor(
             _base,
@@ -1678,7 +1569,7 @@ def render_refine_overrides() -> None:
         _save_col, _info_col = st.columns([1, 3])
         with _save_col:
             if st.button("💾 Save Overrides", type="primary", key="btn_save_overrides"):
-                _active_rows = _edited[_edited["Use"] == True]
+                _active_rows = _edited[_edited["Use"].astype(bool)]
                 _new_map: dict[str, float] = {
                     row["symbol"]: round(float(row["Override σ"]), 2)
                     for _, row in _active_rows.iterrows()
@@ -1738,41 +1629,12 @@ def render_config_panel() -> None:
         k = key or name
         return f"{name}  [Recommend: {_bt_rec[k]}]" if k in _bt_rec else name
 
-    _cfg_hdr, _cfg_btn = st.columns([1, 2])
-    with _cfg_hdr:
-        st.markdown("#### ⚙️ Config")
+    _cfg_btn, _ = st.columns([2, 4])
     with _cfg_btn:
         if st.button("🔄 Get Config", help="Force re-read from snp_config.yml", width="stretch"):
             _force_reload_cfg()
-            st.rerun()
+            st.rerun(scope="fragment")
     st.caption("Changes apply to next derive run. Comments in YAML are not preserved on save.")
-
-    # ── GENERAL (top — most-used risk limits) ───────────────────────────────
-    st.number_input("MINCUSHION", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
-                    key="cfg_mincushion",
-                    help="Minimum excess-liquidity / NLV cushion (triggers alert below this)")
-    st.number_input("MAX_DTE", min_value=1, step=1,
-                    key="cfg_max_dte",
-                    help="Maximum days to expiry for new option entries")
-
-    # ── FILE AGE / AUTO-EXPIRE ──────────────────────────────────────────────
-    st.number_input(
-        "MAX_FILE_AGE (days)",
-        min_value=0, step=1,
-        key="cfg_max_file_age",
-        help="Order pickles older than this many days are auto-deleted on next dashboard load. "
-             "0 = never auto-delete.",
-    )
-    _age_pkls = [
-        ("df_cov.pkl",     "Cover"),
-        ("df_nkd.pkl",     "Nakeds"),
-        ("df_protect.pkl", "Protect"),
-        ("df_reap.pkl",    "Reap"),
-    ]
-    _age_parts = [f"{lbl}: {_pkl_age(f)}" for f, lbl in _age_pkls]
-    st.caption("File ages — " + "  |  ".join(_age_parts))
-
-    st.divider()
 
     # ── DELETE helpers (dialog shown on confirmation button click) ──────────
     def _delete_pkl(fname: str, key: str) -> None:
@@ -1797,143 +1659,223 @@ def render_config_panel() -> None:
             if st.button("❌ Cancel", width="stretch"):
                 st.rerun()
 
-    # ── COVER ──────────────────────────────────────────────────────────────
-    _cov_col, _del_cov_col = st.columns([3, 1])
-    with _cov_col:
-        st.toggle("COVER_ME", key="cfg_cover_me")
-    with _del_cov_col:
-        if (_DATA_DIR / "df_cov.pkl").exists():
-            if st.button("🗑 Del Cov", key="btn_del_cov", width="stretch",
-                         help="Delete residual df_cov.pkl from last derive run"):
-                _confirm_delete("df_cov.pkl", "Cover", "_del_cov_done")
-    if st.session_state.pop("_del_cov_done", False):
-        pass  # toast was already shown; no rerun needed
+    def _del_btn(fname: str, label: str, key: str, done_key: str) -> None:
+        """Render the Del button + clear its one-shot 'done' flag (call inside a card)."""
+        if (_DATA_DIR / fname).exists():
+            if st.button("🗑 Del", key=key, width="stretch",
+                         help=f"Delete residual {fname} from last derive run"):
+                _confirm_delete(fname, label, done_key)
+        st.session_state.pop(done_key, None)
 
-    if st.session_state["cfg_cover_me"]:
-        st.number_input("COVER_MIN_DTE", min_value=0, step=1,
-                        key="cfg_cover_min_dte",
-                        help="Minimum days to expiry for covered call/put candidates")
-        st.number_input(_lbl("COVER_STD_MULT"), min_value=0.0, step=0.05, format="%.2f",
-                        key="cfg_cover_std_mult",
-                        help="Strike distance in units of 1σ above/below spot")
-        st.number_input("COVXPMULT", min_value=0.0, step=0.05, format="%.2f",
-                        key="cfg_covxpmult",
-                        help="Multiplier on market price for execution limit")
-        st.number_input("COV_AGED_DTE", min_value=1, step=1,
-                        key="cfg_cov_aged_dte",
-                        help="Stocks held longer than this many days since assignment use vol-based price only (income over cost-recovery). Default: 180.")
+    # ── Card builders ────────────────────────────────────────────────────────
+    def _card_risk_focus() -> None:
+        with st.container(border=True):
+            st.markdown("**🎯 Risk & Focus**")
+            a, b = st.columns(2)
+            with a:
+                st.number_input("MINCUSHION", min_value=0.0, max_value=1.0, step=0.01,
+                                format="%.2f", key="cfg_mincushion",
+                                help="Minimum excess-liquidity / NLV cushion (triggers alert below this)")
+            with b:
+                st.number_input("MAX_DTE", min_value=1, step=1, key="cfg_max_dte",
+                                help="Maximum days to expiry for new option entries")
+            _fd_col, _sf_col = st.columns([1, 1.4], vertical_alignment="bottom")
+            with _fd_col:
+                st.date_input(
+                    "FOCUS_DATE", key="cfg_focus_date", format="YYYY-MM-DD",
+                    help="Anchors the Performance Dashboard display window + reference NAV. "
+                         "When 'Score from focus date' is on, also the trade-history cut-off "
+                         "for ABANDON/REFINE scoring. Synthetic OHLC backtest is unaffected "
+                         "(always full history).",
+                )
+            with _sf_col:
+                st.toggle(
+                    "Score from focus date", key="cfg_score_from_focus",
+                    help="Restrict trade-history ABANDON/REFINE/DEPLOY scoring to trades on or "
+                         "after FOCUS_DATE — excludes pre-focus mistakes. Off = full history.",
+                )
+            st.number_input(
+                "MAX_FILE_AGE (days)", min_value=0, step=1, key="cfg_max_file_age",
+                help="Order pickles older than this many days are auto-deleted on next dashboard load. "
+                     "0 = never auto-delete.",
+            )
+            _age_pkls = [
+                ("df_cov.pkl", "Cover"), ("df_nkd.pkl", "Nakeds"),
+                ("df_protect.pkl", "Protect"), ("df_reap.pkl", "Reap"),
+            ]
+            st.caption("File ages — " + "  |  ".join(
+                f"{lbl}: {_pkl_age(f)}" for f, lbl in _age_pkls))
 
-    st.divider()
+    def _card_cover() -> None:
+        with st.container(border=True):
+            st.markdown("**🛡 Cover**")
+            _t, _d = st.columns([3, 1])
+            with _t:
+                st.toggle("COVER_ME", key="cfg_cover_me")
+            with _d:
+                _del_btn("df_cov.pkl", "Cover", "btn_del_cov", "_del_cov_done")
+            if st.session_state["cfg_cover_me"]:
+                a, b = st.columns(2)
+                with a:
+                    st.number_input("COVER_MIN_DTE", min_value=0, step=1,
+                                    key="cfg_cover_min_dte",
+                                    help="Minimum days to expiry for covered call/put candidates")
+                with b:
+                    st.number_input(_lbl("COVER_STD_MULT"), min_value=0.0, step=0.05,
+                                    format="%.2f", key="cfg_cover_std_mult",
+                                    help="Strike distance in units of 1σ above/below spot")
+                c, d = st.columns(2)
+                with c:
+                    st.number_input("COVXPMULT", min_value=0.0, step=0.05, format="%.2f",
+                                    key="cfg_covxpmult",
+                                    help="Multiplier on market price for execution limit")
+                with d:
+                    st.number_input("COV_AGED_DTE", min_value=1, step=1,
+                                    key="cfg_cov_aged_dte",
+                                    help="Stocks held longer than this many days since assignment use vol-based price only (income over cost-recovery). Default: 180.")
 
-    # ── SOW ────────────────────────────────────────────────────────────────
-    _sow_col, _del_sow_col = st.columns([3, 1])
-    with _sow_col:
-        st.toggle("SOW_NAKEDS", key="cfg_sow_nakeds")
-    with _del_sow_col:
-        if (_DATA_DIR / "df_nkd.pkl").exists():
-            if st.button("🗑 Del Sow", key="btn_del_nkd", width="stretch",
-                         help="Delete residual df_nkd.pkl from last derive run"):
-                _confirm_delete("df_nkd.pkl", "Nakeds", "_del_nkd_done")
-    st.session_state.pop("_del_nkd_done", None)
+    def _card_sow() -> None:
+        with st.container(border=True):
+            st.markdown("**🌱 Sow**")
+            _t, _d = st.columns([3, 1])
+            with _t:
+                st.toggle("SOW_NAKEDS", key="cfg_sow_nakeds")
+            with _d:
+                _del_btn("df_nkd.pkl", "Nakeds", "btn_del_nkd", "_del_nkd_done")
+            if not st.session_state["cfg_sow_nakeds"]:
+                return
+            a, b = st.columns(2)
+            with a:
+                st.number_input("VIRGIN_DTE", min_value=0, step=1, key="cfg_virgin_dte",
+                                help="Target DTE for naked put entries")
+            with b:
+                st.number_input("VIRGIN_CALL_STD_MULT", min_value=0.0, step=0.1,
+                                format="%.2f", key="cfg_virgin_call_std",
+                                help="σ OTM for virgin call strikes")
+            c, d = st.columns(2)
+            with c:
+                st.number_input(_lbl("VIRGIN_PUT_STD_MULT"), min_value=0.0, step=0.1,
+                                format="%.2f", key="cfg_virgin_put_std",
+                                help="σ OTM for virgin put strikes")
+            with d:
+                st.number_input("NAKEDXPMULT", min_value=0.0, step=0.05, format="%.2f",
+                                key="cfg_nakedxpmult",
+                                help="Multiplier on market price for naked execution limit")
+            _vqm_help = "Fraction of NLV per symbol allocated to naked puts"
+            try:
+                from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _vqm_bt_path  # noqa: PLC0415
+                import json as _vqm_json  # noqa: PLC0415
+                if _vqm_bt_path.exists():
+                    _vqm_bt = pd.read_pickle(_vqm_bt_path)
+                    _vqm_n_deploy = int((_vqm_bt["verdict"] == "DEPLOY").sum())
+                    _vqm_n_refine_ovr = 0
+                    _vqm_ovr_path = Path("data/symbol_overrides.json")
+                    if _vqm_ovr_path.exists():
+                        _vqm_n_refine_ovr = len(
+                            _vqm_json.loads(_vqm_ovr_path.read_text(encoding="utf-8"))
+                            .get("VIRGIN_PUT_STD_MULT", {})
+                        )
+                    _vqm_n = _vqm_n_deploy + _vqm_n_refine_ovr
+                    if _vqm_n > 0:
+                        _vqm_rec = round(1.0 / _vqm_n, 3)
+                        _vqm_help += (
+                            f"\n\n**Recommended: {_vqm_rec:.3f}** "
+                            f"(1 ÷ {_vqm_n} sow symbols: "
+                            f"{_vqm_n_deploy} DEPLOY + {_vqm_n_refine_ovr} REFINE-override)"
+                        )
+            except Exception:
+                pass
+            e, f = st.columns(2)
+            with e:
+                st.number_input(_lbl("MINNAKEDOPTPRICE $", "MINNAKEDOPTPRICE"),
+                                min_value=0.0, step=0.25, format="%.2f", key="cfg_minnaked",
+                                help="Minimum option price to write a naked put")
+            with f:
+                st.number_input("VIRGIN_QTY_MULT", min_value=0.0, step=0.005, format="%.3f",
+                                key="cfg_virgin_qty_mult", help=_vqm_help)
 
-    if st.session_state["cfg_sow_nakeds"]:
-        st.number_input("VIRGIN_DTE", min_value=0, step=1,
-                        key="cfg_virgin_dte",
-                        help="Target DTE for naked put entries")
-        st.number_input("VIRGIN_CALL_STD_MULT", min_value=0.0, step=0.1, format="%.2f",
-                        key="cfg_virgin_call_std",
-                        help="σ OTM for virgin call strikes")
-        st.number_input(_lbl("VIRGIN_PUT_STD_MULT"), min_value=0.0, step=0.1, format="%.2f",
-                        key="cfg_virgin_put_std",
-                        help="σ OTM for virgin put strikes")
-        st.number_input("NAKEDXPMULT", min_value=0.0, step=0.05, format="%.2f",
-                        key="cfg_nakedxpmult",
-                        help="Multiplier on market price for naked execution limit")
-        st.number_input(_lbl("MINNAKEDOPTPRICE $", "MINNAKEDOPTPRICE"), min_value=0.0, step=0.25, format="%.2f",
-                        key="cfg_minnaked",
-                        help="Minimum option price to write a naked put")
-        _vqm_help = "Fraction of NLV per symbol allocated to naked puts"
-        try:
-            from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _vqm_bt_path  # noqa: PLC0415
-            import json as _vqm_json  # noqa: PLC0415
-            if _vqm_bt_path.exists():
-                _vqm_bt = pd.read_pickle(_vqm_bt_path)
-                _vqm_n_deploy = int((_vqm_bt["verdict"] == "DEPLOY").sum())
-                _vqm_n_refine_ovr = 0
-                _vqm_ovr_path = Path("data/symbol_overrides.json")
-                if _vqm_ovr_path.exists():
-                    _vqm_n_refine_ovr = len(
-                        _vqm_json.loads(_vqm_ovr_path.read_text(encoding="utf-8"))
-                        .get("VIRGIN_PUT_STD_MULT", {})
-                    )
-                _vqm_n = _vqm_n_deploy + _vqm_n_refine_ovr
-                if _vqm_n > 0:
-                    _vqm_rec = round(1.0 / _vqm_n, 3)
-                    _vqm_help += (
-                        f"\n\n**Recommended: {_vqm_rec:.3f}** "
-                        f"(1 ÷ {_vqm_n} sow symbols: "
-                        f"{_vqm_n_deploy} DEPLOY + {_vqm_n_refine_ovr} REFINE-override)"
-                    )
-        except Exception:
-            pass
-        st.number_input("VIRGIN_QTY_MULT", min_value=0.0, step=0.005, format="%.3f",
-                        key="cfg_virgin_qty_mult",
-                        help=_vqm_help)
+    def _card_protect() -> None:
+        with st.container(border=True):
+            st.markdown("**🛟 Protect**")
+            _t, _d = st.columns([3, 1])
+            with _t:
+                st.toggle("PROTECT_ME", key="cfg_protect_me")
+            with _d:
+                _del_btn("df_protect.pkl", "Protect", "btn_del_prot", "_del_prot_done")
+            if st.session_state["cfg_protect_me"]:
+                a, b = st.columns(2)
+                with a:
+                    st.number_input("PROTECT_DTE", min_value=0, step=1,
+                                    key="cfg_protect_dte",
+                                    help="Target DTE for protective put/call purchases")
+                with b:
+                    st.number_input("PROTECTION_STRIP", min_value=1, step=1,
+                                    key="cfg_protection_strip",
+                                    help="Number of OTM strikes to evaluate for protection")
 
-    st.divider()
+    def _card_reap() -> None:
+        with st.container(border=True):
+            st.markdown("**🌾 Reap**")
+            _t, _d = st.columns([3, 1])
+            with _t:
+                st.toggle("REAP_ME", key="cfg_reap_me")
+            with _d:
+                _del_btn("df_reap.pkl", "Reap", "btn_del_reap", "_del_reap_done")
+            if st.session_state["cfg_reap_me"]:
+                a, b = st.columns(2)
+                with a:
+                    st.number_input(_lbl("REAPRATIO"), min_value=0.001, step=0.005,
+                                    format="%.3f", key="cfg_reapratio",
+                                    help="Close short option when price ≤ REAPRATIO × avgCost")
+                with b:
+                    st.number_input("MINREAPDTE", min_value=0, step=1, key="cfg_minreapdte",
+                                    help="Do not reap at or below this DTE")
 
-    # ── PROTECT ────────────────────────────────────────────────────────────
-    _prot_col, _del_prot_col = st.columns([3, 1])
-    with _prot_col:
-        st.toggle("PROTECT_ME", key="cfg_protect_me")
-    with _del_prot_col:
-        if (_DATA_DIR / "df_protect.pkl").exists():
-            if st.button("🗑 DELETE_PROT", key="btn_del_prot", width="stretch",
-                         help="Delete residual df_protect.pkl from last derive run"):
-                _confirm_delete("df_protect.pkl", "Protect", "_del_prot_done")
-    st.session_state.pop("_del_prot_done", None)
+    def _card_ai() -> None:
+        with st.container(border=True):
+            st.markdown("**🤖 AI**")
+            _ai_models = st.session_state.get("cfg_aimodels", ["Gemini", "DeepSeek"])
+            _valid_ai = [m for m in _ai_models if m in _PROVIDER_HINTS]
+            if _valid_ai:
+                st.selectbox(
+                    "DEFAULTAI", _valid_ai, key="cfg_defaultai",
+                    help="Default AI provider in the Ask AI dock. Options come from AIMODELS in snp_config.yml.",
+                )
+            else:
+                st.caption("No valid AI providers configured.")
 
-    if st.session_state["cfg_protect_me"]:
-        st.number_input("PROTECT_DTE", min_value=0, step=1,
-                        key="cfg_protect_dte",
-                        help="Target DTE for protective put/call purchases")
-        st.number_input("PROTECTION_STRIP", min_value=1, step=1,
-                        key="cfg_protection_strip",
-                        help="Number of OTM strikes to evaluate for protection")
+    # ── Card grid (st.columns stack to one column on narrow / mobile) ─────────
+    _r1c1, _r1c2 = st.columns(2)
+    with _r1c1:
+        _card_risk_focus()
+    with _r1c2:
+        _card_cover()
+    _r2c1, _r2c2 = st.columns(2)
+    with _r2c1:
+        _card_sow()
+    with _r2c2:
+        _card_protect()
+    _r3c1, _r3c2 = st.columns(2)
+    with _r3c1:
+        _card_reap()
+    with _r3c2:
+        _card_ai()
 
-    st.divider()
+    # Focus-date / toggle change must FULL-rerun so the Performance Dashboard +
+    # trade-history scores (other fragments) update live.
+    _focus_state = (
+        st.session_state.get("cfg_focus_date"),
+        st.session_state.get("cfg_score_from_focus"),
+    )
+    if st.session_state.get("_focus_applied") != _focus_state:
+        st.session_state["_focus_applied"] = _focus_state
+        st.rerun()
 
-    # ── REAP ───────────────────────────────────────────────────────────────
-    _reap_col, _del_reap_col = st.columns([3, 1])
-    with _reap_col:
-        st.toggle("REAP_ME", key="cfg_reap_me")
-    with _del_reap_col:
-        if (_DATA_DIR / "df_reap.pkl").exists():
-            if st.button("🗑 Del Reap", key="btn_del_reap", width="stretch",
-                         help="Delete residual df_reap.pkl from last derive run"):
-                _confirm_delete("df_reap.pkl", "Reap", "_del_reap_done")
-    st.session_state.pop("_del_reap_done", None)
-
-    if st.session_state["cfg_reap_me"]:
-        st.number_input(_lbl("REAPRATIO"), min_value=0.001, step=0.005, format="%.3f",
-                        key="cfg_reapratio",
-                        help="Close short option when price ≤ REAPRATIO × avgCost")
-        st.number_input("MINREAPDTE", min_value=0, step=1,
-                        key="cfg_minreapdte",
-                        help="Do not reap at or below this DTE")
-
-    st.divider()
-
-    # ── AI MODEL ───────────────────────────────────────────────────────────────
-    _ai_models = st.session_state.get("cfg_aimodels", ["Gemini", "DeepSeek"])
-    _valid_ai = [m for m in _ai_models if m in _PROVIDER_HINTS]
-    if _valid_ai:
-        st.selectbox(
-            "DEFAULTAI",
-            _valid_ai,
-            key="cfg_defaultai",
-            help="Default AI provider in the Ask AI dock. Options come from AIMODELS in snp_config.yml.",
-        )
+    # DEFAULTAI change must FULL-rerun so the Ask AI dock (a separate fragment)
+    # re-seeds its provider selection to the newly chosen default.
+    if st.session_state.get("_defaultai_applied") != st.session_state.get("cfg_defaultai"):
+        st.session_state["_defaultai_applied"] = st.session_state.get("cfg_defaultai")
+        st.rerun()
 
     st.divider()
 
@@ -1975,16 +1917,15 @@ def _cached_ohlc_stats() -> tuple[int, int]:
     return total, weekly_in_ohlc
 
 
-@st.fragment(run_every="5s")
-def _bt_status_fragment() -> None:
-    """Auto-refreshing backtest progress and results display."""
-    from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _BT_RESULTS
+def _render_bt_status() -> None:
+    """Backtest progress + results display.
 
-    _proc: subprocess.Popen | None = st.session_state.get("backtest_proc")
-    if _proc is not None and _proc.poll() is not None:
-        st.session_state["_bt_exit"] = _proc.poll()
-        st.session_state.pop("backtest_proc", None)
-        st.rerun()
+    Plain helper (not a fragment): called from render_actions, whose 5 s timer
+    drives the refresh. backtest_proc polling happens in render_actions, so this
+    only renders. (A nested run_every fragment caused "fragment … does not exist"
+    warnings on the parent's full reruns.)
+    """
+    from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _BT_RESULTS
 
     _running = st.session_state.get("backtest_proc") is not None
 
@@ -2024,12 +1965,7 @@ def _bt_status_fragment() -> None:
 def render_analysis() -> None:
     """Cover/Protect gaps + OHLC chart browser."""
     from src.flex.analyze import symbol_performance
-    from src.flex.fetch import (
-        download_cash_transactions, download_nav, download_trades,
-        load_cash_xml, load_nav_xml,
-        merge_cash_into_pickle, merge_into_pickle, merge_nav_into_pickle,
-    )
-    from src.flex.parse import mask_accounts, normalize, normalize_cash
+    from src.flex.parse import mask_accounts, normalize
 
     snap = client.snapshot()
     acct = _selected_account()
@@ -2039,11 +1975,8 @@ def render_analysis() -> None:
     # Shadow keys (_ana_*) are manually set so they survive navigation.
     # Bidirectional sync: save on each render; restore when returning.
     _ANA_PERSIST: list[tuple[str, object]] = [
-        ("pf_sym",            ""),
         ("pf_sectype",        "ALL"),
-        ("pf_f_state",        "ALL"),
         ("pf_dte_sel",        "ALL"),
-        ("pf_itm_only",       False),
         ("pf_weekly_only",    False),
         ("scr_sym",           ""),
         ("scr_strat",         "ALL"),
@@ -2069,238 +2002,11 @@ def render_analysis() -> None:
         elif _sk in st.session_state:
             st.session_state[_wk] = st.session_state[_sk]   # restore on re-entry
 
-    # ── Variables needed by Update Trades + flex data ────────────────────────
+    # ── Flex data paths needed by the data panels ────────────────────────────
     flex_path = _MASTER_DIR / "flex_trades.pkl"
     cash_path = _MASTER_DIR / "flex_cash.pkl"
     nav_path  = _MASTER_DIR / "flex_nav.pkl"
-    token = settings.token.get_secret_value()
-    qid = settings.trades_flexid.get_secret_value()
     _acct_map = {a: lbl for lbl, a in (("US", _US), ("SG", _SG)) if a}
-
-    # ── Imports needed by Generate OHLCs ─────────────────────────────────────
-    from src.dashboard.ohlc import (   # noqa: PLC0415
-        OHLC_PATH,
-        get_sp500_symbols,
-        write_symbol_list,
-    )
-
-    # ── OHLC subprocess state ─────────────────────────────────────────────────
-    ohlc_proc: subprocess.Popen | None = st.session_state.get("ohlc_proc")
-    _ohlc_running = ohlc_proc is not None and ohlc_proc.poll() is None
-    _capture_exit(ohlc_proc, "_ohlc_exit")
-
-    # ── Auto Refresh Flex after OHLC completes ────────────────────────────────
-    _api_ready = bool(token and qid)
-
-    def _launch_flex_refresh(year: int | None = None) -> None:
-        cmd = [sys.executable, str(_here() / "scripts" / "update_trades.py")]
-        if year is not None:
-            cmd += ["--year", str(year)]
-        _ut_log_fh = open(_here() / "log" / "update_trades.log", "w", encoding="utf-8")  # noqa: SIM115
-        _ut_proc = subprocess.Popen(cmd, stdout=_ut_log_fh, stderr=subprocess.STDOUT, env=_sub_env())
-        st.session_state["trades_proc"] = _ut_proc
-        logger.info("update_trades.py started pid={} year={}", _ut_proc.pid, year)
-
-    if (
-        st.session_state.get("_ohlc_exit") == 0
-        and st.session_state.get("_auto_update_trades_pending")
-        and not st.session_state.get("trades_proc")
-    ):
-        st.session_state.pop("_auto_update_trades_pending", None)
-        _launch_flex_refresh()
-
-    # Check if Refresh Flex subprocess finished
-    _trades_proc: subprocess.Popen | None = st.session_state.get("trades_proc")
-    if _trades_proc is not None and _trades_proc.poll() is not None:
-        st.session_state["_trades_exit"] = _trades_proc.poll()
-        st.session_state["trades_proc"] = None
-        st.rerun()
-
-    # ── Actions twistie ───────────────────────────────────────────────────────
-    with st.expander("🛠 Actions", expanded=False, key="exp_ana_actions"):
-        st.caption(
-            "Daily flow: ── **Generate OHLCs** (auto-runs Update Trades) → **Run Backtest** → "
-            "then switch to Orders tab."
-        )
-        _bt_running = st.session_state.get("backtest_proc") is not None
-        _bt_proc: subprocess.Popen | None = st.session_state.get("backtest_proc")
-        if _bt_proc is not None and _bt_proc.poll() is not None:
-            st.session_state["_bt_exit"] = _bt_proc.poll()
-            st.session_state.pop("backtest_proc", None)
-            _bt_running = False
-        _ohlc_btn_col, _bt_btn_col, _bt_chk_col, _clr_btn_col = st.columns([2, 2, 2, 1])
-        if _clr_btn_col.button("✕ Clear", key="btn_actions_clear", width="stretch"):
-            for _k in ("_ohlc_exit", "_trades_exit", "llm_hist_cache"):
-                st.session_state.pop(_k, None)
-            if not _ohlc_running:
-                st.session_state.pop("ohlc_proc", None)
-            _tr = st.session_state.get("trades_proc")
-            if _tr is not None and _tr.poll() is not None:
-                st.session_state.pop("trades_proc", None)
-            st.rerun()
-
-        # ── Generate OHLCs ────────────────────────────────────────────────────────
-        with _ohlc_btn_col:
-            if st.button(
-                "📊 Generate OHLCs",
-                type="primary" if _ohlc_running else "secondary",
-                width="stretch",
-                help=(
-                    "Fetch / update 1.5 yr daily OHLC for S&P500 weekly underlyings + "
-                    "portfolio positions. Runs in background; Update Trades runs automatically after."
-                ),
-            ) and not _ohlc_running:
-                sp500_specs = get_sp500_symbols()
-                seen: set[str] = {s["symbol"] for s in sp500_specs}
-                port_specs: list[dict[str, str]] = []
-                if not snap.positions.empty:
-                    for _, _pos in snap.positions.iterrows():
-                        _sym = str(_pos.get("symbol", ""))
-                        if not _sym or _sym in seen:
-                            continue
-                        port_specs.append({
-                            "symbol":   _sym,
-                            "exchange": str(_pos.get("primaryExch", "")) or "SMART",
-                            "currency": str(_pos.get("currency", "")) or "USD",
-                        })
-                        seen.add(_sym)
-                write_symbol_list(sp500_specs + port_specs)
-
-                _OHLC_LOG.parent.mkdir(parents=True, exist_ok=True)
-                _ohlc_log_fh = open(_OHLC_LOG, "w", encoding="utf-8")   # noqa: SIM115
-                _env = _sub_env()
-                st.session_state.pop("_ohlc_exit", None)
-                st.session_state["_auto_update_trades_pending"] = True
-                _ohlc_new_proc = subprocess.Popen(
-                    [sys.executable, str(_here() / "src" / "fetch_ohlc.py")],
-                    stdout=_ohlc_log_fh,
-                    stderr=subprocess.STDOUT,
-                    env=_env,
-                )
-                st.session_state["ohlc_proc"] = _ohlc_new_proc
-                logger.info("fetch_ohlc.py started pid={}", _ohlc_new_proc.pid)
-                st.rerun()  # immediately show running state / log window
-            if not _ohlc_running and "_ohlc_exit" not in st.session_state:
-                st.caption(f"Last: {_pkl_age('', path=OHLC_PATH)}")
-
-        with _bt_chk_col:
-            _force_ohlc = st.checkbox(
-                "Force-refresh OHLC",
-                key="chk_bt_refresh_ohlc",
-                disabled=_bt_running,
-                help=(
-                    "Re-fetch 5-year daily OHLC from yfinance for all symbols. "
-                    "Only needed when the S&P 500 symbol list changes significantly "
-                    "or cached data is stale (>3 months old)."
-                ),
-            )
-
-        with _bt_btn_col:
-            if st.button(
-                "🧪 Run Backtest",
-                key="btn_run_backtest",
-                type="primary" if _bt_running else "secondary",
-                width="stretch",
-                help=(
-                    "Synthetic wheel-strategy backtest on 5-year daily OHLC.\n\n"
-                    "First run fetches OHLC for all S&P 500 symbols (~2 min). "
-                    "Subsequent runs reuse cached data unless 'Force-refresh OHLC' is checked.\n\n"
-                    "Outputs per-symbol DEPLOY/REFINE/ABANDON verdicts and suggests "
-                    "COVER_STD_MULT, VIRGIN_PUT_STD_MULT, MINNAKEDOPTPRICE, REAPRATIO "
-                    "values for snp_config.yml."
-                ),
-            ) and not _bt_running:
-                _BACKTEST_LOG.parent.mkdir(parents=True, exist_ok=True)
-                _bt_log_fh = open(_BACKTEST_LOG, "w", encoding="utf-8")  # noqa: SIM115
-                st.session_state.pop("_bt_exit", None)
-                _bt_cmd = [sys.executable, str(_here() / "scripts" / "run_backtest.py")]
-                if _force_ohlc:
-                    _bt_cmd.append("--refresh-ohlc")
-                _bt_new_proc = subprocess.Popen(
-                    _bt_cmd,
-                    stdout=_bt_log_fh,
-                    stderr=subprocess.STDOUT,
-                    env=_sub_env(),
-                )
-                st.session_state["backtest_proc"] = _bt_new_proc
-                logger.info("run_backtest.py started pid={} force_ohlc={}", _bt_new_proc.pid, _force_ohlc)
-                st.rerun()
-            from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _BT_RESULTS
-            if not _bt_running and "_bt_exit" not in st.session_state:
-                st.caption(f"Last: {_pkl_age('', path=_BT_RESULTS)}")
-
-        # ── Refresh Flex row ──────────────────────────────────────────────────────
-        _flex_running = st.session_state.get("trades_proc") is not None
-        _rf_btn_col, _rf_year_col, _rf_xmlonly_col, _ = st.columns([2, 1, 1, 2])
-        _rf_year = _rf_year_col.number_input(
-            "Year",
-            min_value=2010,
-            max_value=pd.Timestamp.today().year,
-            value=pd.Timestamp.today().year,
-            step=1,
-            key="ni_flex_year",
-            help="Year for the downloaded XML. For historical years, set the portal query "
-                 "to a custom date range (Jan 1 – Dec 31 of that year) first.",
-        )
-        _rf_xml_only = _rf_xmlonly_col.checkbox(
-            "XML only",
-            key="chk_flex_xml_only",
-            help="Skip API download — re-parse existing *.xml files only.",
-        )
-        if _rf_btn_col.button(
-            "🔄 Refresh Flex",
-            key="btn_refresh_flex",
-            type="primary" if _flex_running else "secondary",
-            width="stretch",
-            help="Download the Flex statement for the selected year and refresh all three "
-                 "pickles (trades, cash, NAV). Runs in background.",
-        ) and not _flex_running:
-            st.session_state.pop("_trades_exit", None)
-            if _rf_xml_only:
-                _rf_cmd = [sys.executable, str(_here() / "scripts" / "update_trades.py"), "--xml-only"]
-                _rf_log_fh = open(_here() / "log" / "update_trades.log", "w", encoding="utf-8")  # noqa: SIM115
-                _rf_proc = subprocess.Popen(_rf_cmd, stdout=_rf_log_fh, stderr=subprocess.STDOUT, env=_sub_env())
-                st.session_state["trades_proc"] = _rf_proc
-                logger.info("update_trades.py --xml-only started pid={}", _rf_proc.pid)
-            else:
-                _launch_flex_refresh(year=int(_rf_year))
-            st.rerun()
-        if not _flex_running and "_trades_exit" not in st.session_state:
-            _rf_age_lbl = _pkl_age("", path=nav_path)
-            _rf_warn = "⚠ TOKEN / TRADES_FLEXID not set — XML only mode" if not _api_ready else ""
-            st.caption(_rf_warn or f"flex_nav.pkl — {_rf_age_lbl}")
-
-        # ── Result displays ────────────────────────────────────────────────────────
-        # OHLC status
-        if _ohlc_running:
-            _op, _ol = _ohlc_progress()
-            st.progress(_op, text=f"⏳ {_ol}")
-        elif "_ohlc_exit" in st.session_state:
-            _ohlc_rc = st.session_state["_ohlc_exit"]
-            if _ohlc_rc == 0:
-                st.success("✅ OHLCs up to date")
-            else:
-                st.error(f"❌ OHLC fetch failed (exit {_ohlc_rc})")
-        if _ohlc_running:
-            _ohlc_live = _ohlc_log_lines(30)
-            if _ohlc_live:
-                st.code("\n".join(_strip_ansi(ln) for ln in _ohlc_live), language=None)
-        if "_ohlc_exit" in st.session_state:
-            _ohlc_post_rc = st.session_state["_ohlc_exit"]
-            _render_log_expander("📋 OHLC log", _OHLC_LOG, expanded=_ohlc_post_rc != 0)
-
-        # Refresh Flex status
-        if st.session_state.get("trades_proc") is not None:
-            st.info("⏳ Refresh Flex running in background…")
-        elif "_trades_exit" in st.session_state:
-            _ut_rc = st.session_state["_trades_exit"]
-            if _ut_rc == 0:
-                st.success("✅ Refresh Flex completed")
-            else:
-                st.error(f"❌ Refresh Flex failed (exit {_ut_rc})")
-
-        # Backtest status / results — rendered by auto-refreshing fragment
-        _bt_status_fragment()
 
     # ── Positions table (live — with filters + ITM highlighting) ─────────────
     _pos_data = pd.DataFrame()
@@ -2324,6 +2030,13 @@ def render_analysis() -> None:
                 .reset_index(drop=True)
             )
 
+        # Apply the single global filter (symbol / C/P / ITM) so Positions + Gaps
+        # honour the top filter bar. State is matched against the pf_state column.
+        _pos_data = apply_global_filter(_pos_data, use_state=False)
+        _g_states = st.session_state.get("flt_state") or []
+        if _g_states and "pf_state" in _pos_data.columns:
+            _pos_data = _pos_data[_pos_data["pf_state"].isin(_g_states)].reset_index(drop=True)
+
     # Render Positions expander unconditionally to avoid layout shifts at startup
     with st.expander("📋 Positions", expanded=False, key="exp_ana_positions"):
         if not client._bootstrapped:
@@ -2331,16 +2044,10 @@ def render_analysis() -> None:
         elif snap.positions.empty:
             st.info("No positions held in the selected account.")
         else:
-            _pf_c1, _pf_c2, _pf_c3, _pf_c4, _pf_c5, _pf_c6 = st.columns([2.5, 1, 2, 1, 1, 1])
-            _pf_sym = _pf_c1.text_input(
-                "Symbol", key="pf_sym", placeholder="exact, e.g. A"
-            ).strip().upper()
+            # Positions-only controls. Symbol / State / ITM live in the global
+            # Filter bar (already applied to _pos_data above) — not duplicated here.
+            _pf_c2, _pf_c4, _pf_c5, _pf_c6 = st.columns([1.3, 1.3, 1.4, 1])
             _pf_sectype = _pf_c2.selectbox("secType", ["ALL", "STK", "OPT"], key="pf_sectype")
-            _all_states = ["ALL"] + sorted(
-                _pos_data["pf_state"].dropna().unique().tolist()
-                if "pf_state" in _pos_data.columns else []
-            )
-            _pf_state_sel = _pf_c3.selectbox("State", _all_states, key="pf_f_state")
             # Build DTE choices from OPT rows in the unfiltered position data
             _opt_mask = (_pos_data.get("secType", pd.Series("", index=_pos_data.index)) == "OPT")
             _opt_expiries = (
@@ -2352,14 +2059,11 @@ def render_analysis() -> None:
             })
             _dte_opts = ["ALL"] + [str(d) for d in _dte_int_set]
             _pf_dte_sel = _pf_c4.selectbox("DTE", _dte_opts, key="pf_dte_sel")
-            _pf_itm_only    = _pf_c5.checkbox("ITM only",    key="pf_itm_only")
             _pf_weekly_only = _pf_c5.checkbox("Weekly only", key="pf_weekly_only")
-            if _pf_c6.button("✕ Clear", key="pf_clear_filter", width="stretch"):
-                for _k in ("pf_sym", "pf_sectype", "pf_f_state", "pf_dte_sel"):
-                    st.session_state.pop(_k, None)
-                st.session_state.pop("pf_itm_only", None)
-                st.session_state.pop("pf_weekly_only", None)
-                st.rerun()
+            _pf_c6.button(
+                "✕ Clear", key="pf_clear_filter", width="stretch",
+                on_click=_clear_positions_filter,
+            )
 
             # Load monthly-only list once for weekly filter
             _monthly_only_set: set[str] = set()
@@ -2375,22 +2079,17 @@ def render_analysis() -> None:
                     except Exception:
                         pass
 
-            # Apply filters
+            # Apply Positions-only filters (Symbol / State / ITM already applied
+            # globally to _pos_data above).
             _pv = _pos_data.copy()
-            if _pf_sym:
-                _pv = _pv[_pv["symbol"].astype(str).str.upper() == _pf_sym]
             if _pf_sectype != "ALL":
                 _pv = _pv[_pv.get("secType", pd.Series("", index=_pv.index)) == _pf_sectype]
-            if _pf_state_sel != "ALL":
-                _pv = _pv[_pv.get("pf_state", pd.Series("", index=_pv.index)) == _pf_state_sel]
             if _pf_dte_sel != "ALL":
                 _dte_max_val = int(_pf_dte_sel)
                 _dte_col = _dte_series(
                     _pv.get("expiry", pd.Series("", index=_pv.index)).fillna("").astype(str)
                 )
                 _pv = _pv[_dte_col.isna() | (_dte_col <= _dte_max_val)]
-            if _pf_itm_only:
-                _pv = _pv[pd.Series(_itm_mask_vec(_pv), index=_pv.index)]
             if _pf_weekly_only and _monthly_only_set and "symbol" in _pv.columns:
                 _pv = _pv[~_pv["symbol"].isin(_monthly_only_set)]
             _pv = _pv.reset_index(drop=True)
@@ -2597,8 +2296,9 @@ def render_analysis() -> None:
             from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _SYN_RES  # noqa: PLC0415
             _bt_scores: list[int | None] = []
             _bt_verdicts: list[str | None] = []
+            _score_since = score_since()
             for _sym in perf["symbol"]:
-                _bs = _score_fn(df_all, _sym)
+                _bs = _score_fn(df_all, _sym, since=_score_since)
                 if _bs.total_trades == 0:
                     _bt_scores.append(None)
                     _bt_verdicts.append(None)
@@ -2627,23 +2327,58 @@ def render_analysis() -> None:
     with st.expander("📊 Trade Analysis", expanded=False, key="exp_ana_pnl"):
 
         # Shared filter controls
-        _fv_col, _fsyn_col, _fsym_col, _fsp = st.columns([2, 1, 2, 5])
+        _fv_col, _fsyn_col, _fsym_col, _fwk_col, _fsp = st.columns([2, 1.4, 2, 1.6, 3.0])
         _vf = _fv_col.selectbox(
             "Verdict", ["All", "DEPLOY", "REFINE", "ABANDON", "INSUFFICIENT_DATA"],
             key="pnl_verdict_filter",
         )
-        _use_syn = _fsyn_col.checkbox(
-            "Synthetic",
-            key="pnl_syn_check",
-            help=(
-                "Controls which verdict column the filter applies to in the "
-                "Historical Trade P&L table below.\n"
-                "ON — filter on the Synthetic backtest Rating column.\n"
-                "OFF — filter on your personal Trade Rating column.\n"
-                "The Synthetic Backtest table below always filters on its own Rating."
-            ),
-        )
+        with _fsyn_col.container(key="syn_chk_wrap"):
+            _use_syn = st.checkbox(
+                "Synthetic",
+                key="pnl_syn_check",
+                help=(
+                    "Controls which verdict column the filter applies to in the "
+                    "Historical Trade P&L table below.\n"
+                    "ON — filter on the Synthetic backtest Rating column.\n"
+                    "OFF — filter on your personal Trade Rating column.\n"
+                    "The Synthetic Backtest table below always filters on its own Rating."
+                ),
+            )
         _sf = _fsym_col.text_input("Symbol", key="pnl_sym_filter", placeholder="e.g. AAPL")
+        with _fwk_col.container(key="wk_chk_wrap"):
+            _wk_only = st.checkbox(
+                "Weeklies Only",
+                key="pnl_weekly_only",
+                help="Show only symbols explicitly classified as weekly in symbol_categories.pkl. "
+                     "Drops monthly-only AND uncategorized symbols (delisted/renamed tickers, ETFs, "
+                     "share-class variants not in the current S&P 500).",
+            )
+
+        # Symbols explicitly marked weekly — the *only* ones kept when "Weeklies Only"
+        # is ticked. Keeping (not just dropping monthly-only) also removes uncategorized
+        # symbols absent from symbol_categories.pkl. _wk_only_active is False when the
+        # categories file is missing/malformed, so the checkbox degrades to a no-op
+        # rather than blanking the whole table.
+        _weekly_set: set[str] = set()
+        _wk_only_active = False
+        if _wk_only:
+            _sc_pkl = _MASTER_DIR / "symbol_categories.pkl"
+            if _sc_pkl.exists():
+                try:
+                    _sc_df = pd.read_pickle(_sc_pkl)
+                    if {"symbol", "is_weekly"} <= set(_sc_df.columns):
+                        _weekly_set = set(_sc_df.loc[_sc_df["is_weekly"], "symbol"].dropna())
+                        _wk_only_active = True
+                except Exception:
+                    pass
+
+        # Match count next to the Verdict selector (e.g. 20/277) — respects Weeklies Only
+        _vcount_col = "syn_verdict" if _use_syn else "verdict"
+        if not perf.empty and _vcount_col in perf.columns:
+            _count_base = perf[perf["symbol"].isin(_weekly_set)] if _wk_only_active else perf
+            _v_total = len(_count_base)
+            _v_match = _v_total if _vf == "All" else int((_count_base[_vcount_col] == _vf).sum())
+            _fv_col.caption(f"**{_v_match}/{_v_total}** symbols match")
 
         _vcolors = {
             "DEPLOY": "color: #22c55e; font-weight: 600",
@@ -2658,12 +2393,18 @@ def render_analysis() -> None:
         else:
             _verdict_col_for_filter = "syn_verdict" if _use_syn else "verdict"
             _perf_disp = perf.copy()
+            if _wk_only_active:
+                _perf_disp = _perf_disp[_perf_disp["symbol"].isin(_weekly_set)]
             if _vf != "All" and _verdict_col_for_filter in _perf_disp.columns:
                 _perf_disp = _perf_disp[_perf_disp[_verdict_col_for_filter] == _vf]
-            if _sf.strip():
+            _gsym = str(st.session_state.get("flt_symbol", "") or "").strip().upper()
+            if _gsym:  # global filter bar takes precedence
+                _perf_disp = _perf_disp[_perf_disp["symbol"].astype(str).str.upper() == _gsym]
+            elif _sf.strip():
                 _perf_disp = _perf_disp[_perf_disp["symbol"].str.contains(_sf.strip().upper(), na=False)]
             _perf_disp = _perf_disp.sort_values("symbol")
-            _vstyle = lambda v: _vcolors.get(v, "")
+            def _vstyle(v):
+                return _vcolors.get(v, "")
             _vcols = [c for c in ["syn_verdict", "verdict"] if c in _perf_disp.columns]
             _pstyled = _banded(_perf_disp).format({
                 "current_price": "${:,.2f}",
@@ -2713,7 +2454,12 @@ def render_analysis() -> None:
                 _syn_disp = _syn.copy()
                 if _vf != "All" and _use_syn:
                     _syn_disp = _syn_disp[_syn_disp["verdict"] == _vf]
-                if _sf.strip():
+                # Global Filter bar symbol takes precedence (exact match), as in the
+                # Historical P&L table above; fall back to the local Symbol field.
+                _gsym = str(st.session_state.get("flt_symbol", "") or "").strip().upper()
+                if _gsym:
+                    _syn_disp = _syn_disp[_syn_disp["symbol"].astype(str).str.upper() == _gsym]
+                elif _sf.strip():
                     _syn_disp = _syn_disp[_syn_disp["symbol"].str.contains(_sf.strip().upper(), na=False)]
                 st.caption(
                     f"{len(_syn_disp)} of {len(_syn)} symbols · last run {_pkl_age('', path=_SYN_PATH)}"
@@ -2782,6 +2528,13 @@ def _render_symbol_deep_dive() -> None:
     with st.expander("🔍 Deep-Dive", expanded=False, key="exp_ana_chart"):
         # Guard stale session_state (e.g. symbol removed from OHLC store after a refresh)
         _cur_sym = st.session_state.get("analysis_chart_sym")
+        # Global filter bar drives the deep-dive symbol when a symbol is set.
+        _gsym = str(st.session_state.get("flt_symbol", "") or "").strip().upper()
+        if _gsym:
+            _match = next((s for s in all_symbols if s.upper() == _gsym), None)
+            if _match:
+                st.session_state["analysis_chart_sym"] = _match
+                _cur_sym = _match
         if _cur_sym not in all_symbols:
             _default_sym = "GOOG" if "GOOG" in all_symbols else (all_symbols[0] if all_symbols else None)
             st.session_state["analysis_chart_sym"] = _default_sym
@@ -2905,7 +2658,7 @@ def _render_symbol_deep_dive() -> None:
                 _, _rec_col = st.columns([1, 3])
                 with _rec_col:
                     st.code(_rec)
-                _score = _sft(_df_all, selected_sym)
+                _score = _sft(_df_all, selected_sym, since=score_since())
                 _s1, _s2, _s3, _s4, _s5 = st.columns(5)
                 _s1.metric("Score", f"{_score.composite:.0f}/100",
                            f"{_vd.get(_score.verdict, '')} {_score.verdict}",
@@ -3424,8 +3177,10 @@ def _fmt_date_col(s: pd.Series, fallback: str = "?") -> pd.Series:
 
 
 _PERF_CHART_DEFAULT_NAV = 632_507
-_DEFAULT_PERF_START     = pd.Timestamp("2025-08-08")   # default display window start
-_PERF_CHART_REF_DATE    = pd.Timestamp("2025-08-08")   # fixed anchor for reference NAV cards
+# Wired to FOCUS_DATE (snp_config.yml / dashboard date picker). Re-evaluated each
+# script rerun, so changing the focus date moves the display window + NAV anchor.
+_DEFAULT_PERF_START     = focus_date()   # default display window start
+_PERF_CHART_REF_DATE    = focus_date()   # anchor for reference NAV cards
 
 
 def _render_perf_chart(
@@ -4188,9 +3943,10 @@ def _build_history_context() -> dict:
     # Backtest scores — run BacktestExpert scoring for all symbols with ≥10 closed OPT trades.
     # Uses same df / symbol filter as score_from_trades() so numbers match the Deep-Dive panel.
     from src.backtest.score import score_from_trades as _score_fn
+    _score_since = score_since()
     backtest_scores: list[dict] = []
     for _r in sorted((r for r in per_symbol if r["n"] >= 10), key=lambda r: r["n"], reverse=True)[:80]:
-        _bs = _score_fn(df, _r["sym"])
+        _bs = _score_fn(df, _r["sym"], since=_score_since)
         backtest_scores.append({
             "sym":    _r["sym"],
             "score":  _bs.composite,
@@ -4338,6 +4094,23 @@ def _build_live_context() -> dict:
     positions = _filter_positions(snap.positions, acct)
     context: dict = {}
 
+    # Weekly vs monthly-only map {symbol: is_weekly} — loaded once, used to tag each
+    # position row (below) AND build the symbol_categories key. Per-row tagging stops
+    # the AI hallucinating membership of the 257-symbol monthly list (e.g. wrongly
+    # calling BA / AMZN monthly-only).
+    _cat_is_weekly: dict[str, bool] = {}
+    _sym_cat_pkl = _MASTER_DIR / "symbol_categories.pkl"
+    if _sym_cat_pkl.exists():
+        try:
+            _sym_cat_df = pd.read_pickle(_sym_cat_pkl)
+            if not _sym_cat_df.empty and {"symbol", "is_weekly"}.issubset(_sym_cat_df.columns):
+                _cat_is_weekly = {
+                    str(_s): bool(_w)
+                    for _s, _w in zip(_sym_cat_df["symbol"], _sym_cat_df["is_weekly"])
+                }
+        except Exception:
+            pass
+
     # ── Positions: live → auto-save; empty → load cached pickle with staleness warning ──
     _pos_is_live = not positions.empty
     _pos_as_of: str | None = None
@@ -4370,7 +4143,16 @@ def _build_live_context() -> dict:
             "position", "marketPrice", "marketValue", "avgCost",
             "delta", "theta", "vega",
         ) if c in positions.columns]
-        context["positions"] = positions[cols]
+        _pos_ctx = positions[cols].copy()
+        # Authoritative per-row expiry classification — the AI must read this column
+        # directly instead of inferring monthly/weekly from any symbol list.
+        if _cat_is_weekly:
+            _pos_ctx["expiry_class"] = [
+                ("weekly" if _cat_is_weekly[_s] else "monthly_only")
+                if _s in _cat_is_weekly else "unclassified"
+                for _s in _pos_ctx["symbol"].astype(str)
+            ]
+        context["positions"] = _pos_ctx
     context["positions_is_live"] = _pos_is_live
     if _pos_as_of:
         context["positions_as_of"] = _pos_as_of
@@ -4593,31 +4375,31 @@ def _build_live_context() -> dict:
         except Exception:
             st.session_state[_SYN_CACHE] = []
 
-    # Symbol categories — weekly vs monthly-only (from symbol_categories.pkl)
-    _sym_cat_pkl = _MASTER_DIR / "symbol_categories.pkl"
-    if _sym_cat_pkl.exists():
-        try:
-            _sym_cat_df = pd.read_pickle(_sym_cat_pkl)
-            if not _sym_cat_df.empty and {"symbol", "is_weekly"}.issubset(_sym_cat_df.columns):
-                context["symbol_categories"] = {
-                    "monthly_only": sorted(_sym_cat_df.loc[~_sym_cat_df["is_weekly"], "symbol"].tolist()),
-                    "weekly": sorted(_sym_cat_df.loc[_sym_cat_df["is_weekly"], "symbol"].tolist()),
-                }
-        except Exception:
-            pass
+    # Symbol categories — weekly vs monthly-only (reuses the map loaded at the top).
+    if _cat_is_weekly:
+        context["symbol_categories"] = {
+            "monthly_only": sorted(s for s, w in _cat_is_weekly.items() if not w),
+            "weekly": sorted(s for s, w in _cat_is_weekly.items() if w),
+        }
 
     return context
 
 
+@st.fragment
 def _render_llm_chat() -> None:
-    """Compact Ask AI dock: always visible, one row of controls + cached response."""
+    """Compact Ask AI dock — a fragment so the copy/history toggles rerun only this
+    section, not the whole page (which would re-pull the live IBKR snapshot)."""
     _ai_models = st.session_state.get("cfg_aimodels", list(_PROVIDER_HINTS))
     _valid_prov = [m for m in _ai_models if m in _PROVIDER_HINTS] or list(_PROVIDER_HINTS)
 
-    # Seed provider selection from DEFAULTAI config on first load
-    if "llm_provider" not in st.session_state:
-        _def = st.session_state.get("cfg_defaultai", _valid_prov[0])
-        st.session_state["llm_provider"] = _def if _def in _valid_prov else _valid_prov[0]
+    # Follow Config's DEFAULTAI: (re)seed the dock's provider whenever DEFAULTAI
+    # changes, without clobbering a manual in-dock selection made between changes.
+    # (Assignment is before the selectbox below, so it sets the widget's default.)
+    _def = st.session_state.get("cfg_defaultai", _valid_prov[0])
+    _def = _def if _def in _valid_prov else _valid_prov[0]
+    if st.session_state.get("_llm_defaultai_applied") != _def:
+        st.session_state["_llm_defaultai_applied"] = _def
+        st.session_state["llm_provider"] = _def
 
     _prov_w = max(len(p) for p in _valid_prov)  # chars in longest provider name
     p_col, q_col, s_col, c_col = st.columns([_prov_w * 0.13, 8 - _prov_w * 0.13 - 1.0, 0.5, 0.5])
@@ -4641,7 +4423,7 @@ def _render_llm_chat() -> None:
     _submit_ver = st.session_state.get("llm_submit_ver", 0)
     if s_col.button("▶", key="llm_send", help="Submit", width="stretch"):
         st.session_state["llm_submit_ver"] = _submit_ver + 1
-        st.rerun()
+        st.rerun(scope="fragment")
 
     if c_col.button("✕", key="llm_clr", help="Clear", width="stretch"):
         st.session_state["llm_q_ver"] = _qver + 1
@@ -4649,7 +4431,7 @@ def _render_llm_chat() -> None:
         st.session_state.pop("llm_last_q", None)
         st.session_state.pop("llm_last_prov", None)
         st.session_state.pop("llm_submit_ver", None)
-        st.rerun()
+        st.rerun(scope="fragment")
 
     # Query when question changes (Enter in text box) OR ▶ was explicitly clicked
     _forced = _submit_ver != st.session_state.get("llm_last_submit_ver", 0)
@@ -4701,7 +4483,7 @@ def _render_llm_chat() -> None:
                 ),
             ):
                 st.session_state["llm_history"] = []
-                st.rerun()
+                st.rerun(scope="fragment")
         if st.session_state.get("llm_copy_open", False):
             _hist = st.session_state.get("llm_history", [])
             if _hist:
@@ -4714,23 +4496,452 @@ def _render_llm_chat() -> None:
 # (render_history removed — all content moved to render_analysis)
 
 
+@st.fragment(run_every=5)
+def render_actions() -> None:
+    """Single daily-action pipeline: OHLCs → Flex → Backtest → Generate → Execute.
+
+    Owns all action subprocess state (derive / execute / ohlc / backtest / trades)
+    and the freeze state machine. Reuses the verbatim handler logic that previously
+    lived inside render_orders (Order Actions) and render_analysis (Actions).
+    """
+    from src.dashboard.ohlc import OHLC_PATH, get_sp500_symbols, write_symbol_list  # noqa: PLC0415
+    from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _BT_RESULTS  # noqa: PLC0415
+
+    snap = client.snapshot()
+    nav_path = _MASTER_DIR / "flex_nav.pkl"
+    _api_ready = bool(
+        settings.token.get_secret_value() and settings.trades_flexid.get_secret_value()
+    )
+
+    # ── derive / execute subprocess + freeze state ───────────────────────────
+    proc: subprocess.Popen | None      = st.session_state.get("derive_proc")
+    exec_proc: subprocess.Popen | None = st.session_state.get("execute_proc")
+    frozen     = client.is_frozen()
+    frozen_for = st.session_state.get("frozen_for", "")   # "derive" | "execute" | ""
+
+    def _auto_unfreeze(tag: str, proc_key: str) -> None:
+        proc_ = st.session_state.get(proc_key)
+        if frozen and proc_ is not None and proc_.poll() is not None and frozen_for == tag:
+            st.session_state[f"_{tag}_exit"] = proc_.poll()
+            client.unfreeze()
+            st.session_state[proc_key] = None
+            st.session_state.pop("frozen_for", None)
+            st.rerun()
+
+    _auto_unfreeze("derive",  "derive_proc")
+    _auto_unfreeze("execute", "execute_proc")
+
+    # Fallback: derive.py logged COMPLETE but hasn't exited in 60s → kill it.
+    if frozen and frozen_for == "derive" and proc is not None and proc.poll() is None:
+        _pct_chk, _, _ = _derive_progress()
+        if _pct_chk >= 1.0:
+            _since = st.session_state.get("_derive_complete_since")
+            if _since is None:
+                st.session_state["_derive_complete_since"] = time.monotonic()
+            elif time.monotonic() - _since > 60.0:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    _kill_rc = proc.wait(timeout=3)
+                except Exception:
+                    _kill_rc = 1
+                st.session_state["_derive_exit"] = _kill_rc
+                client.unfreeze()
+                st.session_state["derive_proc"] = None
+                st.session_state.pop("frozen_for", None)
+                st.session_state.pop("_derive_complete_since", None)
+                st.rerun()
+    else:
+        st.session_state.pop("_derive_complete_since", None)
+
+    _capture_exit(proc,      "_derive_exit")
+    _capture_exit(exec_proc, "_execute_exit")
+
+    # ── ohlc / trades / backtest subprocess state ────────────────────────────
+    ohlc_proc: subprocess.Popen | None = st.session_state.get("ohlc_proc")
+    _ohlc_running = ohlc_proc is not None and ohlc_proc.poll() is None
+    _capture_exit(ohlc_proc, "_ohlc_exit")
+
+    def _launch_flex_refresh(year: int | None = None) -> None:
+        cmd = [sys.executable, str(_here() / "scripts" / "update_trades.py")]
+        if year is not None:
+            cmd += ["--year", str(year)]
+        _ut_log_fh = open(_here() / "log" / "update_trades.log", "w", encoding="utf-8")  # noqa: SIM115
+        _ut_proc = subprocess.Popen(cmd, stdout=_ut_log_fh, stderr=subprocess.STDOUT, env=_sub_env())
+        st.session_state["trades_proc"] = _ut_proc
+        logger.info("update_trades.py started pid={} year={}", _ut_proc.pid, year)
+
+    if (
+        st.session_state.get("_ohlc_exit") == 0
+        and st.session_state.get("_auto_update_trades_pending")
+        and not st.session_state.get("trades_proc")
+    ):
+        st.session_state.pop("_auto_update_trades_pending", None)
+        _launch_flex_refresh()
+
+    _trades_proc: subprocess.Popen | None = st.session_state.get("trades_proc")
+    if _trades_proc is not None and _trades_proc.poll() is not None:
+        st.session_state["_trades_exit"] = _trades_proc.poll()
+        st.session_state["trades_proc"] = None
+        st.rerun()
+
+    _bt_running = st.session_state.get("backtest_proc") is not None
+    _bt_proc: subprocess.Popen | None = st.session_state.get("backtest_proc")
+    if _bt_proc is not None and _bt_proc.poll() is not None:
+        st.session_state["_bt_exit"] = _bt_proc.poll()
+        st.session_state.pop("backtest_proc", None)
+        _bt_running = False
+
+    with st.expander("⚡ Actions", expanded=False, key="exp_actions"):
+        st.caption(
+            "Daily flow — left to right.  Generate OHLCs auto-runs Refresh Flex; "
+            "set REFINE Overrides (below) before Execute Orders."
+        )
+
+        _c1, _a1, _c2, _a2, _c3, _a3, _c4, _a4, _c5 = st.columns(
+            [3, 0.35, 3, 0.35, 3, 0.35, 3.3, 0.35, 3]
+        )
+        for _a in (_a1, _a2, _a3, _a4):
+            _a.markdown("<div class='pipe-arrow'>→</div>", unsafe_allow_html=True)
+
+        # 1) Generate OHLCs ──────────────────────────────────────────────────
+        with _c1:
+            if st.button(
+                "📊 Generate OHLCs",
+                type="primary" if _ohlc_running else "secondary",
+                width="stretch",
+                help="Fetch / update 1.5 yr daily OHLC for S&P500 weekly underlyings + "
+                     "portfolio positions. Runs in background; Refresh Flex runs after.",
+            ) and not _ohlc_running:
+                sp500_specs = get_sp500_symbols()
+                seen: set[str] = {s["symbol"] for s in sp500_specs}
+                port_specs: list[dict[str, str]] = []
+                if not snap.positions.empty:
+                    for _, _pos in snap.positions.iterrows():
+                        _sym = str(_pos.get("symbol", ""))
+                        if not _sym or _sym in seen:
+                            continue
+                        port_specs.append({
+                            "symbol":   _sym,
+                            "exchange": str(_pos.get("primaryExch", "")) or "SMART",
+                            "currency": str(_pos.get("currency", "")) or "USD",
+                        })
+                        seen.add(_sym)
+                write_symbol_list(sp500_specs + port_specs)
+                _OHLC_LOG.parent.mkdir(parents=True, exist_ok=True)
+                _ohlc_log_fh = open(_OHLC_LOG, "w", encoding="utf-8")   # noqa: SIM115
+                st.session_state.pop("_ohlc_exit", None)
+                st.session_state["_auto_update_trades_pending"] = True
+                _ohlc_new_proc = subprocess.Popen(
+                    [sys.executable, str(_here() / "src" / "fetch_ohlc.py")],
+                    stdout=_ohlc_log_fh, stderr=subprocess.STDOUT, env=_sub_env(),
+                )
+                st.session_state["ohlc_proc"] = _ohlc_new_proc
+                logger.info("fetch_ohlc.py started pid={}", _ohlc_new_proc.pid)
+                st.rerun()
+            if not _ohlc_running and "_ohlc_exit" not in st.session_state:
+                st.caption(f"Last: {_pkl_age('', path=OHLC_PATH)}")
+
+        # 2) Refresh Flex ────────────────────────────────────────────────────
+        with _c2:
+            _flex_running = st.session_state.get("trades_proc") is not None
+            if st.button(
+                "🔄 Refresh Flex",
+                key="btn_refresh_flex",
+                type="primary" if _flex_running else "secondary",
+                width="stretch",
+                help="Download the Flex statement for the selected year and refresh all "
+                     "three pickles (trades, cash, NAV). Runs in background.",
+            ) and not _flex_running:
+                st.session_state.pop("_trades_exit", None)
+                if st.session_state.get("chk_flex_xml_only"):
+                    _rf_cmd = [sys.executable, str(_here() / "scripts" / "update_trades.py"), "--xml-only"]
+                    _rf_log_fh = open(_here() / "log" / "update_trades.log", "w", encoding="utf-8")  # noqa: SIM115
+                    _rf_proc = subprocess.Popen(_rf_cmd, stdout=_rf_log_fh, stderr=subprocess.STDOUT, env=_sub_env())
+                    st.session_state["trades_proc"] = _rf_proc
+                    logger.info("update_trades.py --xml-only started pid={}", _rf_proc.pid)
+                else:
+                    _launch_flex_refresh(year=int(st.session_state.get("ni_flex_year", pd.Timestamp.today().year)))
+                st.rerun()
+            _rfy, _rfx = st.columns([1, 1])
+            _rfy.number_input(
+                "Year", min_value=2010, max_value=pd.Timestamp.today().year,
+                value=pd.Timestamp.today().year, step=1, key="ni_flex_year",
+                help="Year for the downloaded XML.",
+            )
+            _rfx.checkbox("XML only", key="chk_flex_xml_only",
+                          help="Skip API download — re-parse existing *.xml files only.")
+            if not _flex_running and "_trades_exit" not in st.session_state:
+                _rf_warn = "⚠ TOKEN / TRADES_FLEXID not set" if not _api_ready else ""
+                st.caption(_rf_warn or f"flex_nav.pkl — {_pkl_age('', path=nav_path)}")
+
+        # 3) Run Backtest ────────────────────────────────────────────────────
+        with _c3:
+            if st.button(
+                "🧪 Run Backtest",
+                key="btn_run_backtest",
+                type="primary" if _bt_running else "secondary",
+                width="stretch",
+                help="Synthetic wheel-strategy backtest on 5-year daily OHLC. Outputs "
+                     "per-symbol DEPLOY/REFINE/ABANDON verdicts + suggested config.",
+            ) and not _bt_running:
+                _BACKTEST_LOG.parent.mkdir(parents=True, exist_ok=True)
+                _bt_log_fh = open(_BACKTEST_LOG, "w", encoding="utf-8")  # noqa: SIM115
+                st.session_state.pop("_bt_exit", None)
+                _bt_cmd = [sys.executable, str(_here() / "scripts" / "run_backtest.py")]
+                if st.session_state.get("chk_bt_refresh_ohlc"):
+                    _bt_cmd.append("--refresh-ohlc")
+                _bt_new_proc = subprocess.Popen(
+                    _bt_cmd, stdout=_bt_log_fh, stderr=subprocess.STDOUT, env=_sub_env(),
+                )
+                st.session_state["backtest_proc"] = _bt_new_proc
+                logger.info("run_backtest.py started pid={}", _bt_new_proc.pid)
+                st.rerun()
+            st.checkbox(
+                "Force-refresh OHLC", key="chk_bt_refresh_ohlc", disabled=_bt_running,
+                help="Re-fetch 5-year daily OHLC from yfinance for all symbols.",
+            )
+            if not _bt_running and "_bt_exit" not in st.session_state:
+                st.caption(f"Last: {_pkl_age('', path=_BT_RESULTS)}")
+
+        # 4) Generate Orders ─────────────────────────────────────────────────
+        with _c4:
+            if st.button(
+                "⚙️ Generate Orders",
+                type="primary" if frozen else "secondary",
+                width="stretch",
+                help="Freezes the dashboard (releases CID), runs derive.py, then reconnects. "
+                     "Takes 2–5 min. Last-known data stays visible during the freeze.",
+            ) and not frozen:
+                _DERIVE_LOG.parent.mkdir(parents=True, exist_ok=True)
+                log_fh = open(_DERIVE_LOG, "w", encoding="utf-8")  # noqa: SIM115
+                st.session_state.pop("_derive_exit", None)
+                st.session_state.pop("_derive_summary", None)
+                st.session_state["frozen_for"] = "derive"
+                client.freeze()
+                new_proc = subprocess.Popen(
+                    [sys.executable, str(_here() / "src" / "derive.py")],
+                    stdout=log_fh, stderr=None, env=_sub_env(),
+                )
+                st.session_state["derive_proc"] = new_proc
+                logger.info("derive.py started pid={}", new_proc.pid)
+                st.rerun()
+            st.checkbox(
+                "Sow: DEPLOY only", key="ord_sow_deploy_only", value=True,
+                help="When ON, Sow shows symbols rated DEPLOY in synthetic backtest OR trade "
+                     "history, plus REFINE symbols with active overrides.",
+            )
+            if "_derive_exit" not in st.session_state and not frozen:
+                ages = [_pkl_age(n) for n in ["df_cov.pkl", "df_nkd.pkl", "df_reap.pkl"]]
+                age_str = ages[0] if len(set(ages)) == 1 else " | ".join(ages)
+                st.caption(f"Last: {age_str}")
+
+        # 5) Execute Orders ──────────────────────────────────────────────────
+        with _c5:
+            @st.dialog("⚠️ Confirm Order Execution", width="small")
+            def _confirm_execute():
+                st.markdown(
+                    "This will execute all orders from the Suggested Orders section. "
+                    "**This action is irreversible.** Are you sure?"
+                )
+                _ce1, _ce2 = st.columns(2)
+                with _ce1:
+                    if st.button("✅ Execute", width="stretch"):
+                        st.session_state["_exec_confirmed"] = True
+                        st.rerun()
+                with _ce2:
+                    if st.button("❌ Cancel", width="stretch"):
+                        st.session_state.pop("_execute_exit", None)
+                        st.session_state.pop("_exec_confirmed", None)
+                        st.rerun()
+
+            if st.button(
+                "▶️ Execute Orders",
+                type="primary" if (frozen and frozen_for == "execute") else "secondary",
+                width="stretch",
+                help="Execute all orders from the Suggested Orders section. Freezes the "
+                     "dashboard, runs execute.py, then reconnects. ⚠️ This is IRREVERSIBLE.",
+            ) and not frozen:
+                _confirm_execute()
+
+            if st.session_state.get("_exec_confirmed"):
+                st.session_state.pop("_exec_confirmed", None)
+                _EXECUTE_LOG.parent.mkdir(parents=True, exist_ok=True)
+                log_fh = open(_EXECUTE_LOG, "w", encoding="utf-8")  # noqa: SIM115
+                st.session_state.pop("_execute_exit", None)
+                st.session_state["frozen_for"] = "execute"
+                client.freeze()
+                exec_new_proc = subprocess.Popen(
+                    [sys.executable, str(_here() / "src" / "execute.py")],
+                    stdout=log_fh, stderr=None, env=_sub_env(),
+                )
+                st.session_state["execute_proc"] = exec_new_proc
+                logger.info("execute.py started pid={}", exec_new_proc.pid)
+
+        # ── Status + logs (full width, below the pipeline row) ───────────────
+        if frozen or "_derive_exit" in st.session_state or "_execute_exit" in st.session_state:
+            gen_status_col, exec_status_col, _st_spacer = st.columns([2.5, 2.5, 5])
+            with gen_status_col:
+                if frozen and frozen_for == "derive":
+                    _pct, phase, _ = _derive_progress()
+                    st.progress(max(_pct, 0.01), text=f"⏳ {phase}")
+                elif "_derive_exit" in st.session_state:
+                    rc = st.session_state["_derive_exit"]
+                    if rc == 0:
+                        if "_derive_summary" not in st.session_state:
+                            _nc = len(_load_pkl("df_cov.pkl"))
+                            _nn = len(_load_pkl("df_nkd.pkl"))
+                            _nr = len(_load_pkl("df_reap.pkl"))
+                            _np = len(_load_pkl("df_protect.pkl"))
+                            st.session_state["_derive_summary"] = (
+                                ([f"{_nc} covers"] if _nc else [])
+                                + ([f"{_nn} nakeds"] if _nn else [])
+                                + ([f"{_nr} reaps"] if _nr else [])
+                                + ([f"{_np} protects"] if _np else [])
+                            )
+                        _parts = st.session_state["_derive_summary"]
+                        if _parts:
+                            st.success(f"✅ {', '.join(_parts)}")
+                        else:
+                            st.warning("⚠️ derive.py ran OK — no orders generated (check log)")
+                    else:
+                        st.error(f"❌ Generate Orders failed (exit {rc})")
+            with exec_status_col:
+                if frozen and frozen_for == "execute":
+                    st.progress(0.5, text="⏳ Executing orders…")
+                elif "_execute_exit" in st.session_state:
+                    rc = st.session_state["_execute_exit"]
+                    if rc == 0:
+                        st.success("✅ Orders executed")
+                    else:
+                        st.error(f"❌ Order execution failed (exit {rc})")
+
+        if frozen and frozen_for == "execute":
+            _exec_log = _here() / "log" / "execute.log"
+            if _exec_log.exists():
+                try:
+                    _exec_live = _exec_log.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
+                    if _exec_live:
+                        st.code("\n".join(_exec_live), language=None)
+                except Exception:
+                    pass
+        elif frozen:
+            log_lines = _derive_log_lines(35)
+            if log_lines:
+                st.code("\n".join(_strip_ansi(ln) for ln in log_lines), language=None)
+        elif "_derive_exit" in st.session_state:
+            rc = st.session_state["_derive_exit"]
+            _render_log_expander("📋 derive.py log", _DERIVE_LOG, expanded=rc != 0)
+
+        if "_execute_exit" in st.session_state:
+            rc = st.session_state["_execute_exit"]
+            _render_log_expander("📋 execute.py log", _EXECUTE_LOG, expanded=rc != 0)
+
+        # OHLC status
+        if _ohlc_running:
+            _op, _ol = _ohlc_progress()
+            st.progress(_op, text=f"⏳ {_ol}")
+        elif "_ohlc_exit" in st.session_state:
+            _ohlc_rc = st.session_state["_ohlc_exit"]
+            if _ohlc_rc == 0:
+                st.success("✅ OHLCs up to date")
+            else:
+                st.error(f"❌ OHLC fetch failed (exit {_ohlc_rc})")
+        if _ohlc_running:
+            _ohlc_live = _ohlc_log_lines(30)
+            if _ohlc_live:
+                st.code("\n".join(_strip_ansi(ln) for ln in _ohlc_live), language=None)
+        if "_ohlc_exit" in st.session_state:
+            _render_log_expander("📋 OHLC log", _OHLC_LOG, expanded=st.session_state["_ohlc_exit"] != 0)
+
+        # Refresh Flex status
+        if st.session_state.get("trades_proc") is not None:
+            st.info("⏳ Refresh Flex running in background…")
+        elif "_trades_exit" in st.session_state:
+            _ut_rc = st.session_state["_trades_exit"]
+            if _ut_rc == 0:
+                st.success("✅ Refresh Flex completed")
+            else:
+                st.error(f"❌ Refresh Flex failed (exit {_ut_rc})")
+
+        # Backtest status / results (render_actions' 5 s timer drives the refresh)
+        _render_bt_status()
+
+        # ── Advanced: Clear Data (optional fresh-start) ──────────────────────
+        _CLEAR_PROTECTED = {"backtest_results.pkl", "backtest_ohlc.pkl", "symbol_overrides.json"}
+
+        @st.dialog("⚠️ Confirm Clear Data", width="small")
+        def _confirm_clear(files: list[str]):
+            st.markdown(
+                "The following derived files in `data/` will be **permanently deleted**. "
+                "Backtest results, REFINE overrides, and OHLC cache are **kept**."
+            )
+            st.markdown("\n".join(f"- `{f}`" for f in files))
+            _cc1, _cc2 = st.columns(2)
+            with _cc1:
+                if st.button("🗑️ Delete", width="stretch"):
+                    st.session_state["_clear_confirmed"] = True
+                    st.rerun()
+            with _cc2:
+                if st.button("❌ Cancel", width="stretch"):
+                    st.rerun()
+
+        with st.expander("Advanced", expanded=False):
+            st.caption(
+                "Use **Clear Data** only for a fresh start (e.g. malformed chains). "
+                "Deletes derived pkl files. Keeps backtest results, REFINE overrides, "
+                "OHLC cache, and data/master/."
+            )
+            _clr_adv_col, _ = st.columns([2, 6])
+            with _clr_adv_col:
+                if st.button("🗑️ Clear Data", width="stretch", type="secondary",
+                             key="btn_clr_data_adv"):
+                    _files_to_clear = sorted(
+                        p.name for p in _DATA_DIR.iterdir()
+                        if p.is_file() and p.name not in _CLEAR_PROTECTED
+                    )
+                    if _files_to_clear:
+                        _confirm_clear(_files_to_clear)
+                    else:
+                        st.toast("No files to clear.")
+
+            if st.session_state.get("_clear_confirmed"):
+                st.session_state.pop("_clear_confirmed", None)
+                _cleared, _locked = [], []
+                for _p in sorted(_DATA_DIR.iterdir()):
+                    if not _p.is_file() or _p.name in _CLEAR_PROTECTED:
+                        continue
+                    try:
+                        _p.unlink()
+                        _cleared.append(_p.name)
+                    except PermissionError:
+                        _locked.append(_p.name)
+                if _cleared:
+                    st.toast(f"Cleared {len(_cleared)} file(s): {', '.join(_cleared)}")
+                if _locked:
+                    st.toast(
+                        f"⚠️ {', '.join(_locked)} still in use — retry in a moment",
+                        icon="⚠️",
+                    )
+
+
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
 
-# Nav row: [header | tabs | account selector | clock | refresh]
-# Fixed at top via CSS :has([stRadio]). On mobile (≤640 px) cols 1 (header) and
-# 4 (clock) are hidden, leaving Analysis/Orders · selector · ↺ on one line.
-_hdr_c, _nav_c1, _acct_c, _time_c, _refresh_c = st.columns([2, 3, 1, 2, 1])
+# Seed config session_state from snp_config.yml at page top (one-shot, guarded).
+# Must run here — not only inside render_config_panel — because Config is collapsed
+# by default, and the Ask AI dock needs cfg_defaultai / cfg_aimodels to pick the
+# right default provider even when the user never opens Config.
+_init_cfg_state()
+
+# Header bar: title | account selector | refresh
+# (Theme switching is handled by Streamlit's burger menu → Settings → Appearance.)
+_hdr_c, _spacer_c, _acct_c, _refresh_c = st.columns([4, 4.7, 1.6, 0.7])
 with _hdr_c:
     header()
-with _nav_c1:
-    nav = st.radio(
-        "Navigation",
-        ["Analysis", "Orders"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
 with _acct_c:
     if len(_REAL_ACCOUNTS) > 1:
         st.selectbox(
@@ -4741,8 +4952,6 @@ with _acct_c:
         )
     elif _REAL_ACCOUNTS:
         st.caption(next(iter(_REAL_ACCOUNTS)))
-with _time_c:
-    _nav_time()
 with _refresh_c:
     if st.button("↺", key="btn_nav_refresh", help="Reload all dashboard data"):
         st.session_state.pop("_ref_ovr_base", None)
@@ -4750,66 +4959,79 @@ with _refresh_c:
         st.session_state.pop("sym_override_editor", None)
         st.rerun()
 
-# Second fixed band: KPI table on top, Ask AI below — stacked in one full-width column.
-# A hidden marker div lets JS locate the outer stHorizontalBlock to pin.
-with st.columns([1])[0]:
-    st.markdown('<div id="kpi-ai-band" style="display:none"></div>', unsafe_allow_html=True)
-    kpi_strip()
-    _render_llm_chat()
-
-st.markdown(
-    """
-    <script>
-    (function () {
-        function applyFix() {
-            /* Pin outer stHorizontalBlock via the hidden marker div */
-            const marker = document.getElementById('kpi-ai-band');
-            const bar = marker ? marker.closest('[data-testid="stHorizontalBlock"]') : null;
-            if (!bar) return;
-            if (!bar.classList.contains('kpi-bar-fixed')) bar.classList.add('kpi-bar-fixed');
-            const nav = document.querySelector('[data-testid="stHorizontalBlock"]:has([data-testid="stRadio"])');
-            const main = document.querySelector('section[data-testid="stMain"] > div.block-container');
-            if (nav && main) {
-                const navH = nav.getBoundingClientRect().height;
-                bar.style.top = navH + 'px';
-                const h = navH + bar.getBoundingClientRect().height;
-                main.style.paddingTop = Math.max(h + 6, 80) + 'px';
-            }
-            /* Apply ask-ai-col styling to the inner column containing the AI input */
-            const inp = document.querySelector('input[placeholder="Ask about your portfolio…"]');
-            if (inp) {
-                const col = inp.closest('[data-testid="stColumn"]');
-                if (col && !col.classList.contains('ask-ai-col')) col.classList.add('ask-ai-col');
-            }
-        }
-        applyFix();
-        let _t;
-        new MutationObserver(function () { clearTimeout(_t); _t = setTimeout(applyFix, 50); })
-            .observe(document.body, { childList: true, subtree: true });
-    })();
-    </script>
-    """,
-    unsafe_allow_html=True,
-)
-
-# Log tab and account navigation changes (fires once per actual change per session).
-_prev_nav = st.session_state.get("_prev_nav")
-if _prev_nav is not None and _prev_nav != nav:
-    logger.info("Tab navigation: {} → {}", _prev_nav, nav)
-st.session_state["_prev_nav"] = nav
-
+# Log account-selector changes (fires once per actual change per session).
 _prev_acct = st.session_state.get("_prev_acct_sel")
 _curr_acct = st.session_state.get("acct_sel")
 if _prev_acct is not None and _prev_acct != _curr_acct:
     logger.info("Account selector: {} → {}", _prev_acct, _curr_acct)
 st.session_state["_prev_acct_sel"] = _curr_acct
 
-if nav == "Analysis":
-    render_analysis()
-elif nav == "Orders":
-    _ord_col, _cfg_col = st.columns([3, 1])
-    with _ord_col:
+# ── KPIs ────────────────────────────────────────────────────────────────────
+with st.expander("\U0001F4CA KPIs", expanded=True, key="exp_kpis"):
+    kpi_strip()
+
+# ── Actions pipeline ─────────────────────────────────────────────────────────
+render_actions()
+
+# ── Ask AI ───────────────────────────────────────────────────────────────────
+with st.expander("\U0001F916 Ask AI", expanded=False, key="exp_ask_ai"):
+    _render_llm_chat()
+
+# ── Single global filter — drives every panel below ──────────────────────────
+render_filter_bar()
+
+# ── Content: master collapsible sections (Performance / Orders / Config) ──────
+# Streamlit forbids expander-in-expander, so master sections are button-toggled
+# banners (st-key-btn_master_* styled in CSS) that show/hide their sub-expanders.
+def _toggle_master(sk: str) -> None:
+    st.session_state[sk] = not st.session_state.get(sk, False)
+
+
+def _master_banner(title: str, key: str, *, default: bool = True) -> bool:
+    """Draw the clay banner toggle button; return whether the section is open.
+
+    The button is rendered inside a per-section fragment (below), so clicking it
+    reruns only that section — not the whole dashboard.
+    """
+    sk = f"_master_{key}"
+    if sk not in st.session_state:
+        st.session_state[sk] = default
+    is_open = st.session_state[sk]
+    arrow = "▾" if is_open else "▸"
+    # on_click toggles BEFORE the implicit (fragment-scoped) rerun → arrow +
+    # content update in a single refresh; no explicit st.rerun() needed.
+    st.button(
+        f"{arrow}  {title}", key=f"btn{sk}", width="stretch",
+        on_click=_toggle_master, args=(sk,),
+    )
+    return st.session_state[sk]
+
+
+# Each master is its own fragment, so opening/closing it reruns only that
+# section instead of the entire page. Header (2 s) and KPIs (10 s) keep their
+# own timers, so they stay fresh without a page-wide rerun on toggle. Config
+# *saves* still call st.rerun() (full app) so other fragments pick up new YAML.
+@st.fragment
+def _master_perf() -> None:
+    # Performance: Positions, Performance Dashboard, Deep-Dive, Gaps, Trade Analysis
+    if _master_banner("📊 Performance", "perf", default=True):
+        render_analysis()
+
+
+@st.fragment
+def _master_orders() -> None:
+    # Orders: Open Orders + Suggested Orders (Cover / Monthly CC / Sow → REFINE / Reap / Protect)
+    if _master_banner("🗂 Orders", "orders", default=True):
         render_orders()
-        render_refine_overrides()
-    with _cfg_col:
+
+
+@st.fragment
+def _master_config() -> None:
+    # Config — last and separate
+    if _master_banner("⚙️ Config", "config", default=False):
         render_config_panel()
+
+
+_master_perf()
+_master_orders()
+_master_config()

@@ -102,7 +102,11 @@ year. Use these to understand capital injections, income, and to cross-check NAV
 - Symbol classification: the Monthly-only list names every S&P 500 symbol that has ONLY \
 monthly/quarterly expiries (gap ≥20 days). Any symbol NOT in that list has weekly or near-weekly \
 expiries. Lookup rule: to answer "is X weekly?" — if X is absent from the monthly-only list → \
-YES (weekly); if X appears in the list → NO (monthly-only).
+YES (weekly); if X appears in the list → NO (monthly-only). \
+CRITICAL: for a symbol you currently HOLD, do NOT scan this list at all — read the expiry_class \
+column on that position row instead (weekly | monthly_only | unclassified). It is authoritative \
+and avoids list-membership mistakes. Only fall back to the Monthly-only list for symbols that are \
+NOT in your positions.
 - Synthetic backtest: per-symbol 5-year OHLC simulation of the wheel strategy at the current \
 config values (COVER_STD_MULT, VIRGIN_PUT_STD_MULT). Verdict is CSP-driven — DEPLOY means the \
 put leg had >=70% win rate and PF>=1.0 over 3+ years; REFINE means marginal CSP edge; ABANDON \
@@ -120,7 +124,12 @@ from suggested orders.
 You cannot run code or execute backtests — for backtesting use the History tab's Backtest Scoring.
 Answer concisely with specific numbers. Never truncate a list, table, or sentence mid-way — \
 always complete the final item. Keep responses under 500 words. \
-When ranking or listing, show the top 5–10 items.
+When ranking or listing, show the top 5–10 items. \
+SELF-CONSISTENCY: do your counting/classification FIRST, then write the summary. Your opening \
+sentence MUST agree with your own tables and final conclusion — if your worked-out table shows N \
+items remain, never open with "none remain". Beware leading questions ("would I have ANY X left?"): \
+do not reflexively answer "No"; compute the actual count and let the data decide. \
+Before sending, re-read your first and last sentences and fix any contradiction.
 
 Current data context:
 {context}"""
@@ -294,11 +303,17 @@ def _format_context(context: dict) -> str:
         lines.append(f"=== {_pos_label} ===")
         lines.append("AUTHORITATIVE: for options the right/strike/expiry columns below are definitive.")
         lines.append("Do NOT use trade_log to infer any option's right, strike, or expiry — trade_log is closed history only.")
+        positions = context["positions"]
+        if "expiry_class" in getattr(positions, "columns", []):
+            lines.append(
+                "The expiry_class column is the DEFINITIVE weekly/monthly classification for each "
+                "holding (weekly | monthly_only | unclassified). Use it directly — do NOT infer a "
+                "symbol's monthly/weekly status from any other list when it is held."
+            )
         if not _pos_live:
             lines.append("WARNING: live IBKR connection unavailable. Positions may be stale. Qualify any recommendations accordingly.")
-        positions = context["positions"]
         text = positions.to_string(index=False)
-        lines.append(text[:2000])
+        lines.append(text[:6000])
     else:
         lines.append("=== Current Positions ===")
         lines.append("NO POSITIONS — portfolio is empty or dashboard is not connected to IBKR.")

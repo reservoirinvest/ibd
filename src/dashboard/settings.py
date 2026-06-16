@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     protect_me: bool = False
     cover_std_mult: float = 0.65
     covxpmult: float = 1.2
+    ai_models: list[str] = ["Gemini", "DeepSeek"]
+    default_ai: str = "Gemini"
 
     model_config = SettingsConfigDict(
         env_file=str(here() / ".env"),
@@ -88,6 +90,8 @@ class Settings(BaseSettings):
                 "protect_me": bool(cfg.get("PROTECT_ME", self.protect_me)),
                 "cover_std_mult": float(cfg.get("COVER_STD_MULT", self.cover_std_mult)),
                 "covxpmult": float(cfg.get("COVXPMULT", self.covxpmult)),
+                "ai_models": list(cfg.get("AIMODELS", self.ai_models)),
+                "default_ai": str(cfg.get("DEFAULTAI", self.default_ai)),
             }
         )
 

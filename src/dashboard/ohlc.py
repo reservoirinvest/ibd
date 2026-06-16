@@ -34,7 +34,7 @@ from ib_async import IB, Stock
 import pandas as pd
 from loguru import logger
 from pyprojroot import here
-from tqdm import tqdm
+from .progress import progress_bar
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -256,12 +256,11 @@ async def _fetch_yf_all(
     end: date,
     log_fh: TextIO,
 ) -> dict[str, pd.DataFrame]:
-    """Bounded-concurrency yfinance fetch with inline tqdm progress."""
+    """Bounded-concurrency yfinance fetch with inline rich progress."""
     sem = asyncio.Semaphore(_CONCURRENCY)
     results: dict[str, pd.DataFrame] = {}
 
-    with tqdm(total=len(specs), desc="OHLC yfinance", unit="sym",
-              leave=True, file=log_fh) as pbar:
+    with progress_bar(len(specs), "OHLC yfinance", unit="sym", file=log_fh) as pbar:
 
         async def _bounded(spec: SymbolSpec) -> None:
             async with sem:
@@ -342,8 +341,7 @@ async def _fetch_ib_all(
                 raise
 
     try:
-        with tqdm(total=len(specs), desc="OHLC IBKR fallback", unit="sym",
-                  leave=True, file=log_fh) as pbar:
+        with progress_bar(len(specs), "OHLC IBKR fallback", unit="sym", file=log_fh) as pbar:
 
             async def _bounded(spec: SymbolSpec) -> None:
                 sym = spec["symbol"]

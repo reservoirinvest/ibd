@@ -27,7 +27,6 @@ dependencies = [
     "jupyterlab>=4.4.9",
     "loguru>=0.7.3",
     "lxml>=6.0.2",
-    "nicegui>=2.0.0",
     "numpy>=2.3.3",
     "pandas>=2.3.3",
     "pandas-datareader>=0.10.0",
@@ -44,7 +43,6 @@ dependencies = [
     "ruff>=0.13.3",
     "scipy>=1.16.2",
     "streamlit>=1.57.0",
-    "tqdm>=4.67.1",
     "yfinance>=0.2.66",
 ]
 

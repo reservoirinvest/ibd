@@ -274,7 +274,7 @@ else:
 
         df_cc = (
             chains[chains.symbol.isin(uncov_long.symbol.unique())]
-            .loc[(chains.dte.between(COVER_MIN_DTE, COVER_MIN_DTE + 7))][
+            .loc[((chains.dte // 1).between(COVER_MIN_DTE, COVER_MIN_DTE + 7))][
                 ["symbol", "expiry", "strike", "dte"]
             ]
             .sort_values(["symbol", "dte"])
@@ -435,7 +435,7 @@ else:
 
         df_cp = (
             chains[chains.symbol.isin(uncov_short.symbol.unique())]
-            .loc[(chains.dte.between(COVER_MIN_DTE, COVER_MIN_DTE + 7))][
+            .loc[((chains.dte // 1).between(COVER_MIN_DTE, COVER_MIN_DTE + 7))][
                 ["symbol", "expiry", "strike", "dte"]
             ]
             .sort_values(["symbol", "dte"])
@@ -610,7 +610,7 @@ else:
         )
     for _sym, _side, _row in sorted(_missing_cov, key=lambda x: x[0]):
         _sym_chains_dte = chains[
-            (chains.symbol == _sym) & chains.dte.between(COVER_MIN_DTE, COVER_MIN_DTE + 7)
+            (chains.symbol == _sym) & (chains.dte // 1).between(COVER_MIN_DTE, COVER_MIN_DTE + 7)
         ]
         if _sym_chains_dte.empty:
             _avail = sorted(chains.loc[chains.symbol == _sym, "dte"].dropna().unique())

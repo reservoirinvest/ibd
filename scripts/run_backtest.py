@@ -3,7 +3,10 @@
 Usage:
     uv run python scripts/run_backtest.py
     uv run python scripts/run_backtest.py --refresh-ohlc   # re-fetch 5-year OHLC
-    uv run python scripts/run_backtest.py --since 2025-08-08  # personal-history filter
+
+Note: the synthetic backtest scores over the FULL ~5-year OHLC history (it needs
+≥2-3 years / ≥20 cycles per symbol for a verdict). There is no focus-date filter;
+the 08-Aug-2025 "focus date" only anchors the Performance Dashboard display.
 """
 import argparse
 import sys

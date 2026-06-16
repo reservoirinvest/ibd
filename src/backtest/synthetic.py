@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from src.backtest.score import BacktestScore, score_from_trades
+from src.backtest.score import BacktestScore
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKTEST_OHLC_PATH = ROOT / "data" / "master" / "backtest_ohlc.pkl"
@@ -102,7 +102,6 @@ def _build_cycles(prices: pd.Series, dte_target: int = DEFAULT_DTE) -> list[_Cyc
         return []
 
     price_idx = prices.index
-    all_dates = set(price_idx.date)
     hv = _rolling_hv(prices)
 
     expiries = _monthly_expiries(
