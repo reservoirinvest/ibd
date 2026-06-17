@@ -197,12 +197,7 @@ st.markdown(
     .st-key-syn_chk_wrap label p,
     .st-key-wk_chk_wrap label p { white-space: nowrap !important; }
 
-    /* REFINE Overrides controls row — center every cell vertically so the
-       "Change all overrides to:" label lines up with the input + buttons */
-    .st-key-ref_ovr_ctrls div[data-testid="stHorizontalBlock"] { align-items: stretch; }
-    .st-key-ref_ovr_ctrls div[data-testid="stColumn"] {
-        display: flex; flex-direction: column; justify-content: center;
-    }
+
 
     /* ── Mobile (≤ 640 px): stack KPI cells two-up ── */
     @media (max-width: 640px) {
@@ -857,11 +852,11 @@ def _drop_withstand(excess: float, delta_abs: float) -> str:
 @st.fragment(run_every=2)
 def header() -> None:
     """Compact status bar — title, connection state, port/cid, position count."""
-    # Trigger a rerun of the main app once bootstrap completes or restarts after disconnect
-    if not client._bootstrapped:
-        st.session_state["_bootstrapped_rerun_done"] = False
-    elif not st.session_state.get("_bootstrapped_rerun_done"):
-        st.session_state["_bootstrapped_rerun_done"] = True
+    # One full-app rerun after the FIRST bootstrap so the main page picks up positions.
+    # Do NOT reset on later disconnects — a flapping connection would otherwise app-rerun
+    # (full-page dim) every ~2 s. The 2 s header + 10 s fragments keep status/positions fresh.
+    if client._bootstrapped and not st.session_state.get("_initial_app_rerun_done"):
+        st.session_state["_initial_app_rerun_done"] = True
         st.rerun(scope="app")
 
     snap = client.snapshot()
@@ -1040,7 +1035,10 @@ def kpi_strip() -> None:
         st.rerun(scope="app")
 
 
-@st.fragment(run_every=10)
+# Content-only (no run_every): the 10 s refresh timer lives on the parent
+# _master_orders fragment. Putting the timer here too makes the inner fragment
+# tick independently of the master banner — so it re-renders (and "expands back")
+# even after the banner is collapsed. Keep the timer on the parent only.
 def render_orders() -> None:
     snap = client.snapshot()
     acct = _selected_account()
@@ -1396,8 +1394,35 @@ def render_orders() -> None:
             )
 
 
+def _sel_all_ovr() -> None:
+    _nb = st.session_state["_ref_ovr_base"].copy()
+    _nb["Use"] = True
+    st.session_state["_ref_ovr_base"] = _nb
+    st.session_state.pop("sym_override_editor", None)
+
+
+def _clr_all_ovr() -> None:
+    _nb = st.session_state["_ref_ovr_base"].copy()
+    _nb["Use"] = False
+    st.session_state["_ref_ovr_base"] = _nb
+    st.session_state.pop("sym_override_editor", None)
+
+
+def _apply_all_ovr() -> None:
+    _val = round(float(st.session_state.get("ovr_all_val", 2.0)), 2)
+    _nb = st.session_state["_ref_ovr_base"].copy()
+    _nb["Override σ"] = _val
+    st.session_state["_ref_ovr_base"] = _nb
+    st.session_state.pop("sym_override_editor", None)
+
+
 def render_refine_overrides() -> None:
     """Per-symbol VIRGIN_PUT_STD_MULT overrides for REFINE symbols.
+
+    Plain st.expander (matches the Sow / Reap / Protect siblings) rendered inside
+    render_orders directly under Sow. Like the siblings it passes a constant
+    `expanded=` so Streamlit preserves the user's open/close toggle across the 10 s
+    timer (the old popped `_ref_ovr_expanded` flag was what forced it to collapse).
 
     Saves to data/symbol_overrides.json; picked up by derive.py on next run.
     """
@@ -1471,12 +1496,16 @@ def render_refine_overrides() -> None:
         else "🔧 REFINE Overrides — no REFINE symbols"
     )
 
-    # Pop the flag so it applies for exactly one render (set by buttons that call st.rerun())
-    _keep_open = st.session_state.pop("_ref_ovr_expanded", False)
-    with st.expander(_lbl, expanded=_keep_open):
+    # Constant `expanded=` (never a popped flag) → Streamlit preserves the user's
+    # open/close toggle across render_orders' 10 s reruns, exactly like the siblings.
+    with st.expander(_lbl, expanded=False):
         if _n_sym == 0:
             st.info("No REFINE symbols in current backtest results.")
             return
+
+        if "_ref_ovr_saved_n" in st.session_state:
+            _saved_n = st.session_state.pop("_ref_ovr_saved_n")
+            st.toast(f"💾 Saved {_saved_n} override(s) → derive.py will use them next run")
 
         st.caption(
             "Per-symbol put-strike width override. "
@@ -1485,51 +1514,38 @@ def render_refine_overrides() -> None:
             "**Suggested σ** = max(grid-optimal, config) — never tighter than global setting."
         )
 
-        # Select All | Change all overrides to: [value] ↵ | Clear All  (one row)
-        # Keyed container → .st-key-ref_ovr_ctrls CSS centers each cell vertically.
+        # Select All | Change all overrides to: [value] ↵ | Clear All  (one row);
+        # st.columns(vertical_alignment="center") centers each cell against the input.
         with st.container(key="ref_ovr_ctrls"):
             _sa_col, _lbl_col, _inp_col, _go_col, _ca_col, _sp_col = st.columns(
                 [1.1, 1.7, 0.9, 0.5, 1.1, 1.4], vertical_alignment="center"
             )
             with _sa_col:
-                if st.button("☑ Select All", key="btn_sel_all_ovr", width="stretch"):
-                    _nb = st.session_state["_ref_ovr_base"].copy()
-                    _nb["Use"] = True
-                    st.session_state["_ref_ovr_base"] = _nb
-                    st.session_state.pop("sym_override_editor", None)
-                    st.session_state["_ref_ovr_expanded"] = True
-                    st.rerun()
+                st.button("☑ Select All", key="btn_sel_all_ovr", width="stretch",
+                          on_click=_sel_all_ovr)
             with _lbl_col:
+                # Fixed-height flex box centres the text vertically against the
+                # ~2.5rem-tall input/buttons (CSS keyed off st.container doesn't
+                # apply in this Streamlit build, so keep the alignment self-contained).
                 st.markdown(
-                    "<div style='display:flex; align-items:center; "
-                    "justify-content:flex-end; height:100%; min-height:2.5rem; "
-                    "white-space:nowrap; font-weight:600; margin:0;'>"
+                    "<div style='display:flex; align-items:center; justify-content:flex-end; "
+                    "height:2.5rem; white-space:nowrap; font-weight:600;'>"
                     "Change all overrides to:</div>",
                     unsafe_allow_html=True,
                 )
             with _inp_col:
-                _ovr_all_val = st.number_input(
+                st.number_input(
                     "Change all overrides to",
                     value=2.00, step=0.25, min_value=0.1, max_value=5.0,
                     key="ovr_all_val", label_visibility="collapsed",
                 )
             with _go_col:
-                if st.button("↵", key="btn_apply_all_ovr", width="stretch",
-                             help="Set every Override σ to this value"):
-                    _nb = st.session_state["_ref_ovr_base"].copy()
-                    _nb["Override σ"] = round(float(_ovr_all_val), 2)
-                    st.session_state["_ref_ovr_base"] = _nb
-                    st.session_state.pop("sym_override_editor", None)
-                    st.session_state["_ref_ovr_expanded"] = True
-                    st.rerun()
+                st.button("↵", key="btn_apply_all_ovr", width="stretch",
+                          help="Set every Override σ to this value",
+                          on_click=_apply_all_ovr)
             with _ca_col:
-                if st.button("☐ Clear All", key="btn_clr_all_ovr", width="stretch"):
-                    _nb = st.session_state["_ref_ovr_base"].copy()
-                    _nb["Use"] = False
-                    st.session_state["_ref_ovr_base"] = _nb
-                    st.session_state.pop("sym_override_editor", None)
-                    st.session_state["_ref_ovr_expanded"] = True
-                    st.rerun()
+                st.button("☐ Clear All", key="btn_clr_all_ovr", width="stretch",
+                          on_click=_clr_all_ovr)
 
         _edited = st.data_editor(
             _base,
@@ -1591,8 +1607,8 @@ def render_refine_overrides() -> None:
                 st.session_state.pop("_ref_ovr_mtime", None)
                 st.session_state.pop("_ref_ovr_base", None)
                 st.session_state.pop("sym_override_editor", None)
-                st.session_state["_ref_ovr_expanded"] = True
-                st.rerun()
+                st.session_state["_ref_ovr_saved_n"] = len(_new_map)
+                st.rerun(scope="fragment")
         with _info_col:
             if _n_active:
                 _active_syms = list(_base.loc[_base["Use"], "symbol"])
@@ -5018,9 +5034,12 @@ def _master_perf() -> None:
         render_analysis()
 
 
-@st.fragment
+@st.fragment(run_every=10)
 def _master_orders() -> None:
     # Orders: Open Orders + Suggested Orders (Cover / Monthly CC / Sow → REFINE / Reap / Protect)
+    # run_every lives here (not on render_orders) so the 10 s refresh pauses while
+    # the banner is collapsed — otherwise the inner fragment ticks on its own and
+    # re-expands the order tables.
     if _master_banner("🗂 Orders", "orders", default=True):
         render_orders()
 

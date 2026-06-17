@@ -23,7 +23,7 @@ src/
   analyze.py            # Portfolio analysis (called from dashboard)
   fetch_ohlc.py         # OHLC history — yfinance primary, IBKR fallback
 config/snp_config.yml   # PORT, CID, MINCUSHION, MAX_DTE, strategy params
-data/master/            # Protected pickles — gitignored; XMLs are backup
+data/master/            # Pickles TRACKED in git (accountId masked to US/SG) = backup; raw year-named XMLs are gitignored
 scripts/                # Standalone refresh scripts (update_trades.py, update_symbol_categories.py, ...)
 ```
 
@@ -71,7 +71,9 @@ uv run python -c "from src.flex import fetch, parse, analyze; from src.backtest 
 
 ---
 
-## Data files (data/master/ — all gitignored)
+## Data files (data/master/ — pickles TRACKED in git; raw XMLs gitignored)
+
+The `data/master/*.pkl` files (and `data/df_chains.pkl`, `data/df_unds.pkl`, `data/symbols.pkl`) are **committed to git** and serve as the backup — their `accountId` is normalised to `US`/`SG`, so no raw account number is exposed. The raw year-named flex reports `data/master/*.xml` (which *do* contain real account numbers) are **gitignored** (`.gitignore: data/master/*.xml`) and are the local-only source for rebuilding the flex pickles. `data/t*.pkl` (traded_*) are also gitignored.
 
 | File | Source | Contents |
 |---|---|---|
@@ -168,7 +170,8 @@ Built in `build_llm_context()` near bottom of `app.py`. Keys include: live posit
 | `header` (status bar) | 2 s |
 | `render_actions` (action pipeline + freeze/subprocess state) | 5 s |
 | `kpi_strip` (inside KPIs expander) | 10 s |
-| `render_orders` | 10 s |
+| `_master_orders` (wraps `render_orders`) | 10 s |
+| `render_orders` | no timer (content-only) |
 | `render_analysis` | no timer |
 
 `render_actions` owns the whole action subprocess + freeze state machine (derive / execute / ohlc / backtest / trades). `render_orders` and `render_analysis` are now content-only. `_nav_time` (clock) was removed with the tabbed nav.
