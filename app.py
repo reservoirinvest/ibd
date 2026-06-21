@@ -1091,6 +1091,16 @@ def render_orders() -> None:
             _cov_summary = _jcs.loads(_cov_sum_path.read_text(encoding="utf-8"))
     except Exception:
         pass
+
+    _hv_fallback_set: set[str] = set()
+    try:
+        _bld_sum_path = _DATA_DIR / "build_summary.json"
+        if _bld_sum_path.exists():
+            import json as _jbs
+            _bld = _jbs.loads(_bld_sum_path.read_text(encoding="utf-8"))
+            _hv_fallback_set = set(_bld.get("hv_fallback", {}).get("symbols", []))
+    except Exception:
+        pass
     try:
         _yml_protect = (yaml.safe_load(_CFG_PATH.read_text(encoding="utf-8")) or {}).get(
             "PROTECT_ME", False
@@ -1153,8 +1163,10 @@ def render_orders() -> None:
     # Cover
     n_cov = len(df_cov)
     cov_reward = _exp_cover_reward(df_cov)
+    _cov_hv = int(df_cov["symbol"].isin(_hv_fallback_set).sum()) if not df_cov.empty else 0
+    _cov_hv_sfx = f" (used hv for {_cov_hv} symbols)" if _cov_hv else ""
     cov_label = (
-        f"📈 Cover — {n_cov} orders · ${cov_reward:,.0f} expected if called"
+        f"📈 Cover — {n_cov} orders · ${cov_reward:,.0f} expected if called{_cov_hv_sfx}"
         if n_cov else "📈 Cover — 0 orders"
     )
     with st.expander(cov_label, expanded=n_cov > 0):
@@ -1266,8 +1278,10 @@ def render_orders() -> None:
 
     n_nkd = len(_df_nkd_disp)
     nkd_premium = _exp_premium(_df_nkd_disp)
+    _sow_hv = int(_df_nkd_disp["symbol"].isin(_hv_fallback_set).sum()) if not _df_nkd_disp.empty else 0
+    _sow_hv_sfx = f" (used hv for {_sow_hv} symbols)" if _sow_hv else ""
     nkd_label = (
-        f"🌱 Sow — {n_nkd} orders · ${nkd_premium:,.0f} expected premium"
+        f"🌱 Sow — {n_nkd} orders · ${nkd_premium:,.0f} expected premium{_sow_hv_sfx}"
         if n_nkd else "🌱 Sow — 0 orders"
     )
     with st.expander(nkd_label, expanded=n_nkd > 0):
@@ -1336,8 +1350,10 @@ def render_orders() -> None:
     # Reap
     n_reap = len(df_reap_pkl)
     reap_cost = _exp_premium(df_reap_pkl)
+    _reap_hv = int(df_reap_pkl["symbol"].isin(_hv_fallback_set).sum()) if not df_reap_pkl.empty else 0
+    _reap_hv_sfx = f" (used hv for {_reap_hv} symbols)" if _reap_hv else ""
     reap_label = (
-        f"🌾 Reap — {n_reap} orders · ${reap_cost:,.0f} to close"
+        f"🌾 Reap — {n_reap} orders · ${reap_cost:,.0f} to close{_reap_hv_sfx}"
         if n_reap else "🌾 Reap — 0 orders"
     )
     with st.expander(reap_label, expanded=n_reap > 0):
@@ -1433,6 +1449,8 @@ def render_refine_overrides() -> None:
     _OVERRIDE_PATH = Path("data/symbol_overrides.json")
 
     if not _BT_RES.exists():
+        with st.expander("🔧 REFINE Overrides — no backtest results", expanded=False, key="exp_refine_overrides"):
+            st.info("No backtest results — run Backtest to see REFINE symbols.")
         return
 
     # Rebuild base DF when backtest file changes or after a save
@@ -1498,7 +1516,7 @@ def render_refine_overrides() -> None:
 
     # Constant `expanded=` (never a popped flag) → Streamlit preserves the user's
     # open/close toggle across render_orders' 10 s reruns, exactly like the siblings.
-    with st.expander(_lbl, expanded=False):
+    with st.expander(_lbl, expanded=False, key="exp_refine_overrides"):
         if _n_sym == 0:
             st.info("No REFINE symbols in current backtest results.")
             return
@@ -2651,7 +2669,11 @@ def _render_symbol_deep_dive() -> None:
             if not _df_all.empty and "pnl" not in _df_all.columns:
                 _df_all = _norm(_df_all)
             _perf = _sym_perf(_df_all)
-            _unds = pd.read_pickle(_unds_path).set_index("symbol") if _unds_path.exists() else pd.DataFrame()
+            try:
+                _unds_raw = pd.read_pickle(_unds_path) if _unds_path.exists() else pd.DataFrame()
+                _unds = _unds_raw.set_index("symbol") if "symbol" in _unds_raw.columns else pd.DataFrame()
+            except Exception:
+                _unds = pd.DataFrame()
             _av = _select_account_values(snap, acct)
             _nlv = float(_av.get("NetLiquidation", 0)) if _av else 0.0
             _qty_mult = st.session_state.get("cfg_virgin_qty_mult", 0.055)
@@ -4219,6 +4241,17 @@ def _build_live_context() -> dict:
         if not df_ord.empty:
             context[ctx_key] = df_ord
 
+    # Uncreated orders — reasons from last derive.py run (written to derive_uncreated.json)
+    _unc_path = _here() / "data" / "derive_uncreated.json"
+    if _unc_path.exists():
+        try:
+            import json as _junc
+            _unc = _junc.loads(_unc_path.read_text(encoding="utf-8"))
+            if _unc:
+                context["uncreated_orders"] = _unc
+        except Exception:
+            pass
+
     # Live open orders (filtered to selected account)
     live_orders = snap.orders
     if acct and not live_orders.empty and "account" in live_orders.columns:
@@ -4633,11 +4666,23 @@ def render_actions() -> None:
             ) and not _ohlc_running:
                 sp500_specs = get_sp500_symbols()
                 seen: set[str] = {s["symbol"] for s in sp500_specs}
+                # Load option-chain symbols so we can skip non-optionable positions
+                # (London-listed ETFs: VWRA, CNDX, IGLN — no chain, no yfinance data)
+                _chain_syms: set[str] = set()
+                try:
+                    _cdf = pd.read_pickle(_here() / "data" / "df_chains.pkl")
+                    if "symbol" in _cdf.columns:
+                        _chain_syms = set(_cdf["symbol"].dropna().astype(str))
+                except Exception:
+                    pass
                 port_specs: list[dict[str, str]] = []
                 if not snap.positions.empty:
                     for _, _pos in snap.positions.iterrows():
                         _sym = str(_pos.get("symbol", ""))
                         if not _sym or _sym in seen:
+                            continue
+                        # Skip symbols with no options chain (London ETFs, non-US ETFs)
+                        if _chain_syms and _sym not in _chain_syms:
                             continue
                         port_specs.append({
                             "symbol":   _sym,
@@ -4855,6 +4900,24 @@ def render_actions() -> None:
             rc = st.session_state["_execute_exit"]
             _render_log_expander("📋 execute.py log", _EXECUTE_LOG, expanded=rc != 0)
 
+        if any(k in st.session_state for k in (
+            "_derive_exit", "_ohlc_exit", "_trades_exit", "_execute_exit", "_bt_exit"
+        )):
+            _, _clr_col, _ = st.columns([8, 2, 8])
+            with _clr_col:
+                if st.button("🗑 Clear logs", key="btn_clear_logs", use_container_width=True):
+                    for _k in ("_derive_exit", "_derive_summary", "_ohlc_exit",
+                               "_trades_exit", "_execute_exit", "_bt_exit"):
+                        st.session_state.pop(_k, None)
+                    for _lf in (_DERIVE_LOG, _OHLC_LOG, _EXECUTE_LOG, _BACKTEST_LOG,
+                                _here() / "log" / "update_trades.log"):
+                        try:
+                            if _lf.exists():
+                                _lf.write_text("", encoding="utf-8")
+                        except Exception:
+                            pass
+                    st.rerun()
+
         # OHLC status
         if _ohlc_running:
             _op, _ol = _ohlc_progress()
@@ -4885,7 +4948,7 @@ def render_actions() -> None:
         # Backtest status / results (render_actions' 5 s timer drives the refresh)
         _render_bt_status()
 
-        # ── Advanced: Clear Data (optional fresh-start) ──────────────────────
+        # ── Clear Data (last item — optional fresh-start) ────────────────────
         _CLEAR_PROTECTED = {"backtest_results.pkl", "backtest_ohlc.pkl", "symbol_overrides.json"}
 
         @st.dialog("⚠️ Confirm Clear Data", width="small")
@@ -4904,43 +4967,43 @@ def render_actions() -> None:
                 if st.button("❌ Cancel", width="stretch"):
                     st.rerun()
 
-        with st.expander("Advanced", expanded=False):
-            st.caption(
-                "Use **Clear Data** only for a fresh start (e.g. malformed chains). "
-                "Deletes derived pkl files. Keeps backtest results, REFINE overrides, "
-                "OHLC cache, and data/master/."
-            )
-            _clr_adv_col, _ = st.columns([2, 6])
-            with _clr_adv_col:
-                if st.button("🗑️ Clear Data", width="stretch", type="secondary",
-                             key="btn_clr_data_adv"):
-                    _files_to_clear = sorted(
-                        p.name for p in _DATA_DIR.iterdir()
-                        if p.is_file() and p.name not in _CLEAR_PROTECTED
-                    )
-                    if _files_to_clear:
-                        _confirm_clear(_files_to_clear)
-                    else:
-                        st.toast("No files to clear.")
+        st.divider()
+        st.caption(
+            "Use **Clear Data** only for a fresh start (e.g. malformed chains). "
+            "Deletes derived pkl files. Keeps backtest results, REFINE overrides, "
+            "OHLC cache, and data/master/."
+        )
+        _clr_adv_col, _ = st.columns([2, 6])
+        with _clr_adv_col:
+            if st.button("🗑️ Clear Data", width="stretch", type="secondary",
+                         key="btn_clr_data_adv"):
+                _files_to_clear = sorted(
+                    p.name for p in _DATA_DIR.iterdir()
+                    if p.is_file() and p.name not in _CLEAR_PROTECTED
+                )
+                if _files_to_clear:
+                    _confirm_clear(_files_to_clear)
+                else:
+                    st.toast("No files to clear.")
 
-            if st.session_state.get("_clear_confirmed"):
-                st.session_state.pop("_clear_confirmed", None)
-                _cleared, _locked = [], []
-                for _p in sorted(_DATA_DIR.iterdir()):
-                    if not _p.is_file() or _p.name in _CLEAR_PROTECTED:
-                        continue
-                    try:
-                        _p.unlink()
-                        _cleared.append(_p.name)
-                    except PermissionError:
-                        _locked.append(_p.name)
-                if _cleared:
-                    st.toast(f"Cleared {len(_cleared)} file(s): {', '.join(_cleared)}")
-                if _locked:
-                    st.toast(
-                        f"⚠️ {', '.join(_locked)} still in use — retry in a moment",
-                        icon="⚠️",
-                    )
+        if st.session_state.get("_clear_confirmed"):
+            st.session_state.pop("_clear_confirmed", None)
+            _cleared, _locked = [], []
+            for _p in sorted(_DATA_DIR.iterdir()):
+                if not _p.is_file() or _p.name in _CLEAR_PROTECTED:
+                    continue
+                try:
+                    _p.unlink()
+                    _cleared.append(_p.name)
+                except PermissionError:
+                    _locked.append(_p.name)
+            if _cleared:
+                st.toast(f"Cleared {len(_cleared)} file(s): {', '.join(_cleared)}")
+            if _locked:
+                st.toast(
+                    f"⚠️ {', '.join(_locked)} still in use — retry in a moment",
+                    icon="⚠️",
+                )
 
 
 # ---------------------------------------------------------------------------

@@ -234,6 +234,14 @@ if not df_unds.empty and "price" in df_unds.columns:
                     df_unds = df_unds.set_index("symbol")
                     df_unds.update(_snap.set_index("symbol")[_refresh_cols])
                     df_unds = df_unds.reset_index()
+                    # HV→IV fallback: IBKR may return HV (tick 104) but not IV (tick 106);
+                    # substitute HV for IV so these symbols are not dropped downstream.
+                    _iv_r = pd.to_numeric(df_unds.get("iv", pd.Series(dtype=float)), errors="coerce")
+                    _hv_r = pd.to_numeric(df_unds.get("hv", pd.Series(dtype=float)), errors="coerce")
+                    _use_hv_r = (~(_iv_r > 0)) & (_hv_r > 0)
+                    if _use_hv_r.any():
+                        df_unds.loc[_use_hv_r, "iv"] = _hv_r[_use_hv_r]
+                        logger.info("HV→IV fallback: %d symbols after price refresh", int(_use_hv_r.sum()))
                     logger.info(
                         "Price refresh: %d/%d symbols now have valid price+iv",
                         int((~_invalid_price_iv(df_unds)).sum()), len(df_unds),
@@ -608,6 +616,7 @@ else:
             "=== COVER DIAGNOSTIC: %d of %d processed positions have no cover order ===",
             len(_missing_cov), len(uncov_long) + len(uncov_short),
         )
+    _cov_reasons: dict[str, list[str]] = {}
     for _sym, _side, _row in sorted(_missing_cov, key=lambda x: x[0]):
         _sym_chains_dte = chains[
             (chains.symbol == _sym) & (chains.dte // 1).between(COVER_MIN_DTE, COVER_MIN_DTE + 7)
@@ -619,6 +628,7 @@ else:
                 _sym, _side, COVER_MIN_DTE, COVER_MIN_DTE + 7,
                 [f"{d:.0f}d" for d in _avail[:5]] or ["none in chains"],
             )
+            _cov_reasons.setdefault("no chain in DTE window", []).append(_sym)
             continue
         _und = getattr(_row, "price", float("nan"))
         _iv = getattr(_row, "iv", float("nan"))
@@ -644,24 +654,28 @@ else:
                 "NO COVER %s (%s): price or IV is NaN (und=%s, iv=%s) — cannot compute covPrice",
                 _sym, _side, _und, _iv,
             )
+            _cov_reasons.setdefault("price or IV missing", []).append(_sym)
         elif _side == "CALL" and _approx_cov > _max_k:
             logger.info(
                 "NO COVER %s (CALL): covPrice≈%.2f (avgCost=%.2f, vol_based=%.2f) > max strike %.2f"
                 " — cost basis above DTE %d–%d chain ceiling",
                 _sym, _approx_cov, _avg, _vol_price, _max_k, COVER_MIN_DTE, COVER_MIN_DTE + 7,
             )
+            _cov_reasons.setdefault("cost basis above chain ceiling", []).append(_sym)
         elif _side == "PUT" and _approx_cov < _min_k:
             logger.info(
                 "NO COVER %s (PUT): covPrice≈%.2f (avgCost=%.2f, vol_based=%.2f) < min strike %.2f"
                 " — cost basis below DTE %d–%d chain floor",
                 _sym, _approx_cov, _avg, _vol_price, _min_k, COVER_MIN_DTE, COVER_MIN_DTE + 7,
             )
+            _cov_reasons.setdefault("cost basis below chain floor", []).append(_sym)
         else:
             logger.info(
                 "NO COVER %s (%s): strikes %.2f–%.2f exist (covPrice≈%.2f)"
                 " — contract qualification or price fetch failed",
                 _sym, _side, _min_k, _max_k, _approx_cov,
             )
+            _cov_reasons.setdefault("qualification failed", []).append(_sym)
 
     try:
         _cov_n_estimated = _cc_estimated + _cp_estimated
@@ -782,6 +796,7 @@ logger.info("=== MAKE SOWING CONTRACTS FOR VIRGIN AND ORPHANED SYMBOLS ===")
 delete_pkl_files(["df_nkd.pkl"])
 
 _SOW_SKIP_PATH = ROOT / "data" / "sow_skip.json"
+_sow_reasons: dict[str, list[str]] = {}
 
 if not SOW_NAKEDS:
     logger.info("SOW_NAKEDS=False — skipping sow generation")
@@ -936,6 +951,20 @@ else:
     else:
         logger.info("No suitable put chains found for virgin/orphaned")
 
+    # --- Sow diagnostic ---
+    _sow_generated = set(df_nkd["symbol"]) if not df_nkd.empty else set()
+    _sow_chain_syms = set(_sow_sym_chains["symbol"]) if not _sow_sym_chains.empty else set()
+    _virg_short_syms = set(virg_short["symbol"]) if not virg_short.empty else set()
+    for _sym in sorted(df_v["symbol"]):
+        if _sym in _sow_generated:
+            continue
+        if _sym not in _sow_chain_syms:
+            _sow_reasons.setdefault("no weekly chain", []).append(_sym)
+        elif _sym not in _virg_short_syms:
+            _sow_reasons.setdefault("no puts below OTM threshold", []).append(_sym)
+        else:
+            _sow_reasons.setdefault("qualification or price fetch failed", []).append(_sym)
+
 # %% MAKE REAPS
 logger.info("=== MAKE REAPS ===")
 
@@ -1004,22 +1033,26 @@ else:
         "=== REAP DIAGNOSTIC: %d sowed options, %d being reaped, %d not ===",
         len(_sow_candidates), len(_reaped_keys), len(_sow_candidates) - len(_reaped_keys),
     )
+    _reap_reasons: dict[str, list[str]] = {}
     for _, _opt in _sow_candidates.iterrows():
         _key = (_opt.symbol, _opt.right, _opt.strike)
         if _key in _reaped_keys:
             continue
         _dte_val = get_dte(_opt.expiry)
         _label = f"{_opt.symbol} {_opt.right}@{_opt.strike:.0f} exp {_opt.expiry} DTE={_dte_val}"
+        _short_label = f"{_opt.symbol} {_opt.right}@{_opt.strike:.0f}"
         if _key in _oo_reaping:
             logger.info(
                 "NOT REAPED %s: active reaping BUY order already submitted",
                 _label,
             )
+            # Has an active open order — not truly uncreated; exclude from summary
         elif _dte_val <= MINREAPDTE:
             logger.info(
                 "NOT REAPED %s: DTE=%d ≤ MINREAPDTE=%d — let expire worthless",
                 _label, _dte_val, MINREAPDTE,
             )
+            _reap_reasons.setdefault(f"DTE ≤ {MINREAPDTE} (let expire)", []).append(_short_label)
         else:
             _unds_rows = df_unds.loc[df_unds.symbol == _opt.symbol, "state"]
             _st = _unds_rows.iloc[0] if not _unds_rows.empty else "unknown"
@@ -1030,11 +1063,13 @@ else:
                     "active sowing/reaping/covering order (zen)" if _st == "zen"
                     else f"in wheel stock cycle ({_st})",
                 )
+                _reap_reasons.setdefault("in wheel cycle / zen", []).append(_short_label)
             else:
                 logger.info(
                     "NOT REAPED %s: was 'unreaped' but qualification or price fetch failed",
                     _label,
                 )
+                _reap_reasons.setdefault("qualification failed", []).append(_short_label)
 
 # %% EXTRACT ORPHANED CONTRACTS FROM df_pf
 logger.info("=== EXTRACT ORPHANED CONTRACTS FROM df_pf ===")
@@ -1455,6 +1490,28 @@ else:
             logger.info("No valid contracts after qualification")
     else:
         logger.info("No suitable put chains found for protecting rolls")
+
+# %% UNCREATED ORDERS SUMMARY
+_uncreated: dict = {}
+if _missing_cov and _cov_reasons:
+    _r = "; ".join(
+        f"{k}: {', '.join(sorted(set(v)))}" for k, v in _cov_reasons.items() if v
+    )
+    logger.info("Symbols without Covered Calls due to — %s", _r)
+    _uncreated["cover"] = {k: sorted(set(v)) for k, v in _cov_reasons.items() if v}
+if _sow_reasons:
+    _r = "; ".join(
+        f"{k}: {', '.join(sorted(set(v)))}" for k, v in _sow_reasons.items() if v
+    )
+    logger.info("Symbols without Sow Orders due to — %s", _r)
+    _uncreated["sow"] = {k: sorted(set(v)) for k, v in _sow_reasons.items() if v}
+if _reap_reasons:
+    _r = "; ".join(f"{k}: {', '.join(v)}" for k, v in _reap_reasons.items() if v)
+    logger.info("Symbols without Reap Orders due to — %s", _r)
+    _uncreated["reap"] = {k: list(v) for k, v in _reap_reasons.items() if v}
+(ROOT / "data" / "derive_uncreated.json").write_text(
+    json.dumps(_uncreated), encoding="utf-8"
+)
 
 # %% FINAL OUTPUT
 end_time = time.time()

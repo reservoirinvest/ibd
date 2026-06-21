@@ -267,7 +267,6 @@ async def _fetch_yf_all(
                 ib_sym, df = await _fetch_one_yf(spec, start, end)
             if df is not None:
                 results[ib_sym] = df
-            pbar.set_postfix_str(spec["symbol"], refresh=False)
             pbar.update(1)
 
         await asyncio.gather(*[_bounded(s) for s in specs])
@@ -374,7 +373,6 @@ async def _fetch_ib_all(
                     df = df[df.index.date >= start]
                     if not df.empty:
                         results[sym] = df
-                pbar.set_postfix_str(sym, refresh=False)
                 pbar.update(1)
 
             await asyncio.gather(*[_bounded(s) for s in specs])

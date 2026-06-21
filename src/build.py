@@ -1273,6 +1273,7 @@ def write_build_summary(
     df_chains: pd.DataFrame,
     df_unds: pd.DataFrame,
     path: Path = BUILD_SUMMARY_PATH,
+    hv_fallback_syms: list[str] | None = None,
 ) -> dict:
     """Compute per-stage coverage, emit clear next-step guidance, and persist a
     machine-readable summary the dashboard can surface.
@@ -1326,6 +1327,19 @@ def write_build_summary(
 
     if missing_iv_syms:
         summary["missing_iv_symbols"] = missing_iv_syms[:50]  # cap list size
+
+    if hv_fallback_syms:
+        summary["hv_fallback"] = {
+            "count": len(hv_fallback_syms),
+            "symbols": hv_fallback_syms,
+        }
+        hv_note = (
+            f"HV used as IV fallback for {len(hv_fallback_syms)} symbols "
+            "(market closed / IV unavailable) — re-run during market hours for live IV."
+        )
+        summary["warnings"].append(hv_note)
+        summary["next_steps"].append(hv_note)
+        logger.info("build_summary: HV fallback recorded for %d symbols", len(hv_fallback_syms))
 
     try:
         path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -1401,6 +1415,49 @@ def chains_n_unds(msg: bool = False):
     # pyrefly: ignore [bad-argument-type]
     df_unds = get_volatilities_snapshot(qualified_contracts, market="SNP", batch_size=50)
 
+    # OHLC-HV fallback: compute 30-day realized vol from price history for symbols
+    # where IBKR didn't return HV (tick 104 is also absent outside market hours).
+    # This fills df_unds["hv"] so the HV→IV block below can substitute it for iv.
+    _ohlc_path = ROOT / "data" / "master" / "ohlc.pkl"
+    if not df_unds.empty and "symbol" in df_unds.columns and _ohlc_path.exists():
+        try:
+            _ohlc_data: dict = pd.read_pickle(_ohlc_path)
+            _hv_from_ohlc: dict[str, float] = {}
+            for _sym, _sym_df in _ohlc_data.items():
+                if "Close" in _sym_df.columns:
+                    _closes = _sym_df["Close"].dropna()
+                    if len(_closes) >= 31:
+                        _hv30 = _closes.pct_change().rolling(30).std().iloc[-1] * (252 ** 0.5)
+                        if pd.notna(_hv30) and _hv30 > 0:
+                            _hv_from_ohlc[_sym] = float(_hv30)
+            if _hv_from_ohlc:
+                _hv_num_pre = pd.to_numeric(df_unds.get("hv", pd.Series(dtype=float)), errors="coerce")
+                _ohlc_hv_full = df_unds["symbol"].map(_hv_from_ohlc)
+                _fill_hv_mask = (~(_hv_num_pre > 0)) & _ohlc_hv_full.notna()
+                if _fill_hv_mask.any():
+                    df_unds.loc[_fill_hv_mask, "hv"] = _ohlc_hv_full[_fill_hv_mask]
+                    logger.info(
+                        "OHLC-HV: filled 30-day realized vol for %d symbols (IBKR HV unavailable)",
+                        int(_fill_hv_mask.sum()),
+                    )
+        except Exception as _ohlc_exc:
+            logger.warning("OHLC-HV computation failed: %s", _ohlc_exc)
+
+    # HV fallback: where IV is unavailable (off-hours), substitute HV so derive.py
+    # can still generate orders instead of skipping every symbol.
+    _hv_fallback_syms: list[str] = []
+    if not df_unds.empty and "symbol" in df_unds.columns:
+        _iv_num = pd.to_numeric(df_unds.get("iv", pd.Series(dtype=float)), errors="coerce")
+        _hv_num = pd.to_numeric(df_unds.get("hv", pd.Series(dtype=float)), errors="coerce")
+        _use_hv_mask = (~(_iv_num > 0)) & (_hv_num > 0)
+        if _use_hv_mask.any():
+            _hv_fallback_syms = sorted(df_unds.loc[_use_hv_mask, "symbol"].astype(str).tolist())
+            df_unds.loc[_use_hv_mask, "iv"] = _hv_num[_use_hv_mask]
+            logger.info(
+                "HV fallback: substituted HV for IV on %d symbols (market closed / IV unavailable)",
+                len(_hv_fallback_syms),
+            )
+
     # Load configuration to get VIRGIN_DTE
     config = load_config('SNP')
     virgin_dte = float(config.get('VIRGIN_DTE', 30))  # Default to 30 if not specified
@@ -1423,7 +1480,7 @@ def chains_n_unds(msg: bool = False):
     pickle_me(df_unds, file_path=ROOT / 'data' / 'df_unds.pkl')
 
     # Per-stage coverage + machine-readable summary + next-step guidance.
-    write_build_summary(_n_syms, df_chains, df_unds)
+    write_build_summary(_n_syms, df_chains, df_unds, hv_fallback_syms=_hv_fallback_syms)
 
     return df_chains, df_unds
 

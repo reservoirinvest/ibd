@@ -6,7 +6,7 @@ Single-file Streamlit app (`app.py`, ~4700 lines) + `src/` modules. **Single lin
 
 **Master sections** (`_master_section(title, key, default)`, bottom of `app.py`): Streamlit forbids expander-in-expander, so each master is a **button-toggled banner** (session_state `_master_<key>`, full `st.rerun()` on click) that conditionally renders its sub-expanders. Styled via CSS class `.st-key-btn_master_*` (clay banner). When a master is collapsed its inner fragment isn't called (timer pauses); the `_SuppressFragmentMissing` log filter swallows the resulting "fragment does not exist" warnings.
 
-**REFINE Overrides** (`render_refine_overrides`, no longer a fragment) is called **inside `render_orders` directly under the Sow expander**. Its base table is sorted by **Override σ descending** (objective: push overrides higher). Controls row = Select All | "Change all overrides to:" + number_input (default 2.00) + ↵ button (sets every Override σ) | Clear All.
+**REFINE Overrides** (`render_refine_overrides`, no longer a fragment) is called **inside `render_orders` directly under the Sow expander**. Its base table is sorted by **Override σ descending** (objective: push overrides higher). Controls row = Select All | "Change all overrides to:" + number_input (default 2.00) + ↵ button (sets every Override σ) | Clear All. Always renders an expander — when `backtest_results.pkl` is missing it shows an info message rather than being invisible.
 
 The **single global filter bar** (`render_filter_bar` / `apply_global_filter`, session_state keys `flt_symbol`/`flt_right`/`flt_state`/`flt_itm`) drives every panel: Positions, Open Orders, Cover/Sow/Reap/Protect tables, Gaps, Trade Analysis, Deep-Dive. Order tables are shown/hidden by state via `_order_table_visible`.
 
@@ -17,7 +17,7 @@ src/
   dashboard/            # Shared UI: ib_client.py, settings.py, state.py, risk.py, ohlc.py, formatting.py, llm_query.py, progress.py (rich)
   flex/                 # Flex report pipeline: fetch.py (download/merge), parse.py (normalize), analyze.py (symbol perf)
   backtest/             # Backtest scoring: score.py
-  build.py              # Fetch qualified contracts + option chains from IBKR
+  build.py              # Fetch qualified contracts + option chains + volatilities from IBKR; writes build_summary.json
   derive.py             # Generate sow / cover / reap / protect orders
   execute.py            # Submit orders to IBKR via ib_async
   analyze.py            # Portfolio analysis (called from dashboard)
@@ -99,6 +99,7 @@ Always **merge, never replace** pickles — use `merge_cash_into_pickle` / `merg
 
 ## Business rules
 
+- **build.py IV/HV fallback** (`chains_n_unds`): after `get_volatilities_snapshot()`, applies a three-tier fallback for missing IV: (1) IBKR HV (tick 104) from the same snapshot; (2) 30-day realized vol computed from `data/master/ohlc.pkl` closes — always available offline. Both paths copy into the `iv` column so `_invalid_price_iv()` in `derive.py` passes. Fallback symbols are recorded in `build_summary.json` under `hv_fallback.{count, symbols}` and shown in Cover/Sow/Reap expander headings as `(used hv for N symbols)`. **derive.py** applies the same HV→IV step after its own IBKR refresh as a safety net.
 - **derive.py**: open IB connection **after** `classified_results()`. Never `ib = None` at the top of a function body.
 - **derive.py**: exclude symbols with active covering/sowing/protecting open orders (open_order_guard) — prevents duplicate orders for manual IBKR entries.
 - **US account sow**: weekly S&P 500 only (skip 3rd-Friday expiry). SG account is exempt (LSE, no options).
