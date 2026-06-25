@@ -20,6 +20,7 @@ src/
   build.py              # Fetch qualified contracts + option chains + volatilities from IBKR; writes build_summary.json
   derive.py             # Generate sow / cover / reap / protect orders
   execute.py            # Submit orders to IBKR via ib_async
+  cancel.py             # Cancel orders: --mode sells (open SELL OPT) or --mode all (reqGlobalCancel)
   analyze.py            # Portfolio analysis (called from dashboard)
   fetch_ohlc.py         # OHLC history — yfinance primary, IBKR fallback
 config/snp_config.yml   # PORT, CID, MINCUSHION, MAX_DTE, strategy params
@@ -34,6 +35,8 @@ uv run ibd                          # start dashboard
 uv run python src/build.py          # fetch contracts + chains
 uv run python src/derive.py         # generate orders
 uv run python src/execute.py        # submit orders
+uv run python src/cancel.py --mode sells   # cancel open SELL option orders
+uv run python src/cancel.py --mode all     # cancel ALL open orders (reqGlobalCancel)
 uv run python scripts/update_trades.py          # refresh flex pickles
 uv run python scripts/update_trades.py --xml-only   # rebuild from local XMLs only
 ```
@@ -175,7 +178,9 @@ Built in `build_llm_context()` near bottom of `app.py`. Keys include: live posit
 | `render_orders` | no timer (content-only) |
 | `render_analysis` | no timer |
 
-`render_actions` owns the whole action subprocess + freeze state machine (derive / execute / ohlc / backtest / trades). `render_orders` and `render_analysis` are now content-only. `_nav_time` (clock) was removed with the tabbed nav.
+`render_actions` owns the whole action subprocess + freeze state machine (derive / execute / cancel / ohlc / backtest / trades). `render_orders` and `render_analysis` are now content-only. `_nav_time` (clock) was removed with the tabbed nav.
+
+**Actions pipeline buttons** (left to right): Generate OHLCs → Refresh Flex → Run Backtest → Generate Orders → Execute Orders. Below the pipeline row: **🚫 Cancel Sell Orders** / **🛑 Cancel All Orders** — both freeze/unfreeze the dashboard via `cancel.py --mode sells|all`. Session state keys: `cancel_proc`, `frozen_for="cancel"`, `_cancel_exit`, `_cancel_mode`. Log: `log/cancel.log`.
 
 ## Progress bars
 

@@ -234,6 +234,7 @@ _CFG_PATH    = _here() / "config" / "snp_config.yml"
 _DERIVE_LOG    = _here() / "log" / "derive_progress.log"
 _OHLC_LOG      = _here() / "log" / "ohlc_progress.log"
 _EXECUTE_LOG   = _here() / "log" / "execute.log"
+_CANCEL_LOG    = _here() / "log" / "cancel.log"
 _DASHBOARD_LOG = _here() / "log" / "dashboard.log"
 _BACKTEST_LOG  = _here() / "log" / "backtest.log"
 
@@ -345,7 +346,7 @@ _CFG_KEYS: list[tuple[str, str, type, object]] = [
     ("cfg_cover_std_mult",   "COVER_STD_MULT",        float, 0.65),
     ("cfg_covxpmult",        "COVXPMULT",             float, 1.2),
     ("cfg_cov_aged_dte",     "COV_AGED_DTE",          int,   180),
-    ("cfg_sow_nakeds",       "SOW_NAKEDS",            bool,  True),
+    ("cfg_sow_nakeds",       "SOW_NAKEDS",            bool,  False),
     ("cfg_virgin_dte",       "VIRGIN_DTE",            int,   5),
     ("cfg_virgin_call_std",  "VIRGIN_CALL_STD_MULT",  float, 3.8),
     ("cfg_virgin_put_std",   "VIRGIN_PUT_STD_MULT",   float, 1.2),
@@ -4562,11 +4563,11 @@ def render_actions() -> None:
         settings.token.get_secret_value() and settings.trades_flexid.get_secret_value()
     )
 
-    # ── derive / execute subprocess + freeze state ───────────────────────────
+    # ── derive / execute / cancel subprocess + freeze state ─────────────────
     proc: subprocess.Popen | None      = st.session_state.get("derive_proc")
     exec_proc: subprocess.Popen | None = st.session_state.get("execute_proc")
     frozen     = client.is_frozen()
-    frozen_for = st.session_state.get("frozen_for", "")   # "derive" | "execute" | ""
+    frozen_for = st.session_state.get("frozen_for", "")   # "derive" | "execute" | "cancel" | ""
 
     def _auto_unfreeze(tag: str, proc_key: str) -> None:
         proc_ = st.session_state.get(proc_key)
@@ -4579,6 +4580,7 @@ def render_actions() -> None:
 
     _auto_unfreeze("derive",  "derive_proc")
     _auto_unfreeze("execute", "execute_proc")
+    _auto_unfreeze("cancel",  "cancel_proc")
 
     # Fallback: derive.py logged COMPLETE but hasn't exited in 60s → kill it.
     if frozen and frozen_for == "derive" and proc is not None and proc.poll() is None:
@@ -4841,9 +4843,78 @@ def render_actions() -> None:
                 st.session_state["execute_proc"] = exec_new_proc
                 logger.info("execute.py started pid={}", exec_new_proc.pid)
 
+        # ── Cancel Orders row ────────────────────────────────────────────────
+        @st.dialog("⚠️ Confirm Cancel Sell Orders", width="small")
+        def _confirm_cancel_sells():
+            st.markdown(
+                "This will cancel all open **SELL option** orders. "
+                "BUY orders and stock positions are unaffected. Are you sure?"
+            )
+            _cs1, _cs2 = st.columns(2)
+            with _cs1:
+                if st.button("🚫 Cancel Sells", width="stretch"):
+                    st.session_state["_cancel_confirmed"] = True
+                    st.session_state["_cancel_mode"] = "sells"
+                    st.rerun()
+            with _cs2:
+                if st.button("❌ Back", width="stretch"):
+                    st.rerun()
+
+        @st.dialog("⚠️ Confirm Cancel ALL Orders", width="small")
+        def _confirm_cancel_all():
+            st.markdown(
+                "This will call **reqGlobalCancel** and cancel **ALL** open orders. "
+                "Are you sure?"
+            )
+            _ca1, _ca2 = st.columns(2)
+            with _ca1:
+                if st.button("🛑 Cancel All", width="stretch"):
+                    st.session_state["_cancel_confirmed"] = True
+                    st.session_state["_cancel_mode"] = "all"
+                    st.rerun()
+            with _ca2:
+                if st.button("❌ Back", width="stretch"):
+                    st.rerun()
+
+        _ccol1, _ccol2, _ccol_spacer = st.columns([3, 3, 10])
+        with _ccol1:
+            if st.button(
+                "🚫 Cancel Sell Orders",
+                type="primary" if (frozen and frozen_for == "cancel"
+                                   and st.session_state.get("_cancel_mode") == "sells") else "secondary",
+                width="stretch",
+                help="Cancel all open SELL option orders. BUY orders are unaffected.",
+            ) and not frozen:
+                _confirm_cancel_sells()
+        with _ccol2:
+            if st.button(
+                "🛑 Cancel All Orders",
+                type="primary" if (frozen and frozen_for == "cancel"
+                                   and st.session_state.get("_cancel_mode") == "all") else "secondary",
+                width="stretch",
+                help="Send reqGlobalCancel — cancels ALL open orders.",
+            ) and not frozen:
+                _confirm_cancel_all()
+
+        if st.session_state.get("_cancel_confirmed"):
+            _cmode = st.session_state.pop("_cancel_mode", "sells")
+            st.session_state.pop("_cancel_confirmed", None)
+            _CANCEL_LOG.parent.mkdir(parents=True, exist_ok=True)
+            _cancel_log_fh = open(_CANCEL_LOG, "w", encoding="utf-8")  # noqa: SIM115
+            st.session_state.pop("_cancel_exit", None)
+            st.session_state["_cancel_mode"] = _cmode
+            st.session_state["frozen_for"] = "cancel"
+            client.freeze()
+            cancel_new_proc = subprocess.Popen(
+                [sys.executable, str(_here() / "src" / "cancel.py"), "--mode", _cmode],
+                stdout=_cancel_log_fh, stderr=subprocess.STDOUT, env=_sub_env(),
+            )
+            st.session_state["cancel_proc"] = cancel_new_proc
+            logger.info("cancel.py started pid={} mode={}", cancel_new_proc.pid, _cmode)
+
         # ── Status + logs (full width, below the pipeline row) ───────────────
-        if frozen or "_derive_exit" in st.session_state or "_execute_exit" in st.session_state:
-            gen_status_col, exec_status_col, _st_spacer = st.columns([2.5, 2.5, 5])
+        if frozen or "_derive_exit" in st.session_state or "_execute_exit" in st.session_state or "_cancel_exit" in st.session_state:
+            gen_status_col, exec_status_col, cancel_status_col, _st_spacer = st.columns([2.5, 2.5, 2.5, 2.5])
             with gen_status_col:
                 if frozen and frozen_for == "derive":
                     _pct, phase, _ = _derive_progress()
@@ -4878,6 +4949,16 @@ def render_actions() -> None:
                         st.success("✅ Orders executed")
                     else:
                         st.error(f"❌ Order execution failed (exit {rc})")
+            with cancel_status_col:
+                if frozen and frozen_for == "cancel":
+                    _cmode_lbl = st.session_state.get("_cancel_mode", "")
+                    st.progress(0.5, text=f"⏳ Cancelling {'sell' if _cmode_lbl == 'sells' else 'all'} orders…")
+                elif "_cancel_exit" in st.session_state:
+                    rc = st.session_state["_cancel_exit"]
+                    if rc == 0:
+                        st.success("✅ Cancel completed")
+                    else:
+                        st.error(f"❌ Cancel failed (exit {rc})")
 
         if frozen and frozen_for == "execute":
             _exec_log = _here() / "log" / "execute.log"
@@ -4886,6 +4967,14 @@ def render_actions() -> None:
                     _exec_live = _exec_log.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]
                     if _exec_live:
                         st.code("\n".join(_exec_live), language=None)
+                except Exception:
+                    pass
+        elif frozen and frozen_for == "cancel":
+            if _CANCEL_LOG.exists():
+                try:
+                    _cancel_live = _CANCEL_LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
+                    if _cancel_live:
+                        st.code("\n".join(_cancel_live), language=None)
                 except Exception:
                     pass
         elif frozen:
@@ -4900,16 +4989,21 @@ def render_actions() -> None:
             rc = st.session_state["_execute_exit"]
             _render_log_expander("📋 execute.py log", _EXECUTE_LOG, expanded=rc != 0)
 
+        if "_cancel_exit" in st.session_state:
+            rc = st.session_state["_cancel_exit"]
+            _render_log_expander("📋 cancel.py log", _CANCEL_LOG, expanded=rc != 0)
+
         if any(k in st.session_state for k in (
-            "_derive_exit", "_ohlc_exit", "_trades_exit", "_execute_exit", "_bt_exit"
+            "_derive_exit", "_ohlc_exit", "_trades_exit", "_execute_exit", "_bt_exit", "_cancel_exit"
         )):
             _, _clr_col, _ = st.columns([8, 2, 8])
             with _clr_col:
                 if st.button("🗑 Clear logs", key="btn_clear_logs", use_container_width=True):
                     for _k in ("_derive_exit", "_derive_summary", "_ohlc_exit",
-                               "_trades_exit", "_execute_exit", "_bt_exit"):
+                               "_trades_exit", "_execute_exit", "_bt_exit", "_cancel_exit"):
                         st.session_state.pop(_k, None)
-                    for _lf in (_DERIVE_LOG, _OHLC_LOG, _EXECUTE_LOG, _BACKTEST_LOG,
+                    st.session_state.pop("_cancel_mode", None)
+                    for _lf in (_DERIVE_LOG, _OHLC_LOG, _EXECUTE_LOG, _CANCEL_LOG, _BACKTEST_LOG,
                                 _here() / "log" / "update_trades.log"):
                         try:
                             if _lf.exists():
