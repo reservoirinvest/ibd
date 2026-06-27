@@ -267,9 +267,10 @@ if len(_REAL_ACCOUNTS) > 1:
     _ACCOUNT_OPTIONS["ALL"] = ""        # ALL only makes sense with 2+ accounts
 _ACCOUNT_OPTIONS.update(_REAL_ACCOUNTS)
 
-# Default: first real account, or ALL if none configured
+# Default: ALL when both accounts configured, else first real account
 if "acct_sel" not in st.session_state:
-    st.session_state["acct_sel"] = next(iter(_REAL_ACCOUNTS), "ALL")
+    default = "ALL" if len(_REAL_ACCOUNTS) > 1 else next(iter(_REAL_ACCOUNTS), "ALL")
+    st.session_state["acct_sel"] = default
 
 
 def _selected_account() -> str:
@@ -904,6 +905,20 @@ def kpi_strip() -> None:
     buy_pow    = float(av.get("BuyingPower",         _D("0")) or 0)
     leverage_s = float(av.get("Leverage-S",          _D("0")) or 0)
 
+    # Warm-start NLV from flex_nav.pkl while IBKR account values are still streaming.
+    # Mirrors the Performance Dashboard pattern: show last known NAV instantly, switch
+    # to live NLV once account_values arrives (indicated by ~ prefix while cached).
+    _display_nlv = k["nlv"]
+    _nlv_cached = False
+    if _display_nlv == 0 and not snap.account_values:
+        try:
+            _df_nav = pd.read_pickle(_MASTER_DIR / "flex_nav.pkl")
+            if not _df_nav.empty and "total" in _df_nav.columns:
+                _display_nlv = float(_df_nav["total"].iloc[-1])
+                _nlv_cached = True
+        except Exception:
+            pass
+
     # Drop withstand — goes into row 1 col 3 (in line with NLV)
     if snap.account_values and not snap.positions.empty:
         delta_sel = g["delta_$"]
@@ -976,7 +991,7 @@ def kpi_strip() -> None:
 
     # Row 1: NLV | Stock Value | Opt Value | Cash
     row1 = [
-        _cell(_lbl("NLV", "Net Liquidation Value: total portfolio value including cash, stocks and options at current market prices."), money(k["nlv"])),
+        _cell(_lbl("NLV", "Net Liquidation Value: total portfolio value including cash, stocks and options at current market prices."), ("~" + money(_display_nlv)) if _nlv_cached else money(_display_nlv)),
         _cell(_lbl("Stock Value", "Total market value of all stock positions at current prices (StockMarketValue)."), money(stock_val)),
         _cell(_lbl("Opt Value", "Option Market Value: total mark-to-market value of all option positions."), money(opt_val)),
         _cell(_lbl("Cash", "Total cash balance across all currencies (TotalCashBalance)."), money(cash_val)),
@@ -3679,17 +3694,6 @@ def _render_perf_chart(
                 hovertemplate="%{text}  $%{customdata:,.0f}<extra>Consolidated</extra>",
             ))
 
-        if not opt_index.empty:
-            _opt_equiv = _opt_display.reindex(opt_index.index, method="ffill").values
-            _opt_text  = [f"{v:+.2f}%" for v in opt_index.values]
-            fig.add_trace(go.Scatter(
-                x=opt_index.index, y=opt_index.values,
-                customdata=_opt_equiv, text=_opt_text,
-                name="OPT P&L", yaxis="y2",
-                line=dict(color="#60a5fa", width=1.5, dash="dash" if _have_nav else "solid"),
-                hovertemplate="%{text}  $%{customdata:,.0f}<extra>OPT P&L</extra>",
-            ))
-
         if not spy_index.empty:
             spy_equiv = ((spy_index / 100.0 + 1.0) * starting_capital).values
             _spy_text = [f"{v:+.2f}%" for v in spy_index.values]
@@ -3709,6 +3713,17 @@ def _render_perf_chart(
                 name="QQQ", yaxis="y2",
                 line=dict(color="#fbbf24", width=1.5, dash="dot"),
                 hovertemplate="%{text}  $%{customdata:,.0f}<extra>QQQ</extra>",
+            ))
+
+        if not opt_index.empty:
+            _opt_equiv = _opt_display.reindex(opt_index.index, method="ffill").values
+            _opt_text  = [f"{v:+.2f}%" for v in opt_index.values]
+            fig.add_trace(go.Scatter(
+                x=opt_index.index, y=opt_index.values,
+                customdata=_opt_equiv, text=_opt_text,
+                name="OPT P&L", yaxis="y2",
+                line=dict(color="#60a5fa", width=1.5, dash="dash" if _have_nav else "solid"),
+                hovertemplate="%{text}  $%{customdata:,.0f}<extra>OPT P&L</extra>",
             ))
 
         # Cash markers on secondary % axis (at 0%) — full history so they show when zoomed out
