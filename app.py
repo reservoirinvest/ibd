@@ -1264,7 +1264,7 @@ def render_orders() -> None:
     import json as _sow_json  # noqa: PLC0415
     from src.backtest.score import score_from_trades as _sft  # noqa: PLC0415
     from src.backtest.synthetic import BACKTEST_RESULTS_PATH as _BT_RES  # noqa: PLC0415
-    _deploy_only = st.session_state.get("ord_sow_deploy_only", True)
+    _deploy_only = st.session_state.get("ord_sow_deploy_only", False)
     _df_nkd_disp = df_nkd.copy()
     _syn_deploy_syms: set[str] = set()
     _trade_deploy_syms: set[str] = set()
@@ -1302,7 +1302,7 @@ def render_orders() -> None:
     )
     with st.expander(nkd_label, expanded=n_nkd > 0):
         _deploy_syms_all = _syn_deploy_syms | _trade_deploy_syms
-        if st.session_state.get("ord_sow_deploy_only", True):
+        if st.session_state.get("ord_sow_deploy_only", False):
             if _deploy_syms_all or _refine_override_syms:
                 st.caption(
                     f"Filter: {len(_syn_deploy_syms)} syn-DEPLOY"
@@ -4807,7 +4807,7 @@ def render_actions() -> None:
                 logger.info("derive.py started pid={}", new_proc.pid)
                 st.rerun()
             st.checkbox(
-                "Sow: DEPLOY only", key="ord_sow_deploy_only", value=True,
+                "Sow: DEPLOY only", key="ord_sow_deploy_only", value=False,
                 help="When ON, Sow shows symbols rated DEPLOY in synthetic backtest OR trade "
                      "history, plus REFINE symbols with active overrides.",
             )
@@ -4891,7 +4891,19 @@ def render_actions() -> None:
                 if st.button("❌ Back", width="stretch"):
                     st.rerun()
 
-        _ccol1, _ccol2, _ccol_spacer = st.columns([3, 3, 10])
+        @st.dialog("⏻ Shutdown IB Monitor?", width="small")
+        def _confirm_shutdown():
+            st.markdown("Disconnect from IBKR and stop the dashboard server?")
+            _sd1, _sd2 = st.columns(2)
+            with _sd1:
+                if st.button("⏻ Shutdown", width="stretch", type="primary"):
+                    st.session_state["_shutdown_confirmed"] = True
+                    st.rerun()
+            with _sd2:
+                if st.button("❌ Back", width="stretch"):
+                    st.rerun()
+
+        _ccol1, _ccol2, _ccol_spacer, _ccol_sd = st.columns([3, 3, 7, 3])
         with _ccol1:
             if st.button(
                 "🚫 Cancel Sell Orders",
@@ -4910,6 +4922,17 @@ def render_actions() -> None:
                 help="Send reqGlobalCancel — cancels ALL open orders.",
             ) and not frozen:
                 _confirm_cancel_all()
+        with _ccol_sd:
+            if st.button(
+                "⏻ Shutdown",
+                width="stretch",
+                help="Disconnect from IBKR and stop the server.",
+            ) and not frozen:
+                _confirm_shutdown()
+
+        if st.session_state.pop("_shutdown_confirmed", None):
+            client.stop()
+            os._exit(0)
 
         if st.session_state.get("_cancel_confirmed"):
             _cmode = st.session_state.pop("_cancel_mode", "sells")
