@@ -709,10 +709,11 @@ def _derive_progress() -> tuple[float, str, list[str]]:
     return pct / 100.0, label, tail
 
 
-_TQDM_BAR_RE  = re.compile(r"^(.+?):\s+\d+%\|")
-_TQDM_PCT_RE  = re.compile(r":\s+(\d+)%\|")
-_RICH_PROG_RE = re.compile(r"^(.+?)\s+[━─\-]{3,}\s+(\d+)%")
-_ANSI_RE     = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
+_TQDM_BAR_RE      = re.compile(r"^(.+?):\s+\d+%\|")
+_TQDM_PCT_RE      = re.compile(r":\s+(\d+)%\|")
+_RICH_PROG_RE     = re.compile(r"^(.+?)\s+[━─\-]{3,}\s+(\d+)%")
+_BACKTEST_PROG_RE = re.compile(r"\|\s+(Backtest):\s+\d+/\d+")
+_ANSI_RE          = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
 
 
 def _strip_ansi(text: str) -> str:
@@ -737,7 +738,9 @@ def _log_lines(log_path: Path, n: int = 35) -> list[str]:
     bar_slot: dict[str, int] = {}
     out: list[str] = []
     for line in raw:
-        m = _TQDM_BAR_RE.match(line)
+        m = (_TQDM_BAR_RE.match(line)
+             or _RICH_PROG_RE.match(_strip_ansi(line))
+             or _BACKTEST_PROG_RE.search(line))
         if m:
             key = m.group(1).strip()
             if key in bar_slot:
@@ -803,12 +806,21 @@ def _ohlc_progress() -> tuple[float, str]:
     return max(last_pct, 0.01), last_label or "Fetching OHLCs…"
 
 
-def _render_log_expander(label: str, log_path: Path, *, expanded: bool = False) -> None:
-    """Render a collapsible st.expander containing the full text of *log_path*."""
+def _render_log_expander(
+    label: str, log_path: Path, *, expanded: bool = False, lines_fn=None
+) -> None:
+    """Render a collapsible st.expander containing the full text of *log_path*.
+
+    Pass *lines_fn* (a zero-arg callable returning list[str]) to display
+    pre-processed / deduplicated lines instead of the raw file content.
+    """
     with st.expander(label, expanded=expanded):
         if log_path.exists():
             try:
-                st.code(log_path.read_text(encoding="utf-8", errors="replace"), language=None)
+                if lines_fn is not None:
+                    st.code("\n".join(lines_fn()), language=None)
+                else:
+                    st.code(log_path.read_text(encoding="utf-8", errors="replace"), language=None)
             except Exception as e:
                 st.warning(f"Could not read log: {e}")
 
@@ -906,11 +918,20 @@ def kpi_strip() -> None:
     leverage_s = float(av.get("Leverage-S",          _D("0")) or 0)
 
     # Warm-start NLV from flex_nav.pkl while IBKR account values are still streaming.
-    # Mirrors the Performance Dashboard pattern: show last known NAV instantly, switch
-    # to live NLV once account_values arrives (indicated by ~ prefix while cached).
+    # Shows ~$X,XXX,XXX (tilde prefix) until all configured accounts have streamed their
+    # values — prevents showing a partial US-only sum before SG data arrives in ALL mode.
+    _expected_accts = [a for a in (_US, _SG) if a]
+    _streaming = set(snap.account_values.keys())
+    if acct:
+        _all_accounts_ready = acct in _streaming
+    else:
+        _all_accounts_ready = not _expected_accts or _streaming.issuperset(_expected_accts)
     _display_nlv = k["nlv"]
     _nlv_cached = False
-    if _display_nlv == 0 and not snap.account_values:
+    if _all_accounts_ready and _display_nlv > 0:
+        global _LIVE_NAV_TODAY
+        _LIVE_NAV_TODAY = {"date": pd.Timestamp.today().normalize(), "nlv": _display_nlv}
+    else:
         try:
             _df_nav = pd.read_pickle(_MASTER_DIR / "flex_nav.pkl")
             if not _df_nav.empty and "total" in _df_nav.columns:
@@ -1981,12 +2002,12 @@ def _render_bt_status() -> None:
 
     if _running:
         st.info("⏳ Backtest running… (first run may take ~5 min to fetch OHLC)")
-        _render_log_expander("📋 Backtest log", _BACKTEST_LOG, expanded=True)
+        _render_log_expander("📋 Backtest log", _BACKTEST_LOG, expanded=True, lines_fn=lambda: _log_lines(_BACKTEST_LOG, 500))
     elif "_bt_exit" in st.session_state:
         _bt_rc = st.session_state["_bt_exit"]
         if _bt_rc == 0:
             st.success("✅ Backtest complete")
-            _render_log_expander("📋 Backtest log", _BACKTEST_LOG, expanded=False)
+            _render_log_expander("📋 Backtest log", _BACKTEST_LOG, expanded=False, lines_fn=lambda: _log_lines(_BACKTEST_LOG, 500))
             if _BT_RESULTS.exists():
                 try:
                     from src.backtest.synthetic import suggest_config
@@ -2008,7 +2029,7 @@ def _render_bt_status() -> None:
                     st.warning(f"Could not load backtest results: {_be}")
         else:
             st.error(f"❌ Backtest failed (exit {_bt_rc})")
-            _render_log_expander("📋 Backtest log", _BACKTEST_LOG, expanded=True)
+            _render_log_expander("📋 Backtest log", _BACKTEST_LOG, expanded=True, lines_fn=lambda: _log_lines(_BACKTEST_LOG, 500))
 
 
 @st.fragment
@@ -3280,20 +3301,18 @@ def _render_perf_chart(
                 pass
 
         # ── Patch today with live NLV when Flex data is stale ────────────
-        # Keeps the chart current on any trading day without needing a manual Flex update.
+        # Reads _LIVE_NAV_TODAY written by kpi_strip — no extra snapshot() call needed.
         _today_ts = pd.Timestamp.today().normalize()
-        if len(_nav_series_full) >= 1 and _nav_series_full.index.max() < _today_ts:
-            try:
-                _live_snap = client.snapshot()
-                if _live_snap.connected and _live_snap.account_values:
-                    _live_nlv = account_kpis(_live_snap)["nlv"]
-                    if _live_nlv > 0:
-                        _nav_series_full = pd.concat([
-                            _nav_series_full,
-                            pd.Series({_today_ts: _live_nlv}),
-                        ]).sort_index()
-            except Exception:
-                pass
+        if (
+            len(_nav_series_full) >= 1
+            and _nav_series_full.index.max() < _today_ts
+            and _LIVE_NAV_TODAY.get("date") == _today_ts
+            and _LIVE_NAV_TODAY.get("nlv", 0) > 0
+        ):
+            _nav_series_full = pd.concat([
+                _nav_series_full,
+                pd.Series({_today_ts: _LIVE_NAV_TODAY["nlv"]}),
+            ]).sort_index()
 
         _have_nav = len(_nav_series_full) >= 2
 
@@ -4140,6 +4159,10 @@ def _build_ohlc_context(focus_symbols: set[str]) -> dict:
 
 _PF_PICKLE = _MASTER_DIR.parent / "df_pf.pkl"   # data/df_pf.pkl — auto-saved snapshot
 
+# Live NAV for today, written by kpi_strip once all accounts are streaming.
+# All consumers (perf chart, LLM context) read from here — single source of truth.
+_LIVE_NAV_TODAY: dict = {}  # {"date": pd.Timestamp, "nlv": float}
+
 
 def _build_live_context() -> dict:
     """Build LLM context from the live dashboard snapshot, trade history, and OHLC stats."""
@@ -4283,8 +4306,18 @@ def _build_live_context() -> dict:
             if not _df_nav.empty and {"reportDate", "total"}.issubset(_df_nav.columns):
                 _nav_ts = _df_nav.set_index("reportDate")["total"].sort_index()
                 _nav_ts = _nav_ts[_nav_ts > 0]
+                # Patch today's NAV from _LIVE_NAV_TODAY (written by kpi_strip).
+                _today_ts = pd.Timestamp.today().normalize()
+                if (
+                    len(_nav_ts) >= 1
+                    and _nav_ts.index.max() < _today_ts
+                    and _LIVE_NAV_TODAY.get("date") == _today_ts
+                    and _LIVE_NAV_TODAY.get("nlv", 0) > 0
+                ):
+                    _nav_ts = pd.concat(
+                        [_nav_ts, pd.Series({_today_ts: _LIVE_NAV_TODAY["nlv"]})]
+                    ).sort_index()
                 if len(_nav_ts) >= 2:
-                    _today_ts   = pd.Timestamp.today().normalize()
                     _jan25      = pd.Timestamp("2025-01-01")
                     _ytd_start  = pd.Timestamp(f"{_today_ts.year}-01-01")
                     _current    = float(_nav_ts.iloc[-1])
@@ -4858,7 +4891,25 @@ def render_actions() -> None:
                 st.session_state["execute_proc"] = exec_new_proc
                 logger.info("execute.py started pid={}", exec_new_proc.pid)
 
-        # ── Cancel Orders row ────────────────────────────────────────────────
+        # ── Cancel / Clear row ───────────────────────────────────────────────
+        _CLEAR_PROTECTED = {"backtest_results.pkl", "backtest_ohlc.pkl", "symbol_overrides.json"}
+
+        @st.dialog("⚠️ Confirm Clear Data", width="small")
+        def _confirm_clear(files: list[str]):
+            st.markdown(
+                "The following derived files in `data/` will be **permanently deleted**. "
+                "Backtest results, REFINE overrides, and OHLC cache are **kept**."
+            )
+            st.markdown("\n".join(f"- `{f}`" for f in files))
+            _cc1, _cc2 = st.columns(2)
+            with _cc1:
+                if st.button("🗑️ Delete", width="stretch"):
+                    st.session_state["_clear_confirmed"] = True
+                    st.rerun()
+            with _cc2:
+                if st.button("❌ Cancel", width="stretch"):
+                    st.rerun()
+
         @st.dialog("⚠️ Confirm Cancel Sell Orders", width="small")
         def _confirm_cancel_sells():
             st.markdown(
@@ -4903,7 +4954,7 @@ def render_actions() -> None:
                 if st.button("❌ Back", width="stretch"):
                     st.rerun()
 
-        _ccol1, _ccol2, _ccol_spacer, _ccol_sd = st.columns([3, 3, 7, 3])
+        _ccol1, _ccol2, _ccol3, _ccol_spacer, _ccol_sd = st.columns([3, 3, 3, 4, 3])
         with _ccol1:
             if st.button(
                 "🚫 Cancel Sell Orders",
@@ -4922,6 +4973,22 @@ def render_actions() -> None:
                 help="Send reqGlobalCancel — cancels ALL open orders.",
             ) and not frozen:
                 _confirm_cancel_all()
+        with _ccol3:
+            if st.button(
+                "🗑️ Clear Data",
+                width="stretch",
+                type="secondary",
+                help="Delete derived pkl files for a fresh start (e.g. malformed chains). "
+                     "Keeps backtest results, REFINE overrides, OHLC cache, and data/master/.",
+            ) and not frozen:
+                _files_to_clear = sorted(
+                    p.name for p in _DATA_DIR.iterdir()
+                    if p.is_file() and p.name not in _CLEAR_PROTECTED
+                )
+                if _files_to_clear:
+                    _confirm_clear(_files_to_clear)
+                else:
+                    st.toast("No files to clear.")
         with _ccol_sd:
             if st.button(
                 "⏻ Shutdown",
@@ -5079,44 +5146,6 @@ def render_actions() -> None:
 
         # Backtest status / results (render_actions' 5 s timer drives the refresh)
         _render_bt_status()
-
-        # ── Clear Data (last item — optional fresh-start) ────────────────────
-        _CLEAR_PROTECTED = {"backtest_results.pkl", "backtest_ohlc.pkl", "symbol_overrides.json"}
-
-        @st.dialog("⚠️ Confirm Clear Data", width="small")
-        def _confirm_clear(files: list[str]):
-            st.markdown(
-                "The following derived files in `data/` will be **permanently deleted**. "
-                "Backtest results, REFINE overrides, and OHLC cache are **kept**."
-            )
-            st.markdown("\n".join(f"- `{f}`" for f in files))
-            _cc1, _cc2 = st.columns(2)
-            with _cc1:
-                if st.button("🗑️ Delete", width="stretch"):
-                    st.session_state["_clear_confirmed"] = True
-                    st.rerun()
-            with _cc2:
-                if st.button("❌ Cancel", width="stretch"):
-                    st.rerun()
-
-        st.divider()
-        st.caption(
-            "Use **Clear Data** only for a fresh start (e.g. malformed chains). "
-            "Deletes derived pkl files. Keeps backtest results, REFINE overrides, "
-            "OHLC cache, and data/master/."
-        )
-        _clr_adv_col, _ = st.columns([2, 6])
-        with _clr_adv_col:
-            if st.button("🗑️ Clear Data", width="stretch", type="secondary",
-                         key="btn_clr_data_adv"):
-                _files_to_clear = sorted(
-                    p.name for p in _DATA_DIR.iterdir()
-                    if p.is_file() and p.name not in _CLEAR_PROTECTED
-                )
-                if _files_to_clear:
-                    _confirm_clear(_files_to_clear)
-                else:
-                    st.toast("No files to clear.")
 
         if st.session_state.get("_clear_confirmed"):
             st.session_state.pop("_clear_confirmed", None)
